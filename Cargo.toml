@@ -1,0 +1,82 @@
+[package]
+name = "quicp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[features]
+default = ["runtime-tokio"]
+runtime-tokio = ["dep:tokio", "noq/runtime-tokio"]
+tls-rustls = ["noq/rustls-ring"]
+
+[dependencies]
+crc32c = "0.6"
+fs4 = "1.1"
+managed = { version = "0.8.0", features = ["std"] }
+# Temporary QUIC backend for the prototype; it is not the QUICP wire contract.
+noq = { version = "=1.1.1", default-features = false, features = ["ring"] }
+# The backend's crypto seam exposes transport parameters through this protocol crate.
+noq-proto = { version = "=1.1.1", default-features = false, features = ["ring"] }
+bytes = "1"
+ring = "0.17.14"
+rustix = { version = "1.1", features = ["fs", "process"] }
+serde = { version = "1.0", features = ["derive"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-raw", "async"] }
+subtle = "2.6.1"
+thiserror = "2.0"
+tokio = { version = "=1.53.1", optional = true, features = ["io-util", "macros", "net", "rt", "time"] }
+toml = "0.9"
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
+fearless_simd = { version = "=0.5.0", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+socket2 = { version = "0.6.5", features = ["all"] }
+
+[dev-dependencies]
+rcgen = "=0.14.8"
+tempfile = "3.20"
+tun-rs = { version = "2.8.8", default-features = false, features = ["utun_fd"] }
+
+[[bench]]
+name = "loopback"
+harness = false
+required-features = ["runtime-tokio"]
+
+[[bench]]
+name = "packet_pool"
+harness = false
+
+[[bench]]
+name = "carrier_encode"
+harness = false
+
+[[bench]]
+name = "carrier_decode"
+harness = false
+
+[[bench]]
+name = "tcp_loopback"
+harness = false
+
+[[bench]]
+name = "utun_loopback"
+harness = false
+required-features = ["runtime-tokio"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+
+[patch.crates-io]
+noq = { path = "vendor/noq" }
+noq-proto = { path = "vendor/noq-proto" }
