@@ -7,7 +7,12 @@ use std::io::{self, IoSliceMut};
     all(test, feature = "runtime-tokio"),
     all(target_os = "linux", feature = "runtime-tokio")
 ))]
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+#[cfg(any(
+    all(test, feature = "runtime-tokio"),
+    all(target_os = "linux", feature = "runtime-tokio")
+))]
+use std::net::SocketAddr;
 #[cfg(any(
     all(test, feature = "runtime-tokio"),
     all(target_os = "linux", feature = "runtime-tokio")
@@ -54,14 +59,210 @@ use crate::config::{ClientConfig, ConfigError, MultipathMode, ServerConfig};
 use crate::config::{TrustedFileMode, read_trusted_file};
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::faketcp::{CarrierDirection, FakeTcpSocket, FourTuple, SynDataMode};
+use crate::flow::backend_error_code;
 use crate::multipath::backend_transport_config;
 use crate::no_security::{NoSecurityClientConfig, NoSecurityServerConfig};
-use crate::session::{ApplicationProfile, ResumptionCache, ResumptionPolicy};
+use crate::session::{ApplicationError, ApplicationProfile, ResumptionCache, ResumptionPolicy};
+use crate::{FlowError, OpenRequest, PendingFlow, QuicpFlow};
 
 #[cfg(feature = "tls-rustls")]
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PENDING_HANDSHAKES: u16 = 128;
 const PENDING_HANDSHAKE_BYTES: u32 = 32 * 1024;
+
+/// A configured QUICP client endpoint.
+#[cfg(any(
+    all(test, feature = "runtime-tokio"),
+    all(target_os = "linux", feature = "runtime-tokio")
+))]
+#[derive(Debug)]
+pub struct Client {
+    endpoint: noq::Endpoint,
+    server_addr: SocketAddr,
+    server_name: String,
+}
+
+#[cfg(any(
+    all(test, feature = "runtime-tokio"),
+    all(target_os = "linux", feature = "runtime-tokio")
+))]
+impl Client {
+    /// Binds a Linux FakeTCP client endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid paths, unsupported multipath mode, or socket setup failure.
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+    pub fn bind_fake_tcp(
+        config: &ClientConfig,
+        paths: &[(FourTuple, SynDataMode)],
+    ) -> Result<Self, TransportError> {
+        if config.multipath.mode != MultipathMode::Off {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the stable client API does not yet coordinate multipath failover",
+            )
+            .into());
+        }
+        let endpoint = build_fake_tcp_client_endpoint(config, paths)?;
+        let server_addr = paths[0].0.destination;
+        let server_name = config
+            .tls
+            .as_ref()
+            .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name.clone());
+        Ok(Self::from_endpoint(endpoint, server_addr, server_name))
+    }
+
+    #[cfg(any(
+        all(test, feature = "runtime-tokio"),
+        all(target_os = "linux", feature = "runtime-tokio")
+    ))]
+    fn from_endpoint(
+        endpoint: noq::Endpoint,
+        server_addr: SocketAddr,
+        server_name: String,
+    ) -> Self {
+        Self {
+            endpoint,
+            server_addr,
+            server_name,
+        }
+    }
+
+    /// Connects to the configured server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when connection setup or the handshake fails.
+    pub async fn connect(&self) -> Result<Connection, ConnectionError> {
+        let connecting = self
+            .endpoint
+            .connect(self.server_addr, &self.server_name)
+            .map_err(|error| ConnectionError::Connect(Box::new(error)))?;
+        connecting
+            .await
+            .map(Connection)
+            .map_err(|error| ConnectionError::Handshake(Box::new(error)))
+    }
+}
+
+/// A configured QUICP server endpoint.
+#[cfg(any(
+    all(test, feature = "runtime-tokio"),
+    all(target_os = "linux", feature = "runtime-tokio")
+))]
+#[derive(Debug)]
+pub struct Server {
+    endpoint: noq::Endpoint,
+}
+
+#[cfg(any(
+    all(test, feature = "runtime-tokio"),
+    all(target_os = "linux", feature = "runtime-tokio")
+))]
+impl Server {
+    /// Binds a Linux FakeTCP server endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid paths or socket setup failure.
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+    pub fn bind_fake_tcp(
+        config: &ServerConfig,
+        paths: &[(FourTuple, SynDataMode)],
+    ) -> Result<Self, TransportError> {
+        build_fake_tcp_server_endpoint(config, paths).map(Self::from_endpoint)
+    }
+
+    #[cfg(any(
+        all(test, feature = "runtime-tokio"),
+        all(target_os = "linux", feature = "runtime-tokio")
+    ))]
+    fn from_endpoint(endpoint: noq::Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    /// Accepts the next connection attempt without waiting for its handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint is closed.
+    pub async fn accept(&self) -> Result<IncomingConnection, ConnectionError> {
+        self.endpoint
+            .accept()
+            .await
+            .map(IncomingConnection)
+            .ok_or(ConnectionError::EndpointClosed)
+    }
+}
+
+/// A server-side connection attempt whose handshake has not completed.
+#[derive(Debug)]
+pub struct IncomingConnection(noq::Incoming);
+
+impl IncomingConnection {
+    /// Completes the connection handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the handshake fails.
+    pub async fn handshake(self) -> Result<Connection, ConnectionError> {
+        self.0
+            .await
+            .map(Connection)
+            .map_err(|error| ConnectionError::Handshake(Box::new(error)))
+    }
+}
+
+/// An established QUICP connection.
+#[derive(Clone, Debug)]
+pub struct Connection(noq::Connection);
+
+impl Connection {
+    /// Returns an identifier stable for the lifetime of this connection.
+    #[must_use]
+    pub fn stable_id(&self) -> usize {
+        self.0.stable_id()
+    }
+
+    /// Opens one application flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when OPEN/STATUS exchange or stream setup fails.
+    pub async fn open_flow(&self, request: OpenRequest) -> Result<QuicpFlow, FlowError> {
+        QuicpFlow::open(&self.0, request).await
+    }
+
+    /// Accepts the next application flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no stream is available or OPEN is invalid.
+    pub async fn accept_flow(&self) -> Result<PendingFlow, FlowError> {
+        crate::flow::accept_flow(&self.0).await
+    }
+
+    /// Closes this connection immediately.
+    pub fn close(&self, error: ApplicationError, reason: &[u8]) {
+        self.0.close(backend_error_code(error), reason);
+    }
+
+    #[cfg(all(test, feature = "runtime-tokio"))]
+    fn backend(&self) -> &noq::Connection {
+        &self.0
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConnectionError {
+    #[error("starting QUICP connection: {0}")]
+    Connect(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("establishing QUICP connection: {0}")]
+    Handshake(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("QUICP endpoint is closed")]
+    EndpointClosed,
+}
 
 /// A client connection that may still be waiting for the full handshake.
 pub enum ClientHandshake {
@@ -588,12 +789,12 @@ mod tests {
 
     #[cfg(not(feature = "tls-rustls"))]
     use super::TransportError;
-    #[cfg(all(feature = "tls-rustls", unix))]
-    use super::{ClientHandshake, start_client_handshake};
     use super::{
-        MultipathSocket, build_client_config, build_client_endpoint_with_socket,
+        Client, MultipathSocket, Server, build_client_config, build_client_endpoint_with_socket,
         build_server_config, build_server_endpoint_with_socket,
     };
+    #[cfg(all(feature = "tls-rustls", unix))]
+    use super::{ClientHandshake, start_client_handshake};
     use crate::config::{
         CarrierConfig, ClientConfig, Ipv4Pool, Multipath, MultipathMode, PathCandidate,
         ServerConfig, ZeroRttMode,
@@ -702,30 +903,27 @@ mod tests {
             let client_endpoint =
                 noq::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
             client_endpoint.set_default_client_config(build_client_config(&client).unwrap());
+            let server = Server::from_endpoint(server_endpoint);
+            let client = Client::from_endpoint(client_endpoint, server_addr, "quicp".to_owned());
 
             let server_connection =
-                async { server_endpoint.accept().await.unwrap().await.unwrap() };
-            let client_connection = async {
-                client_endpoint
-                    .connect(server_addr, "quicp")
-                    .unwrap()
-                    .await
-                    .unwrap()
-            };
+                async { server.accept().await.unwrap().handshake().await.unwrap() };
+            let client_connection = client.connect();
             let (server_connection, client_connection) =
                 tokio::join!(server_connection, client_connection);
+            let client_connection = client_connection.unwrap();
             crate::session::ApplicationProfile::SinglePath
-                .authenticate_connection(&client_connection, true)
+                .authenticate_connection(client_connection.backend(), true)
                 .expect("plaintext single-path admission");
             crate::session::ApplicationProfile::SinglePath
-                .authenticate_connection(&server_connection, true)
+                .authenticate_connection(server_connection.backend(), true)
                 .expect("plaintext server admission");
             assert!(matches!(
                 crate::session::ApplicationProfile::Multipath
-                    .authenticate_connection(&client_connection, true),
+                    .authenticate_connection(client_connection.backend(), true),
                 Err(crate::session::SessionError::ProfileMismatch)
             ));
-            crate::session::ApplicationProfile::admit_negotiated(&client_connection, true)
+            crate::session::ApplicationProfile::admit_negotiated(client_connection.backend(), true)
                 .expect("negotiated plaintext profile");
             let blocked_request = crate::wire::OpenRequest::new(
                 crate::wire::CanonicalHost::parse("blocked.example").unwrap(),
@@ -734,11 +932,9 @@ mod tests {
             let blocked_client = {
                 let connection = client_connection.clone();
                 let request = blocked_request.clone();
-                tokio::spawn(
-                    async move { crate::flow::QuicpFlow::open(&connection, request).await },
-                )
+                tokio::spawn(async move { connection.open_flow(request).await })
             };
-            let blocked_pending = crate::flow::accept_flow(&server_connection).await.unwrap();
+            let blocked_pending = server_connection.accept_flow().await.unwrap();
             assert_eq!(blocked_pending.request(), &blocked_request);
             assert!(!blocked_client.is_finished());
 
@@ -749,11 +945,9 @@ mod tests {
             let ready_client = {
                 let connection = client_connection.clone();
                 let request = ready_request.clone();
-                tokio::spawn(
-                    async move { crate::flow::QuicpFlow::open(&connection, request).await },
-                )
+                tokio::spawn(async move { connection.open_flow(request).await })
             };
-            let ready_pending = crate::flow::accept_flow(&server_connection).await.unwrap();
+            let ready_pending = server_connection.accept_flow().await.unwrap();
             assert_eq!(ready_pending.request(), &ready_request);
             let mut server_flow = ready_pending.accept().await.unwrap();
             let mut client_flow = tokio::time::timeout(Duration::from_secs(2), ready_client)

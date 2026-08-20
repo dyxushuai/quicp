@@ -15,7 +15,10 @@ pub use config::{
     CarrierConfig, ClientConfig, Config, ConfigError, Multipath, MultipathMode, PathCandidate,
     ServerConfig, SynDataPolicy, ZeroRttMode, load_config,
 };
-pub use flow::{FlowError, PendingFlow, QuicpFlow, accept_flow};
+pub use flow::{FlowError, PendingFlow, QuicpFlow};
 pub use platform::{PlatformError, PlatformPacketBridge, PlatformPacketConfig};
-pub use transport::TransportError;
+pub use session::ApplicationError;
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+pub use transport::{Client, Server};
+pub use transport::{Connection, ConnectionError, IncomingConnection, TransportError};
 pub use wire::{CanonicalHost, OpenRequest, OpenStatus, WireError};

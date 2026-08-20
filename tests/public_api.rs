@@ -1,9 +1,11 @@
 use std::num::NonZeroU16;
 
 use quicp::{
-    CanonicalHost, Config, OpenRequest, PlatformPacketBridge, PlatformPacketConfig, QuicpFlow,
-    ZeroRttMode, accept_flow,
+    ApplicationError, CanonicalHost, Config, Connection, ConnectionError, IncomingConnection,
+    OpenRequest, PendingFlow, PlatformPacketBridge, PlatformPacketConfig, QuicpFlow, ZeroRttMode,
 };
+#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+use quicp::{Client, Server};
 
 #[test]
 fn common_library_api_is_available_from_the_crate_root() {
@@ -26,5 +28,13 @@ listen_addrs = ["127.0.0.1:4433"]
     assert_eq!(ZeroRttMode::Off, ZeroRttMode::Off);
 
     let _flow_type: Option<QuicpFlow> = None;
-    std::hint::black_box(accept_flow);
+    let _pending_type: Option<PendingFlow> = None;
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+    let _client_type: Option<Client> = None;
+    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
+    let _server_type: Option<Server> = None;
+    let _connection_type: Option<Connection> = None;
+    let _incoming_type: Option<IncomingConnection> = None;
+    let _error_type: Option<ConnectionError> = None;
+    assert_eq!(ApplicationError::FlowAbort.code(), 0x101);
 }

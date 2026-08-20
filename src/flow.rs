@@ -58,15 +58,18 @@ impl QuicpFlow {
         request: OpenRequest,
     ) -> Result<Self, FlowError> {
         ApplicationProfile::admit_negotiated(connection, true)?;
-        let (mut send, mut recv) = connection.open_bi().await.map_err(FlowError::Open)?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|error| FlowError::Open(Box::new(error)))?;
         send.write_all(&request.encode())
             .await
-            .map_err(FlowError::Write)?;
+            .map_err(|error| FlowError::Write(Box::new(error)))?;
 
         let mut status = [0u8; 1];
         recv.read_exact(&mut status)
             .await
-            .map_err(FlowError::Read)?;
+            .map_err(|error| FlowError::Read(Box::new(error)))?;
         let mut gate = ClientOpenGate::new();
         match gate.accept_status(status[0])? {
             OpenDisposition::Ready => Ok(Self::new(send, recv)),
@@ -79,8 +82,10 @@ impl QuicpFlow {
     /// # Errors
     ///
     /// Returns an error when the peer has already closed the stream.
-    pub fn reset(&mut self, error: ApplicationError) -> Result<(), noq::ClosedStream> {
-        self.send.reset(backend_error_code(error))
+    pub fn reset(&mut self, error: ApplicationError) -> Result<(), FlowError> {
+        self.send
+            .reset(backend_error_code(error))
+            .map_err(|error| FlowError::Reset(Box::new(error)))
     }
 
     /// Attempts to read flow bytes without depending on a particular async runtime.
@@ -260,7 +265,7 @@ impl PendingFlow {
         self.send
             .write_all(&[OpenStatus::Ok.encode()])
             .await
-            .map_err(FlowError::Write)?;
+            .map_err(|error| FlowError::Write(Box::new(error)))?;
         Ok(QuicpFlow::new(self.send, self.recv))
     }
 
@@ -276,11 +281,11 @@ impl PendingFlow {
         self.send
             .write_all(&[status.encode()])
             .await
-            .map_err(FlowError::Write)?;
+            .map_err(|error| FlowError::Write(Box::new(error)))?;
         self.send
             .finish()
             .map_err(noq::WriteError::from)
-            .map_err(FlowError::Write)?;
+            .map_err(|error| FlowError::Write(Box::new(error)))?;
         Ok(())
     }
 }
@@ -292,7 +297,10 @@ impl PendingFlow {
 /// Returns an error when no bidirectional stream can be accepted or the OPEN header is invalid.
 pub async fn accept_flow(connection: &noq::Connection) -> Result<PendingFlow, FlowError> {
     ApplicationProfile::admit_negotiated(connection, true)?;
-    let (mut send, mut recv) = connection.accept_bi().await.map_err(FlowError::Accept)?;
+    let (mut send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| FlowError::Accept(Box::new(error)))?;
     let request = match read_open(&mut recv).await {
         Ok(request) => request,
         Err(error) if error.is_protocol_violation() => {
@@ -312,7 +320,9 @@ pub async fn accept_flow(connection: &noq::Connection) -> Result<PendingFlow, Fl
 
 async fn read_open(recv: &mut noq::RecvStream) -> Result<OpenRequest, FlowError> {
     let mut first = [0u8; 1];
-    recv.read_exact(&mut first).await.map_err(FlowError::Read)?;
+    recv.read_exact(&mut first)
+        .await
+        .map_err(|error| FlowError::Read(Box::new(error)))?;
     let host_len = usize::from(first[0]);
     if host_len == 0 {
         return Err(SessionError::Wire(crate::wire::WireError::InvalidHostLength).into());
@@ -321,13 +331,13 @@ async fn read_open(recv: &mut noq::RecvStream) -> Result<OpenRequest, FlowError>
     encoded[0] = first[0];
     recv.read_exact(&mut encoded[1..])
         .await
-        .map_err(FlowError::Read)?;
+        .map_err(|error| FlowError::Read(Box::new(error)))?;
     let (request, consumed) = OpenRequest::decode(&encoded).map_err(SessionError::from)?;
     debug_assert_eq!(consumed, encoded.len());
     Ok(request)
 }
 
-fn backend_error_code(error: ApplicationError) -> noq::VarInt {
+pub(crate) fn backend_error_code(error: ApplicationError) -> noq::VarInt {
     #[allow(clippy::cast_possible_truncation)]
     let code = error.code() as u32;
     noq::VarInt::from_u32(code)
@@ -336,13 +346,15 @@ fn backend_error_code(error: ApplicationError) -> noq::VarInt {
 #[derive(Debug, Error)]
 pub enum FlowError {
     #[error("opening QUICP flow: {0}")]
-    Open(#[source] noq::ConnectionError),
+    Open(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("accepting QUICP flow: {0}")]
-    Accept(#[source] noq::ConnectionError),
+    Accept(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("reading QUICP flow: {0}")]
-    Read(#[source] noq::ReadExactError),
+    Read(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("writing QUICP flow: {0}")]
-    Write(#[source] noq::WriteError),
+    Write(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("resetting QUICP flow: {0}")]
+    Reset(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("flow status rejected: {0:?}")]
     Rejected(OpenStatus),
     #[error("flow status OK cannot be used for rejection")]
@@ -353,11 +365,12 @@ pub enum FlowError {
 
 impl FlowError {
     fn is_protocol_violation(&self) -> bool {
-        matches!(
-            self,
-            Self::Session(SessionError::Wire(_))
-                | Self::Read(noq::ReadExactError::FinishedEarly(_))
-        )
+        matches!(self, Self::Session(SessionError::Wire(_)))
+            || matches!(
+                self,
+                Self::Read(error)
+                    if matches!(error.downcast_ref(), Some(noq::ReadExactError::FinishedEarly(_)))
+            )
     }
 }
 

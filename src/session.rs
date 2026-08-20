@@ -128,9 +128,7 @@ fn handshake_evidence(
             peer_authenticated: true,
             current_policy_authorized,
         }),
-        Err(handshake) => {
-            tls_handshake_evidence(connection, handshake, current_policy_authorized)
-        }
+        Err(handshake) => tls_handshake_evidence(connection, handshake, current_policy_authorized),
     }
 }
 
