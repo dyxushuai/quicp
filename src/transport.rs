@@ -40,7 +40,7 @@ use crate::{FlowError, OpenRequest, PendingFlow, QuicpFlow};
 #[cfg(feature = "runtime-tokio")]
 #[path = "transport/tokio.rs"]
 mod tokio_adapter;
-#[cfg(all(test, unix, feature = "runtime-tokio"))]
+#[cfg(all(test, feature = "runtime-tokio"))]
 pub(crate) use tokio_adapter::MultipathSocket;
 #[cfg(all(test, unix, feature = "runtime-tokio"))]
 pub(crate) use tokio_adapter::{
