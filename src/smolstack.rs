@@ -18,15 +18,20 @@ use thiserror::Error;
 
 use crate::packet_ring::PacketRing;
 
+/// Default IP packet MTU.
 pub const DEFAULT_MTU: usize = 1500;
+/// Default maximum packets processed by one bounded poll.
 pub const DEFAULT_POLL_BUDGET: usize = 32;
+/// Default byte capacity of each smoltcp TCP flow half.
 pub const DEFAULT_FLOW_BUFFER_BYTES: usize = 32 * 1024;
 
 /// Preallocated smoltcp TCP socket buffers.  A flow owns exactly one receive and one send buffer;
 /// the Tokio packet rings are accounted for separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcpFlowBuffers {
+    /// Receive-buffer bytes reserved for one TCP flow.
     pub receive_bytes: usize,
+    /// Send-buffer bytes reserved for one TCP flow.
     pub send_bytes: usize,
 }
 
@@ -117,7 +122,9 @@ pub fn poll_tcp_write(
 /// Admission and scheduling limits for the smoltcp runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SmoltcpConfig {
+    /// Complete-IP-packet MTU.
     pub mtu: usize,
+    /// Maximum ingress packets processed per poll slice.
     pub max_packets_per_poll: NonZeroUsize,
 }
 
@@ -251,6 +258,7 @@ impl Device for RingDevice {
     }
 }
 
+/// smoltcp receive token borrowing one packet and its device owner.
 #[derive(Debug)]
 pub struct RingRxToken<'a> {
     packet: Option<Vec<u8>>,
@@ -275,6 +283,7 @@ impl Drop for RingRxToken<'_> {
     }
 }
 
+/// smoltcp transmit token borrowing the bounded egress queue and device owner.
 #[derive(Debug)]
 pub struct RingTxToken<'a> {
     queue: Arc<PacketRing>,
@@ -287,12 +296,15 @@ impl TxToken for RingTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // `transmit` reserves a pool slot for the single-owner device. The fallback keeps the
-        // smoltcp trait total if a caller violates that ownership invariant.
+        // The smoltcp contract normally supplies a length no larger than the interface MTU.
+        // Bound a violating caller before any allocation so a bad token cannot request an
+        // arbitrary buffer. The callback receives the bounded slice and the packet is discarded
+        // after the callback when the requested length was invalid.
+        let bounded_len = len.min(self.mtu);
         let mut packet = self
             .queue
-            .acquire_buffer(len)
-            .unwrap_or_else(|| vec![0; len]);
+            .acquire_buffer(bounded_len)
+            .unwrap_or_else(|| vec![0; bounded_len]);
         let result = f(&mut packet);
         if len <= self.mtu {
             // `transmit` checked capacity before handing out this token. Under the SPSC
@@ -300,6 +312,8 @@ impl TxToken for RingTxToken<'_> {
             // violated the single-producer ownership rule; drop the packet instead of writing
             // to the consumer-owned free queue.
             let _ = self.queue.push(packet);
+        } else {
+            self.queue.recycle_buffer(packet);
         }
         result
     }
@@ -333,10 +347,13 @@ pub fn poll_bounded<D: Device + ?Sized>(
     }
 }
 
+/// smoltcp adapter limit-validation errors.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SmoltcpError {
+    /// MTU falls outside the supported IPv4/IPv6 range.
     #[error("smoltcp MTU {0} is outside 576..=9000")]
     InvalidMtu(usize),
+    /// A TCP receive or send buffer was zero bytes.
     #[error("smoltcp TCP flow buffers must be nonzero")]
     ZeroFlowBuffer,
 }

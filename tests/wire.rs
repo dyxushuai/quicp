@@ -1,6 +1,6 @@
 use std::num::NonZeroU16;
 
-use quicp::wire::{CanonicalHost, OpenRequest, OpenStatus, WireError};
+use quicp::{CanonicalHost, OpenRequest, OpenStatus, WireError};
 
 #[test]
 fn open_request_round_trips() {
@@ -10,10 +10,23 @@ fn open_request_round_trips() {
     );
 
     let encoded = request.encode();
+    let mut caller_buffer = [0u8; 256];
+    let caller_length = request
+        .encode_into(&mut caller_buffer)
+        .expect("caller buffer fits");
     let (decoded, consumed) = OpenRequest::decode(&encoded).expect("valid frame");
 
     assert_eq!(decoded, request);
     assert_eq!(consumed, encoded.len());
+    assert_eq!(request.encoded_len(), encoded.len());
+    assert_eq!(&caller_buffer[..caller_length], encoded);
+    assert_eq!(
+        request.encode_into(&mut [0; 1]),
+        Err(WireError::OutputTooSmall {
+            required: encoded.len(),
+            available: 1,
+        })
+    );
     assert!(encoded.len() <= 256);
 }
 

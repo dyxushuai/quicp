@@ -1,9 +1,7 @@
 use thiserror::Error;
 
-use crate::config::{MultipathMode, ZeroRttMode};
-use crate::wire::{OpenRequest, OpenStatus, WireError};
-
-pub const MAX_OPEN_HEADER: u16 = 256;
+use crate::config::MultipathMode;
+use crate::wire::{OpenStatus, WireError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationProfile {
@@ -40,27 +38,24 @@ impl ApplicationProfile {
         Ok(())
     }
 
-    /// Produces the only token that permits parsing an early OPEN header.
+    /// Validates profile and policy evidence.
     ///
     /// # Errors
     ///
-    /// Returns an error until peer authentication, current policy, profile token, and
-    /// multipath state all agree.
-    fn authenticate(
-        self,
-        evidence: &HandshakeEvidence,
-    ) -> Result<AuthenticatedSession, SessionError> {
-        if !evidence.peer_authenticated {
+    /// Returns an error until peer admission, current policy, profile token, and multipath state
+    /// all agree.
+    fn admit_evidence(self, evidence: &HandshakeEvidence) -> Result<(), SessionError> {
+        if evidence.peer_admission == PeerAdmission::Unauthenticated {
             return Err(SessionError::PeerUnauthenticated);
         }
         if !evidence.current_policy_authorized {
             return Err(SessionError::PolicyRejected);
         }
         self.validate(&evidence.selected_profile_token, evidence.multipath_enabled)?;
-        Ok(AuthenticatedSession { profile: self })
+        Ok(())
     }
 
-    /// Authenticates a fully established backend connection against the selected profile.
+    /// Admits a fully established backend connection against the selected profile.
     ///
     /// The no-security profile admits an established handshake that carries a matching
     /// profile token. The TLS adapter also requires a nonempty peer certificate chain.
@@ -69,13 +64,15 @@ impl ApplicationProfile {
     ///
     /// Returns an error unless the negotiated profile token, multipath state, and current
     /// authorization policy all agree. TLS sessions also fail without a peer identity.
-    pub fn authenticate_connection(
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn admit_connection(
         self,
         connection: &noq::Connection,
         current_policy_authorized: bool,
-    ) -> Result<AuthenticatedSession, SessionError> {
+    ) -> Result<(), SessionError> {
         let evidence = handshake_evidence(connection, current_policy_authorized)?;
-        self.authenticate(&evidence)
+        self.admit_evidence(&evidence)
     }
 
     /// Admits whichever profile the established handshake actually negotiated.
@@ -84,16 +81,16 @@ impl ApplicationProfile {
     ///
     /// Returns an error when handshake data is missing, the token is unknown, or the
     /// token does not match the negotiated multipath state.
-    pub fn admit_negotiated(
+    pub(crate) fn admit_negotiated(
         connection: &noq::Connection,
         current_policy_authorized: bool,
-    ) -> Result<AuthenticatedSession, SessionError> {
+    ) -> Result<(), SessionError> {
         let evidence = handshake_evidence(connection, current_policy_authorized)?;
         let selected = [Self::SinglePath, Self::Multipath]
             .into_iter()
             .find(|profile| profile.profile_token() == evidence.selected_profile_token.as_slice())
             .ok_or(SessionError::UnsupportedProfileToken)?;
-        selected.authenticate(&evidence)
+        selected.admit_evidence(&evidence)
     }
 }
 
@@ -110,8 +107,16 @@ impl From<MultipathMode> for ApplicationProfile {
 struct HandshakeEvidence {
     selected_profile_token: Vec<u8>,
     multipath_enabled: bool,
-    peer_authenticated: bool,
+    peer_admission: PeerAdmission,
     current_policy_authorized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerAdmission {
+    #[cfg(feature = "tls-rustls")]
+    Authenticated,
+    ExplicitlyUnauthenticated,
+    Unauthenticated,
 }
 
 fn handshake_evidence(
@@ -125,7 +130,7 @@ fn handshake_evidence(
         Ok(plain) => Ok(HandshakeEvidence {
             selected_profile_token: plain.profile_token,
             multipath_enabled: connection.is_multipath_enabled(),
-            peer_authenticated: true,
+            peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
             current_policy_authorized,
         }),
         Err(handshake) => tls_handshake_evidence(connection, handshake, current_policy_authorized),
@@ -144,18 +149,23 @@ fn tls_handshake_evidence(
     let selected_profile_token = handshake
         .protocol
         .ok_or(SessionError::UnsupportedProfileToken)?;
-    let peer_authenticated = connection
+    let peer_admission = if connection
         .peer_identity()
         .and_then(|identity| {
             identity
                 .downcast::<Vec<noq::rustls::pki_types::CertificateDer<'static>>>()
                 .ok()
         })
-        .is_some_and(|certificates| !certificates.is_empty());
+        .is_some_and(|certificates| !certificates.is_empty())
+    {
+        PeerAdmission::Authenticated
+    } else {
+        PeerAdmission::Unauthenticated
+    };
     Ok(HandshakeEvidence {
         selected_profile_token,
         multipath_enabled: connection.is_multipath_enabled(),
-        peer_authenticated,
+        peer_admission,
         current_policy_authorized,
     })
 }
@@ -167,11 +177,6 @@ fn tls_handshake_evidence(
     _current_policy_authorized: bool,
 ) -> Result<HandshakeEvidence, SessionError> {
     Err(SessionError::UnsupportedCrypto)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AuthenticatedSession {
-    profile: ApplicationProfile,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -232,207 +237,31 @@ pub enum OpenDisposition {
     Rejected(OpenStatus),
 }
 
-impl AuthenticatedSession {
-    #[must_use]
-    pub const fn profile(self) -> ApplicationProfile {
-        self.profile
-    }
-
-    /// Parses a buffered early OPEN only after authentication and rejects payload bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a wire error for a malformed header or [`SessionError::EarlyPayload`]
-    /// when bytes follow the header.
-    pub fn decode_early_open(self, bytes: &[u8]) -> Result<OpenRequest, SessionError> {
-        let (request, consumed) = OpenRequest::decode(bytes)?;
-        if consumed != bytes.len() {
-            return Err(SessionError::EarlyPayload);
-        }
-        Ok(request)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResumptionMetadata {
-    server_fingerprint: [u8; 32],
-    expires_at_unix_seconds: u64,
-    policy_epoch: u64,
-    profile: ApplicationProfile,
-    header_limit: u16,
-}
-
-pub const MAX_RESUMPTION_ENTRIES: usize = 256;
-
-/// Bounded application-owned admission metadata for the optional security resumption cache.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ResumptionCache {
-    entries: Vec<ResumptionMetadata>,
-}
-
-impl ResumptionCache {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Adds metadata and evicts the oldest entry when the bounded cache is full.
-    pub fn insert(&mut self, metadata: ResumptionMetadata) {
-        if metadata.header_limit > MAX_OPEN_HEADER {
-            return;
-        }
-        if let Some(index) = self.entries.iter().position(|entry| entry == &metadata) {
-            self.entries.remove(index);
-        }
-        if self.entries.len() == MAX_RESUMPTION_ENTRIES {
-            self.entries.remove(0);
-        }
-        self.entries.push(metadata);
-    }
-
-    /// Retains only metadata admitted by the current policy and reports whether any remains.
-    pub fn admit(&mut self, current: &ResumptionPolicy) -> bool {
-        self.entries.retain(|metadata| metadata.admits(current));
-        !self.entries.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl ResumptionMetadata {
-    #[must_use]
-    pub const fn new(
-        server_fingerprint: [u8; 32],
-        expires_at_unix_seconds: u64,
-        policy_epoch: u64,
-        profile: ApplicationProfile,
-        header_limit: u16,
-    ) -> Self {
-        Self {
-            server_fingerprint,
-            expires_at_unix_seconds,
-            policy_epoch,
-            profile,
-            header_limit,
-        }
-    }
-
-    #[must_use]
-    pub fn admits(&self, current: &ResumptionPolicy) -> bool {
-        current.mode == ZeroRttMode::SafeOpenOnly
-            && current.now_unix_seconds < self.expires_at_unix_seconds
-            && current.server_fingerprint == self.server_fingerprint
-            && current.policy_epoch == self.policy_epoch
-            && current.profile == self.profile
-            && current.header_limit == self.header_limit
-            && current.header_limit <= MAX_OPEN_HEADER
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResumptionPolicy {
-    pub mode: ZeroRttMode,
-    pub server_fingerprint: [u8; 32],
-    pub now_unix_seconds: u64,
-    pub policy_epoch: u64,
-    pub profile: ApplicationProfile,
-    pub header_limit: u16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EarlyDataOutcome {
-    Accepted,
-    ExplicitlyRejected,
-    AmbiguousOrFailed,
-}
-
-/// Resolves the temporary backend's ambiguous early-data result without replaying after failure.
-pub async fn zero_rtt_outcome(
-    connection: &noq::Connection,
-    accepted: noq::ZeroRttAccepted,
-) -> EarlyDataOutcome {
-    classify_zero_rtt(accepted.await, connection.close_reason().is_none())
-}
-
-const fn classify_zero_rtt(accepted: bool, connection_alive: bool) -> EarlyDataOutcome {
-    match (accepted, connection_alive) {
-        (true, _) => EarlyDataOutcome::Accepted,
-        (false, true) => EarlyDataOutcome::ExplicitlyRejected,
-        (false, false) => EarlyDataOutcome::AmbiguousOrFailed,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EarlyDecision {
-    Continue,
-    RetryOnceAtOneRtt,
-    Abort,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct EarlyAttempt {
-    fallback_used: bool,
-    non_replayable: bool,
-}
-
-impl EarlyAttempt {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            fallback_used: false,
-            non_replayable: false,
-        }
-    }
-
-    pub const fn mark_non_replayable(&mut self) {
-        self.non_replayable = true;
-    }
-
-    pub fn resolve(&mut self, outcome: EarlyDataOutcome) -> EarlyDecision {
-        match outcome {
-            EarlyDataOutcome::Accepted => EarlyDecision::Continue,
-            EarlyDataOutcome::ExplicitlyRejected if !self.fallback_used && !self.non_replayable => {
-                self.fallback_used = true;
-                EarlyDecision::RetryOnceAtOneRtt
-            }
-            EarlyDataOutcome::ExplicitlyRejected | EarlyDataOutcome::AmbiguousOrFailed => {
-                EarlyDecision::Abort
-            }
-        }
-    }
-}
-
+/// Stable QUICP application error codes sent when closing flows or connections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum ApplicationError {
+    /// Malformed or unexpected flow protocol data.
     FlowProtocol = 0x100,
+    /// A local application aborted a flow.
     FlowAbort = 0x101,
+    /// The peer rejected a flow request.
     FlowRejected = 0x102,
+    /// A required backup path was unavailable.
     MultipathRequired = 0x103,
+    /// Path churn exceeded the bounded policy.
     MultipathChurn = 0x104,
 }
 
 impl ApplicationError {
     #[must_use]
+    /// Returns the stable wire code.
     pub const fn code(self) -> u64 {
         self as u64
     }
 
     #[must_use]
+    /// Maps a peer wire code, using [`Self::FlowProtocol`] for unknown values.
     pub const fn from_peer_code(code: u64) -> Self {
         match code {
             value if value == Self::FlowAbort.code() => Self::FlowAbort,
@@ -445,93 +274,65 @@ impl ApplicationError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+/// An error raised while validating session admission or profile state.
 pub enum SessionError {
+    /// The peer has not completed authentication.
     #[error("peer authentication is incomplete")]
     PeerUnauthenticated,
+    /// The active admission policy rejected the peer.
     #[error("peer is not authorized by current policy")]
     PolicyRejected,
+    /// The peer selected an unsupported QUICP profile token.
     #[error("unsupported QUICP profile token")]
     UnsupportedProfileToken,
+    /// The selected security backend cannot provide the requested session.
     #[error("unsupported security backend session")]
     UnsupportedCrypto,
+    /// TLS authentication was requested without enabling its crate feature.
     #[error("TLS authentication requires the `tls-rustls` feature")]
     SecurityFeatureDisabled,
+    /// The negotiated profile token conflicts with the multipath state.
     #[error("profile token and multipath state do not match")]
     ProfileMismatch,
-    #[error("0-RTT OPEN contains application payload")]
-    EarlyPayload,
+    /// A flow attempted an invalid session-state transition.
     #[error("invalid flow state transition")]
     InvalidState,
+    /// Session wire encoding or decoding failed.
     #[error(transparent)]
     Wire(#[from] WireError),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
-
-    use super::{
-        ApplicationProfile, EarlyDataOutcome, HandshakeEvidence, SessionError, classify_zero_rtt,
-    };
-    use crate::wire::{CanonicalHost, OpenRequest};
+    use super::{ApplicationProfile, HandshakeEvidence, PeerAdmission};
 
     #[test]
-    fn early_open_parsing_requires_authenticated_evidence() {
+    fn session_admission_requires_profile_and_policy_evidence() {
         let profile = ApplicationProfile::SinglePath;
         for evidence in [
             HandshakeEvidence {
                 selected_profile_token: b"quicp/1".to_vec(),
                 multipath_enabled: false,
-                peer_authenticated: false,
+                peer_admission: PeerAdmission::Unauthenticated,
                 current_policy_authorized: true,
             },
             HandshakeEvidence {
                 selected_profile_token: b"quicp/1".to_vec(),
                 multipath_enabled: false,
-                peer_authenticated: true,
+                peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
                 current_policy_authorized: false,
             },
         ] {
-            assert!(profile.authenticate(&evidence).is_err());
+            assert!(profile.admit_evidence(&evidence).is_err());
         }
 
-        let session = profile
-            .authenticate(&HandshakeEvidence {
+        profile
+            .admit_evidence(&HandshakeEvidence {
                 selected_profile_token: b"quicp/1".to_vec(),
                 multipath_enabled: false,
-                peer_authenticated: true,
+                peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
                 current_policy_authorized: true,
             })
-            .expect("authenticated session");
-        let request = OpenRequest::new(
-            CanonicalHost::parse("www.example.com").expect("host"),
-            NonZeroU16::new(443).expect("port"),
-        );
-        let mut early = request.encode();
-        early.push(b'x');
-        assert_eq!(session.profile(), profile);
-        assert!(matches!(
-            session.decode_early_open(&early),
-            Err(SessionError::EarlyPayload)
-        ));
-        assert_eq!(
-            session
-                .decode_early_open(&request.encode())
-                .expect("header only"),
-            request
-        );
-    }
-
-    #[test]
-    fn zero_rtt_rejection_requires_a_live_connection() {
-        assert_eq!(
-            classify_zero_rtt(false, true),
-            EarlyDataOutcome::ExplicitlyRejected
-        );
-        assert_eq!(
-            classify_zero_rtt(false, false),
-            EarlyDataOutcome::AmbiguousOrFailed
-        );
-        assert_eq!(classify_zero_rtt(true, false), EarlyDataOutcome::Accepted);
+            .expect("explicit no-security admission");
     }
 }

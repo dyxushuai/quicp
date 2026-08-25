@@ -7,7 +7,7 @@ use std::{
     num::NonZeroUsize,
     pin::Pin,
     sync::{
-        Arc, Weak,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker, ready},
@@ -36,6 +36,232 @@ use proto::{
     TransportErrorCode, congestion::Controller, n0_nat_traversal,
 };
 
+const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 264;
+const ENDPOINT_EVENT_QUEUE_CAPACITY: usize = 264;
+
+#[derive(Debug)]
+struct OverflowSignal<T: Copy + Eq> {
+    values: StdMutex<Vec<T>>,
+    waker: StdMutex<Option<Waker>>,
+    fatal: AtomicUsize,
+}
+
+impl<T: Copy + Eq> Default for OverflowSignal<T> {
+    fn default() -> Self {
+        Self {
+            values: StdMutex::new(Vec::new()),
+            waker: StdMutex::new(None),
+            fatal: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl<T: Copy + Eq> OverflowSignal<T> {
+    fn mark(&self, value: T) {
+        if let Ok(mut values) = self.values.lock() {
+            if !values.contains(&value) {
+                if values.len() < ENDPOINT_EVENT_QUEUE_CAPACITY {
+                    values.push(value);
+                } else {
+                    self.fatal.store(1, Ordering::Release);
+                }
+            }
+        }
+        let waker = self.waker.lock().ok().and_then(|mut waker| waker.take());
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn take(&self) -> Option<T> {
+        self.values.lock().ok().and_then(|mut values| {
+            (!values.is_empty()).then(|| values.remove(0))
+        })
+    }
+
+    fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::Acquire) != 0
+    }
+
+    fn register(&self, waker: &Waker) {
+        if let Ok(mut stored) = self.waker.lock() {
+            stored.clone_from(&Some(waker.clone()));
+        }
+        let wake_now = self
+            .values
+            .lock()
+            .ok()
+            .is_some_and(|values| !values.is_empty())
+            || self.is_fatal();
+        if wake_now {
+            waker.wake_by_ref();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ConnectionEventSender {
+    events: mpsc::Sender<ConnectionEvent>,
+    overflow: Arc<OverflowSignal<()>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ConnectionEventReceiver {
+    events: mpsc::Receiver<ConnectionEvent>,
+    overflow: Arc<OverflowSignal<()>>,
+    fatal: bool,
+}
+
+impl ConnectionEventSender {
+    pub(crate) fn channel() -> (Self, ConnectionEventReceiver) {
+        let (events, receiver) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);
+        let overflow = Arc::new(OverflowSignal::default());
+        (
+            Self {
+                events,
+                overflow: Arc::clone(&overflow),
+            },
+            ConnectionEventReceiver {
+                events: receiver,
+                overflow,
+                fatal: false,
+            },
+        )
+    }
+
+    pub(crate) fn send_control(&self, event: ConnectionEvent) -> bool {
+        self.send(event)
+    }
+
+    pub(crate) fn send_proto(&self, event: ConnectionEvent) -> bool {
+        self.send(event)
+    }
+
+    fn send(&self, event: ConnectionEvent) -> bool {
+        match self.events.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.overflow.mark(());
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
+impl ConnectionEventReceiver {
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<ConnectionEvent>> {
+        if self.fatal {
+            return Poll::Ready(None);
+        }
+        if self.overflow.is_fatal() {
+            self.fatal = true;
+            return Poll::Ready(Some(ConnectionEvent::Close {
+                error_code: VarInt::from_u32(0x100),
+                reason: Bytes::from_static(b"connection event overflow signal saturated"),
+            }));
+        }
+        if self.overflow.take().is_some() {
+            self.fatal = true;
+            return Poll::Ready(Some(ConnectionEvent::Close {
+                error_code: VarInt::from_u32(0x100),
+                reason: Bytes::from_static(b"connection event queue overflow"),
+            }));
+        }
+        match self.events.poll_recv(cx) {
+            Poll::Pending => {
+                self.overflow.register(cx.waker());
+                if self.overflow.take().is_some() {
+                    self.fatal = true;
+                    Poll::Ready(Some(ConnectionEvent::Close {
+                        error_code: VarInt::from_u32(0x100),
+                        reason: Bytes::from_static(b"connection event queue overflow"),
+                    }))
+                } else {
+                    Poll::Pending
+                }
+            }
+            result => result,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EndpointEventSender {
+    events: mpsc::Sender<(ConnectionHandle, EndpointEvent)>,
+    overflow: Arc<OverflowSignal<ConnectionHandle>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EndpointEventReceiver {
+    events: mpsc::Receiver<(ConnectionHandle, EndpointEvent)>,
+    overflow: Arc<OverflowSignal<ConnectionHandle>>,
+    fatal: bool,
+}
+
+impl EndpointEventSender {
+    pub(crate) fn channel() -> (Self, EndpointEventReceiver) {
+        let (events, receiver) = mpsc::channel(ENDPOINT_EVENT_QUEUE_CAPACITY);
+        let overflow = Arc::new(OverflowSignal::default());
+        (
+            Self {
+                events,
+                overflow: Arc::clone(&overflow),
+            },
+            EndpointEventReceiver {
+                events: receiver,
+                overflow,
+                fatal: false,
+            },
+        )
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        handle: ConnectionHandle,
+        event: EndpointEvent,
+    ) -> Result<(), mpsc::error::TrySendError<(ConnectionHandle, EndpointEvent)>> {
+        match self.events.try_send((handle, event)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(value)) => {
+                self.overflow.mark(value.0);
+                Err(mpsc::error::TrySendError::Full(value))
+            }
+            Err(mpsc::error::TrySendError::Closed(value)) => {
+                Err(mpsc::error::TrySendError::Closed(value))
+            }
+        }
+    }
+}
+
+impl EndpointEventReceiver {
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(ConnectionHandle, EndpointEvent)>> {
+        if self.fatal || self.overflow.is_fatal() {
+            self.fatal = true;
+            return Poll::Ready(None);
+        }
+        if self.overflow.take().is_some() {
+            self.fatal = true;
+            return Poll::Ready(None);
+        }
+        match self.events.poll_recv(cx) {
+            Poll::Pending => {
+                self.overflow.register(cx.waker());
+                if self.overflow.take().is_some() || self.overflow.is_fatal() {
+                    self.fatal = true;
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
+            result => result,
+        }
+    }
+}
+
 fn is_path_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -58,8 +284,8 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        endpoint_events: EndpointEventSender,
+        conn_events: ConnectionEventReceiver,
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
@@ -1460,8 +1686,8 @@ pub(crate) struct State {
     handshake_confirmed: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    conn_events: ConnectionEventReceiver,
+    endpoint_events: EndpointEventSender,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
@@ -1501,8 +1727,8 @@ impl State {
     fn new(
         inner: proto::Connection,
         handle: ConnectionHandle,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        endpoint_events: EndpointEventSender,
+        conn_events: ConnectionEventReceiver,
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
         sender: Pin<Box<dyn UdpSender>>,
@@ -1604,8 +1830,9 @@ impl State {
 
     fn forward_endpoint_events(&mut self) {
         while let Some(event) = self.inner.poll_endpoint_events() {
-            // If the endpoint driver is gone, noop.
-            let _ = self.endpoint_events.send((self.handle, event));
+            if self.endpoint_events.try_send(self.handle, event).is_err() {
+                return;
+            }
         }
     }
 
@@ -1883,9 +2110,7 @@ impl Drop for State {
     fn drop(&mut self) {
         if !self.inner.is_drained() {
             // Ensure the endpoint can tidy up
-            let _ = self
-                .endpoint_events
-                .send((self.handle, EndpointEvent::drained()));
+            let _ = self.endpoint_events.try_send(self.handle, EndpointEvent::drained());
         }
 
         if !self.on_closed.is_empty()
@@ -1960,3 +2185,49 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// memory allocations when calling `poll_transmit()`. Benchmarks have shown
 /// that numbers around 10 are a good compromise.
 const MAX_TRANSMIT_SEGMENTS: NonZeroUsize = NonZeroUsize::new(10).expect("known");
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn close_event() -> ConnectionEvent {
+        ConnectionEvent::Close {
+            error_code: VarInt::from_u32(0),
+            reason: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn connection_events_are_fifo_and_overflow_is_fatal() {
+        let (sender, mut receiver) = ConnectionEventSender::channel();
+        assert!(sender.send_proto(close_event()));
+        assert!(sender.send_control(close_event()));
+        assert!(matches!(receiver.events.try_recv(), Ok(ConnectionEvent::Close { .. })));
+        assert!(matches!(receiver.events.try_recv(), Ok(ConnectionEvent::Close { .. })));
+
+        for _ in 0..CONNECTION_EVENT_QUEUE_CAPACITY {
+            assert!(sender.send_control(close_event()));
+        }
+        assert!(!sender.send_control(close_event()));
+        assert!(receiver.overflow.take().is_some());
+    }
+
+    #[test]
+    fn endpoint_event_overflow_fails_the_receiver_closed() {
+        let (sender, mut receiver) = EndpointEventSender::channel();
+        for _ in 0..ENDPOINT_EVENT_QUEUE_CAPACITY {
+            assert!(sender
+                .try_send(ConnectionHandle(7), EndpointEvent::drained())
+                .is_ok());
+        }
+        assert!(sender
+            .try_send(ConnectionHandle(9), EndpointEvent::drained())
+            .is_err());
+        assert!(sender
+            .try_send(ConnectionHandle(10), EndpointEvent::drained())
+            .is_err());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(receiver.poll_recv(&mut cx), Poll::Ready(None)));
+        assert!(matches!(receiver.poll_recv(&mut cx), Poll::Ready(None)));
+    }
+}

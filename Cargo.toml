@@ -4,54 +4,92 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
+autotests = false
+autoexamples = false
+autobenches = false
+description = "A QUIC-based TCP alternative over a FakeTCP carrier"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/dyxushuai/quicp"
+documentation = "https://github.com/dyxushuai/quicp#documentation"
+include = [
+    "Cargo.lock",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    ".github/**",
+    "benches/**",
+    "deny.toml",
+    "docs/**",
+    "examples/**",
+    "include/**",
+    "sdk/README.md",
+    "sdk/android/CMakeLists.txt",
+    "sdk/android/examples/**",
+    "sdk/android/src/**",
+    "sdk/apple/Examples/**",
+    "sdk/apple/Package.swift",
+    "sdk/apple/Sources/**",
+    "sdk/apple/Tests/**",
+    "sdk/apple/build-xcframework.sh",
+    "sdk/apple/CQuicp/**",
+    "src/**",
+    "tests/**",
+]
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 
 [features]
-default = ["runtime-tokio"]
-runtime-tokio = ["dep:tokio", "noq/runtime-tokio"]
+ffi-c = ["platform-smoltcp"]
+platform-smoltcp = ["dep:managed", "dep:smoltcp"]
+runtime-tokio = [
+    "dep:libc",
+    "dep:socket2",
+    "dep:tokio",
+    "noq/runtime-tokio",
+]
 tls-rustls = ["noq/rustls-ring"]
+# Repository-only raw benchmark/test access. The stable facade uses HostDatagramSocket/HostRuntime
+# and never exposes backend types; this is not a backend-selection feature.
+internal-bench = []
+
+[package.metadata.docs.rs]
+features = ["runtime-tokio", "tls-rustls", "platform-smoltcp", "ffi-c"]
 
 [dependencies]
 crc32c = "0.6"
-fs4 = "1.1"
-managed = { version = "0.8.0", features = ["std"] }
+futures-core = "0.3"
+managed = { version = "0.8.0", default-features = false, features = ["std"], optional = true }
 # Temporary QUIC backend for the prototype; it is not the QUICP wire contract.
 noq = { version = "=1.1.1", default-features = false, features = ["ring"] }
 # The backend's crypto seam exposes transport parameters through this protocol crate.
 noq-proto = { version = "=1.1.1", default-features = false, features = ["ring"] }
-bytes = "1"
-ring = "0.17.14"
+bytes = { version = "1", default-features = false, features = ["std"] }
+ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
-serde = { version = "1.0", features = ["derive"] }
-smoltcp = { version = "0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-raw", "async"] }
-subtle = "2.6.1"
-thiserror = "2.0"
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+smoltcp = { version = "0.12.0", default-features = false, optional = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-raw", "async"] }
+subtle = { version = "2.6.1", default-features = false }
+thiserror = { version = "2.0", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", optional = true, features = ["io-util", "macros", "net", "rt", "time"] }
-toml = "0.9"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 
-[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
-fearless_simd = { version = "=0.5.0", default-features = false, features = ["std"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-socket2 = { version = "0.6.5", features = ["all"] }
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
 [dev-dependencies]
 rcgen = "=0.14.8"
 tempfile = "3.20"
-tun-rs = { version = "2.8.8", default-features = false, features = ["utun_fd"] }
 
 [[bench]]
 name = "loopback"
 harness = false
-required-features = ["runtime-tokio"]
-
-[[bench]]
-name = "packet_pool"
-harness = false
+required-features = ["runtime-tokio", "internal-bench"]
 
 [[bench]]
 name = "carrier_encode"
@@ -61,14 +99,66 @@ harness = false
 name = "carrier_decode"
 harness = false
 
-[[bench]]
-name = "tcp_loopback"
-harness = false
+[[example]]
+name = "header_protection"
 
-[[bench]]
-name = "utun_loopback"
-harness = false
+[[example]]
+name = "echo"
+
+[[example]]
+name = "host_loopback"
+
+[[example]]
+name = "multipath"
+
+[[example]]
+name = "queqiao_plugin"
+
+[[example]]
+name = "smoltcp_bridge"
+required-features = ["platform-smoltcp"]
+
+[[example]]
+name = "zero_rtt"
+
+[[example]]
+name = "socks5_tunnel"
 required-features = ["runtime-tokio"]
+
+[[test]]
+name = "config"
+
+[[test]]
+name = "faketcp"
+
+[[test]]
+name = "flow"
+
+[[test]]
+name = "host_carrier"
+
+[[test]]
+name = "host_runtime"
+
+[[test]]
+name = "platform"
+required-features = ["platform-smoltcp"]
+
+[[test]]
+name = "smolstack"
+required-features = ["platform-smoltcp"]
+
+[[test]]
+name = "public_api"
+
+[[test]]
+name = "raw_faketcp_multipath"
+
+[[test]]
+name = "session"
+
+[[test]]
+name = "wire"
 
 [lints.rust]
 unsafe_code = "deny"

@@ -114,6 +114,23 @@ fn platform_bridge_rejects_empty_and_oversized_packets() {
 }
 
 #[test]
+fn smoltcp_tx_token_bounds_a_malformed_length() {
+    let config = PlatformPacketConfig {
+        packet_capacity: 1,
+        byte_budget: 1500,
+        smoltcp: SmoltcpConfig::default(),
+    };
+    let bridge = PlatformPacketBridge::new(config).expect("bridge");
+    let mut device = bridge.smoltcp_device(config.smoltcp).expect("device");
+    let tx = device.transmit(Instant::ZERO).expect("tx slot");
+    tx.consume(usize::MAX, |packet| {
+        assert_eq!(packet.len(), config.smoltcp.mtu);
+    });
+    assert_eq!(bridge.egress_len(), 0);
+    assert!(device.transmit(Instant::ZERO).is_some());
+}
+
+#[test]
 fn platform_bridge_serializes_parallel_ingress_calls() {
     let bridge =
         Arc::new(PlatformPacketBridge::new(PlatformPacketConfig::default()).expect("bridge"));

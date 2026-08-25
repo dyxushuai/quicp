@@ -30,7 +30,7 @@ use bytes::{Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent,
-    EndpointEvent, FourTuple, NetworkChangeHint, ServerConfig,
+    FourTuple, NetworkChangeHint, ServerConfig,
 };
 use rustc_hash::FxHashMap;
 #[cfg(all(
@@ -39,13 +39,15 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{Notify, futures::Notified, mpsc};
+use tokio::sync::{Notify, futures::Notified};
 use tracing::{Instrument, Span, trace};
 use udp::{BATCH_SIZE, RecvMeta};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
-    connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
+    connection::{Connecting, ConnectionEventSender, EndpointEventReceiver, EndpointEventSender},
+    incoming::Incoming,
+    work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -285,8 +287,7 @@ impl Endpoint {
 
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
+            sender.send_control(ConnectionEvent::Rebind(inner.socket.create_sender()));
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket
@@ -313,8 +314,7 @@ impl Endpoint {
     pub fn handle_network_change(&self, hint: Option<Arc<dyn NetworkChangeHint + Sync + Send>>) {
         let mut inner = self.inner.state.lock().unwrap();
         for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::LocalAddressChanged(hint.clone()));
+            sender.send_control(ConnectionEvent::LocalAddressChanged(hint.clone()));
         }
         if let Some(driver) = inner.driver.take() {
             driver.wake();
@@ -353,8 +353,7 @@ impl Endpoint {
         let mut endpoint = self.inner.state.lock().unwrap();
         endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
         for sender in endpoint.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
+            sender.send_control(ConnectionEvent::Close {
                 error_code,
                 reason: reason.clone(),
             });
@@ -575,7 +574,7 @@ pub(crate) struct State {
     recv_state: RecvState,
     driver: Option<Waker>,
     ipv6: bool,
-    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
+    events: EndpointEventReceiver,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
@@ -640,11 +639,30 @@ impl State {
         for _ in 0..IO_LOOP_BOUND {
             let (ch, event) = match self.events.poll_recv(cx) {
                 Poll::Ready(Some(x)) => x,
-                Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
+                Poll::Ready(None) => {
+                    let error_code = VarInt::from_u32(0x100);
+                    let reason = Bytes::from_static(b"endpoint event queue overflow");
+                    self.recv_state.connections.close = Some((error_code, reason.clone()));
+                    for sender in self.recv_state.connections.senders.values() {
+                        sender.send_control(ConnectionEvent::Close {
+                            error_code,
+                            reason: reason.clone(),
+                        });
+                    }
+                    self.recv_state.connections.senders.clear();
+                    self.recv_state.connections.active_connections = 0;
+                    shared.all_draining.notify_waiters();
+                    shared.idle.notify_waiters();
+                    return false;
+                }
                 Poll::Pending => {
                     return false;
                 }
             };
+
+            if !self.recv_state.connections.senders.contains_key(&ch) {
+                continue;
+            }
 
             if event.is_draining() {
                 self.recv_state.connections.active_connections -= 1;
@@ -661,13 +679,9 @@ impl State {
                 continue;
             };
             // Ignoring errors from dropped connections that haven't yet been cleaned up
-            let _ = self
-                .recv_state
-                .connections
-                .senders
-                .get_mut(&ch)
-                .unwrap()
-                .send(ConnectionEvent::Proto(event));
+            if let Some(sender) = self.recv_state.connections.senders.get(&ch) {
+                let _ = sender.send_proto(ConnectionEvent::Proto(event));
+            }
         }
 
         true
@@ -744,9 +758,9 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 #[derive(Debug)]
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    senders: FxHashMap<ConnectionHandle, ConnectionEventSender>,
     /// Stored to give out clones to new ConnectionInners
-    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    sender: EndpointEventSender,
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
     /// Counter for all active (non-draining/drained) connections.
@@ -769,13 +783,12 @@ impl ConnectionSet {
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        let (send, recv) = ConnectionEventSender::channel();
         if let Some((error_code, ref reason)) = self.close {
-            send.send(ConnectionEvent::Close {
+            send.send_control(ConnectionEvent::Close {
                 error_code,
                 reason: reason.clone(),
-            })
-            .unwrap();
+            });
         }
         self.senders.insert(handle, send);
         self.active_connections += 1;
@@ -843,7 +856,7 @@ impl EndpointRef {
         ipv6: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
-        let (sender, events) = mpsc::unbounded_channel();
+        let (sender, events) = EndpointEventSender::channel();
         let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
         let sender = socket.create_sender();
         Self(Arc::new(EndpointInner {
@@ -910,7 +923,7 @@ struct RecvState {
 
 impl RecvState {
     fn new(
-        sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+        sender: EndpointEventSender,
         max_receive_segments: NonZeroUsize,
         endpoint: &proto::Endpoint,
     ) -> Self {
@@ -984,12 +997,9 @@ impl RecvState {
                                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                                     // Ignoring errors from dropped connections that haven't yet been cleaned up
                                     received_connection_packet = true;
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                    if let Some(sender) = self.connections.senders.get(&handle) {
+                                        let _ = sender.send_proto(ConnectionEvent::Proto(event));
+                                    }
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
                                     respond(transmit, &response_buffer, sender);

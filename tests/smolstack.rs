@@ -1,6 +1,13 @@
+use std::num::NonZeroUsize;
 use std::task::{Context, Poll, Waker};
 
-use quicp::smolstack::{SmoltcpConfig, TcpFlowBuffers, poll_tcp_read, poll_tcp_write};
+use quicp::platform::{PlatformPacketBridge, PlatformPacketConfig};
+use quicp::smolstack::{
+    SmoltcpConfig, TcpFlowBuffers, poll_bounded, poll_tcp_read, poll_tcp_write,
+};
+use smoltcp::iface::{Config as InterfaceConfig, Interface, PollResult, SocketSet};
+use smoltcp::time::Instant;
+use smoltcp::wire::HardwareAddress;
 
 #[test]
 fn tcp_buffers_are_preallocated_and_zero_is_rejected() {
@@ -41,6 +48,35 @@ fn smoltcp_mtu_boundaries_are_explicit() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn bounded_smoltcp_poll_drains_tier1_ingress() {
+    let bridge = PlatformPacketBridge::new(PlatformPacketConfig::default()).unwrap();
+    bridge.ingress_ip_borrowed(&[0x45; 64]).unwrap();
+    let mut device = bridge
+        .smoltcp_device(SmoltcpConfig::default())
+        .expect("device");
+    let mut interface = Interface::new(
+        InterfaceConfig::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::ZERO,
+    );
+    let mut sockets = SocketSet::new(Vec::new());
+
+    let result = poll_bounded(
+        &mut interface,
+        &mut device,
+        &mut sockets,
+        Instant::ZERO,
+        NonZeroUsize::MIN,
+    );
+
+    assert!(matches!(
+        result,
+        PollResult::None | PollResult::SocketStateChanged
+    ));
+    assert_eq!(bridge.ingress_len(), 0);
 }
 
 #[test]

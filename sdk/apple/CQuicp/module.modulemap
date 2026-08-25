@@ -1,0 +1,4 @@
+module CQuicp [system] {
+    header "quicp.h"
+    export *
+}

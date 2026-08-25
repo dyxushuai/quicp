@@ -20,9 +20,11 @@ pub const DEFAULT_PLATFORM_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// Bounded packet queues shared by a platform adapter and the smoltcp owner task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlatformPacketConfig {
+    /// Maximum packet count reserved independently for ingress and egress.
     pub packet_capacity: usize,
     /// Maximum bytes reserved independently for ingress and egress.
     pub byte_budget: usize,
+    /// smoltcp device limits shared with the bridge.
     pub smoltcp: SmoltcpConfig,
 }
 
@@ -90,12 +92,7 @@ impl PlatformPacketBridge {
     ///
     /// Returns an error when the packet is empty, exceeds the MTU, or the ingress queue is full.
     pub fn ingress_ip(&self, packet: Vec<u8>) -> Result<(), PlatformError> {
-        if packet.is_empty() || packet.len() > self.mtu {
-            return Err(PlatformError::PacketOutsideMtu {
-                len: packet.len(),
-                mtu: self.mtu,
-            });
-        }
+        self.validate_packet_length(packet.len())?;
         let _guard = lock_recover(&self.ingress_producer);
         self.ingress
             .push(packet)
@@ -111,13 +108,21 @@ impl PlatformPacketBridge {
     ///
     /// Returns an error when the packet is empty, exceeds the MTU, or the ingress queue is full.
     pub fn ingress_ip_borrowed(&self, packet: &[u8]) -> Result<(), PlatformError> {
-        if packet.is_empty() || packet.len() > self.mtu {
-            return Err(PlatformError::PacketOutsideMtu {
-                len: packet.len(),
-                mtu: self.mtu,
-            });
-        }
+        self.validate_packet_length(packet.len())?;
         let _guard = lock_recover(&self.ingress_producer);
+        self.ingress_ip_borrowed_validated_while_locked(packet)
+    }
+
+    #[cfg(feature = "ffi-c")]
+    pub(crate) fn lock_ingress_producer(&self) -> MutexGuard<'_, ()> {
+        lock_recover(&self.ingress_producer)
+    }
+
+    pub(crate) fn ingress_ip_borrowed_validated_while_locked(
+        &self,
+        packet: &[u8],
+    ) -> Result<(), PlatformError> {
+        debug_assert!(self.validate_packet_length(packet.len()).is_ok());
         self.ingress
             .push_copy(packet)
             .map_err(PlatformError::from_ring)?;
@@ -142,6 +147,18 @@ impl PlatformPacketBridge {
     /// Returns an error without dequeuing when the output buffer is too small.
     pub fn poll_egress_ip_into(&self, output: &mut [u8]) -> Result<Option<usize>, PlatformError> {
         let _guard = lock_recover(&self.egress_consumer);
+        self.poll_egress_ip_into_while_locked(output)
+    }
+
+    #[cfg(feature = "ffi-c")]
+    pub(crate) fn lock_egress_consumer(&self) -> MutexGuard<'_, ()> {
+        lock_recover(&self.egress_consumer)
+    }
+
+    pub(crate) fn poll_egress_ip_into_while_locked(
+        &self,
+        output: &mut [u8],
+    ) -> Result<Option<usize>, PlatformError> {
         self.egress
             .pop_into(output)
             .map_err(PlatformError::from_ring)
@@ -177,13 +194,22 @@ impl PlatformPacketBridge {
     }
 
     #[must_use]
+    /// Returns the number of complete IP packets waiting for smoltcp.
     pub fn ingress_len(&self) -> usize {
         self.ingress.len()
     }
 
     #[must_use]
+    /// Returns the number of complete IP packets waiting for the platform.
     pub fn egress_len(&self) -> usize {
         self.egress.len()
+    }
+
+    pub(crate) fn validate_packet_length(&self, len: usize) -> Result<(), PlatformError> {
+        if len == 0 || len > self.mtu {
+            return Err(PlatformError::PacketOutsideMtu { len, mtu: self.mtu });
+        }
+        Ok(())
     }
 }
 
@@ -191,27 +217,52 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Packet-bridge configuration, ownership, MTU, and bounded-queue errors.
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PlatformError {
+    /// Packet queue capacity was zero.
     #[error("packet queue capacity must be nonzero")]
     ZeroPacketCapacity,
+    /// Per-direction byte budget was zero.
     #[error("packet queue byte budget must be nonzero")]
     ZeroByteBudget,
+    /// Preallocating packet slots would exceed the byte budget.
     #[error("packet pool reservation exceeds byte budget")]
     PoolBudgetExceeded,
+    /// The bounded queue or byte budget cannot accept another packet.
     #[error("packet queue is full or packet exceeds its byte budget")]
     PacketQueueFull,
+    /// The caller-owned output buffer cannot hold the next packet.
     #[error("output buffer capacity {capacity} is smaller than required {required}")]
-    BufferTooSmall { required: usize, capacity: usize },
+    BufferTooSmall {
+        /// Required packet bytes.
+        required: usize,
+        /// Supplied output capacity.
+        capacity: usize,
+    },
+    /// smoltcp device or poll configuration failed.
     #[error(transparent)]
     Smoltcp(#[from] SmoltcpError),
+    /// Another smoltcp device currently owns the bridge.
     #[error("smoltcp owner is already active for this packet bridge")]
     SmoltcpOwnerBusy,
+    /// The smoltcp device and packet bridge use different MTUs.
     #[error("smoltcp device MTU {actual} does not match packet bridge MTU {expected}")]
-    SmoltcpMtuMismatch { expected: usize, actual: usize },
+    SmoltcpMtuMismatch {
+        /// Bridge MTU.
+        expected: usize,
+        /// Supplied smoltcp MTU.
+        actual: usize,
+    },
+    /// An IP packet was empty or exceeded the bridge MTU.
     #[error("IP packet length {len} is outside MTU {mtu}")]
-    PacketOutsideMtu { len: usize, mtu: usize },
+    PacketOutsideMtu {
+        /// Observed packet length.
+        len: usize,
+        /// Configured MTU.
+        mtu: usize,
+    },
 }
 
 impl PlatformError {

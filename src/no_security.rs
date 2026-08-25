@@ -1,10 +1,10 @@
-//! Plaintext crypto adapter used by the QUICP baseline.
+//! No-TLS crypto adapter used by the QUICP baseline.
 //!
-//! This deliberately does not implement IETF QUIC security. It only supplies the backend seam
-//! needed by the current `noq` stream engine, so the QUICP no-TLS profile can be measured without
-//! TLS or packet AEAD. The TLS adapter remains available as an opt-in configuration.
+//! This deliberately does not implement IETF QUIC payload security. It supplies the backend seam
+//! needed by the current `noq` stream engine, with optional user-provided packet-header protection.
+//! The TLS adapter remains available as an opt-in configuration.
 
-use std::{any::Any, io::Cursor};
+use std::{any::Any, io::Cursor, sync::Arc};
 
 use bytes::BytesMut;
 use noq_proto::{
@@ -14,6 +14,10 @@ use noq_proto::{
         ServerConfig, Session, UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
+};
+
+use crate::header_protection::{
+    BackendHeaderKey, HeaderProtectionFactory, HeaderProtectionKeys, HeaderProtectionSide,
 };
 
 const MAGIC: [u8; 4] = *b"QPCS";
@@ -61,12 +65,21 @@ impl PacketKey for PlainKey {
     }
 }
 
-fn plain_keys() -> Keys {
-    Keys {
-        header: KeyPair {
-            local: Box::new(PlainKey),
-            remote: Box::new(PlainKey),
+fn keys(header_keys: Option<&HeaderProtectionKeys>) -> Keys {
+    let header = header_keys.map_or_else(
+        || KeyPair {
+            local: Box::new(PlainKey) as Box<dyn HeaderKey>,
+            remote: Box::new(PlainKey) as Box<dyn HeaderKey>,
         },
+        |header_keys| KeyPair {
+            local: Box::new(BackendHeaderKey::new(Arc::clone(&header_keys.local)))
+                as Box<dyn HeaderKey>,
+            remote: Box::new(BackendHeaderKey::new(Arc::clone(&header_keys.remote)))
+                as Box<dyn HeaderKey>,
+        },
+    );
+    Keys {
+        header,
         packet: KeyPair {
             local: Box::new(PlainKey),
             remote: Box::new(PlainKey),
@@ -95,10 +108,16 @@ pub(crate) struct NoSecuritySession {
     peer_token: Option<Vec<u8>>,
     peer_params: Option<TransportParameters>,
     input: Vec<u8>,
+    header_keys: Option<Arc<HeaderProtectionKeys>>,
 }
 
 impl NoSecuritySession {
-    fn new(side: Side, profile_token: Vec<u8>, params: &TransportParameters) -> Self {
+    fn new(
+        side: Side,
+        profile_token: Vec<u8>,
+        params: &TransportParameters,
+        header_keys: Option<Arc<HeaderProtectionKeys>>,
+    ) -> Self {
         Self {
             side,
             profile_token,
@@ -107,22 +126,22 @@ impl NoSecuritySession {
             peer_token: None,
             peer_params: None,
             input: Vec::new(),
+            header_keys,
         }
     }
 
     fn message(kind: u8, token: &[u8], params: &TransportParameters, output: &mut Vec<u8>) {
-        let mut encoded_params = Vec::new();
-        params.write(&mut encoded_params);
         output.extend_from_slice(&MAGIC);
         output.push(kind);
         output.push(u8::try_from(token.len()).expect("QUICP profile token is short"));
-        output.extend_from_slice(
-            &u16::try_from(encoded_params.len())
-                .expect("QUICP transport parameters are short")
-                .to_be_bytes(),
-        );
+        let params_len_offset = output.len();
+        output.extend_from_slice(&[0, 0]);
         output.extend_from_slice(token);
-        output.extend_from_slice(&encoded_params);
+        let params_start = output.len();
+        params.write(output);
+        let params_len = u16::try_from(output.len() - params_start)
+            .expect("QUICP transport parameters are short");
+        output[params_len_offset..params_len_offset + 2].copy_from_slice(&params_len.to_be_bytes());
     }
 
     fn protocol_error(reason: &'static str) -> TransportError {
@@ -177,7 +196,7 @@ impl NoSecuritySession {
 
 impl Session for NoSecuritySession {
     fn initial_keys(&self, _dst_cid: ConnectionId, _side: Side) -> Keys {
-        plain_keys()
+        keys(self.header_keys.as_deref())
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
@@ -243,21 +262,21 @@ impl Session for NoSecuritySession {
             (Side::Client, Stage::New) => {
                 Self::message(CLIENT_HELLO, &self.profile_token, &self.params, buf);
                 self.stage = Stage::HelloSent;
-                Some(plain_keys())
+                Some(keys(self.header_keys.as_deref()))
             }
             (Side::Client, Stage::HelloSent) if self.peer_token.is_some() => {
                 Self::message(CLIENT_CONFIRM, self.expected_token(), &self.params, buf);
                 self.stage = Stage::Established;
-                Some(plain_keys())
+                Some(keys(self.header_keys.as_deref()))
             }
             (Side::Server, Stage::New) if self.peer_token.is_some() => {
                 self.stage = Stage::ServerKeysReady;
-                Some(plain_keys())
+                Some(keys(self.header_keys.as_deref()))
             }
             (Side::Server, Stage::ServerKeysReady) => {
                 Self::message(SERVER_HELLO, self.expected_token(), &self.params, buf);
                 self.stage = Stage::Established;
-                Some(plain_keys())
+                Some(keys(self.header_keys.as_deref()))
             }
             _ => None,
         }
@@ -286,12 +305,18 @@ impl Session for NoSecuritySession {
 
 pub(crate) struct NoSecurityClientConfig {
     profile_token: Vec<u8>,
+    header_keys: Option<Arc<HeaderProtectionKeys>>,
 }
 
 impl NoSecurityClientConfig {
-    pub(crate) fn new(profile_token: &[u8]) -> Self {
+    pub(crate) fn new(
+        profile_token: &[u8],
+        header_factory: Option<Arc<dyn HeaderProtectionFactory>>,
+    ) -> Self {
         Self {
             profile_token: profile_token.to_vec(),
+            header_keys: header_factory
+                .map(|factory| Arc::new(factory.build(HeaderProtectionSide::Client))),
         }
     }
 }
@@ -307,12 +332,23 @@ impl ClientConfig for NoSecurityClientConfig {
             Side::Client,
             self.profile_token.clone(),
             params,
+            self.header_keys.clone(),
         )))
     }
 }
 
-#[derive(Default)]
-pub(crate) struct NoSecurityServerConfig;
+pub(crate) struct NoSecurityServerConfig {
+    header_keys: Option<Arc<HeaderProtectionKeys>>,
+}
+
+impl NoSecurityServerConfig {
+    pub(crate) fn new(header_factory: Option<Arc<dyn HeaderProtectionFactory>>) -> Self {
+        Self {
+            header_keys: header_factory
+                .map(|factory| Arc::new(factory.build(HeaderProtectionSide::Server))),
+        }
+    }
+}
 
 impl ServerConfig for NoSecurityServerConfig {
     fn initial_keys(
@@ -320,7 +356,9 @@ impl ServerConfig for NoSecurityServerConfig {
         version: u32,
         _dst_cid: ConnectionId,
     ) -> Result<Keys, UnsupportedVersion> {
-        (version == 1).then(plain_keys).ok_or(UnsupportedVersion)
+        (version == 1)
+            .then(|| keys(self.header_keys.as_deref()))
+            .ok_or(UnsupportedVersion)
     }
 
     fn retry_tag(&self, _version: u32, _orig_dst_cid: ConnectionId, _packet: &[u8]) -> [u8; 16] {
@@ -328,13 +366,34 @@ impl ServerConfig for NoSecurityServerConfig {
     }
 
     fn start_session(&self, _version: u32, params: &TransportParameters) -> Box<dyn Session> {
-        Box::new(NoSecuritySession::new(Side::Server, Vec::new(), params))
+        Box::new(NoSecuritySession::new(
+            Side::Server,
+            Vec::new(),
+            params,
+            self.header_keys.clone(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct XorHeader;
+
+    impl crate::QuicpHeaderProtector for XorHeader {
+        fn decrypt(&self, packet_number_offset: usize, packet: &mut [u8]) {
+            packet[packet_number_offset] ^= 0x80;
+        }
+
+        fn encrypt(&self, packet_number_offset: usize, packet: &mut [u8]) {
+            packet[packet_number_offset] ^= 0x80;
+        }
+
+        fn sample_size(&self) -> usize {
+            1
+        }
+    }
 
     #[test]
     fn plaintext_keys_leave_packet_bytes_unchanged() {
@@ -347,5 +406,17 @@ mod tests {
         assert_eq!(&payload[..], b"payload");
         assert_eq!(key.sample_size(), 0);
         assert_eq!(key.tag_len(), 0);
+    }
+
+    #[test]
+    fn custom_header_protection_only_changes_the_backend_header() {
+        let header_keys = HeaderProtectionKeys::new(Arc::new(XorHeader), Arc::new(XorHeader));
+        let keys = keys(Some(&header_keys));
+        let mut bytes = [0x01, 0x02, 0x03, 0x04, 0x05];
+        keys.header.local.encrypt(0, &mut bytes);
+        assert_eq!(bytes, [0x81, 0x02, 0x03, 0x04, 0x05]);
+        keys.header.remote.decrypt(0, &mut bytes);
+        assert_eq!(bytes, [0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(keys.packet.local.tag_len(), 0);
     }
 }
