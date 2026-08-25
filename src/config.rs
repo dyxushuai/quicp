@@ -1159,7 +1159,22 @@ impl CarrierConfig {
 }
 
 fn default_cookie_secret_file() -> PathBuf {
-    PathBuf::from("/etc/quicp/carrier-cookie.secret")
+    #[cfg(unix)]
+    {
+        PathBuf::from("/etc/quicp/carrier-cookie.secret")
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("quicp")
+            .join("carrier-cookie.secret")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        PathBuf::from("/etc/quicp/carrier-cookie.secret")
+    }
 }
 
 /// Policy for TCP-shaped SYN payloads on the raw carrier.

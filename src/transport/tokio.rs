@@ -5,17 +5,24 @@
 //! the parent. Windows requires a separate packet-injection adapter and is intentionally not
 //! routed through the Unix path.
 
+#[cfg(any(test, unix))]
 use std::io::{self, IoSliceMut};
+#[cfg(any(test, unix))]
 use std::net::{IpAddr, SocketAddr};
+#[cfg(any(test, unix))]
 use std::num::NonZeroUsize;
+#[cfg(any(test, unix))]
 use std::pin::Pin;
-#[cfg(unix)]
+#[cfg(any(test, unix))]
 use std::sync::Arc;
+#[cfg(any(test, unix))]
 use std::task::{Context, Poll};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(any(test, unix))]
 use noq::udp::{RecvMeta, Transmit};
+#[cfg(any(test, unix))]
 use noq::{AsyncUdpSocket, UdpSender};
 
 #[cfg(unix)]
@@ -36,6 +43,7 @@ use super::{
 
 #[cfg(unix)]
 pub(crate) const SYN_COOKIE_EPOCH_SECONDS: u64 = 60;
+#[cfg(any(test, unix))]
 #[derive(Debug)]
 pub(crate) struct MultipathSocket {
     children: [Box<dyn AsyncUdpSocket>; 2],
@@ -43,6 +51,7 @@ pub(crate) struct MultipathSocket {
     next_recv: usize,
 }
 
+#[cfg(any(test, unix))]
 impl MultipathSocket {
     pub(crate) fn new(
         primary: (Box<dyn AsyncUdpSocket>, SocketAddr),
@@ -66,6 +75,7 @@ impl MultipathSocket {
     }
 }
 
+#[cfg(any(test, unix))]
 impl AsyncUdpSocket for MultipathSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(MultipathSender {
@@ -122,6 +132,7 @@ impl AsyncUdpSocket for MultipathSocket {
     }
 }
 
+#[cfg(any(test, unix))]
 fn is_path_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -132,12 +143,14 @@ fn is_path_unavailable(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(any(test, unix))]
 #[derive(Debug)]
 struct MultipathSender {
     children: [Pin<Box<dyn UdpSender>>; 2],
     routes: [(IpAddr, SocketAddr); 2],
 }
 
+#[cfg(any(test, unix))]
 impl UdpSender for MultipathSender {
     fn poll_send(
         mut self: Pin<&mut Self>,

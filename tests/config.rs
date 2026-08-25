@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 use quicp::load_config;
 use quicp::{
-    CarrierConfig, ClientConfig, ClientTls, Config, ConfigError, CongestionControl, FourTuple,
+    CarrierConfig, ClientConfig, ClientTls, Config, ConfigError, CongestionControl,
     MAX_FLOW_BUFFER_BYTES, MssMode, MtuConfig, Multipath, MultipathMode, PathCandidate, PmtuMode,
-    QuicpTransportConfig, ServerConfig, ServerTls, SynDataMode, SynDataPolicy,
+    QuicpTransportConfig, ServerConfig, ServerTls, SynDataPolicy,
 };
+#[cfg(unix)]
+use quicp::{FourTuple, SynDataMode};
 
 const CLIENT_PREFIX: &str = r#"
 role = "client"
