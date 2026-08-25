@@ -27,7 +27,8 @@ focuses on using the Rust crate and platform SDKs.
 > crates.io distribution. `cargo package` intentionally omits path dependencies, so it is not a
 > valid QUICP release artifact; publish a repository source archive that retains `vendor/**` and
 > the project licenses instead.
-> Windows carrier support and production VPN/TUN integrations remain roadmap work.
+> Windows host-driven and packet-bridge builds are supported; the ISP-facing Windows Tier 0
+> carrier and native Wintun/TAP adapter remain roadmap work.
 
 ## Start here
 
@@ -98,10 +99,10 @@ socket differences that Cargo features cannot express.
 
 | Surface | Linux | Apple | Android | Windows |
 | --- | --- | --- | --- | --- |
-| Host-driven Rust API | Yes | Yes | Yes | Roadmap |
+| Host-driven Rust API | Yes | Yes | Yes | Yes |
 | Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | Roadmap: WFP/driver adapter |
-| smoltcp packet bridge | Yes | Yes | Yes | Roadmap |
-| C packet-bridge ABI | Yes | Yes | Yes | Roadmap |
+| smoltcp packet bridge | Yes | Yes | Yes | Yes (host-owned packet I/O) |
+| C packet-bridge ABI | Yes | Yes | Yes | Yes |
 | Swift/Kotlin wrappers | — | Packet bridge | Packet bridge | — |
 
 The C, Swift, and Kotlin surfaces intentionally expose packet bridging only. They do not create
@@ -118,7 +119,8 @@ those pieces at their platform boundary.
   fallback and still needs a privileged runtime probe plus a narrowly scoped PF RST rule before
   production admission.
   Windows must use a separately reviewed WFP/driver packet-injection adapter; Winsock raw TCP is
-  not an admitted Tier 0 implementation. Wintun/TAP remains Tier 1.
+  not an admitted Tier 0 implementation. The host-driven core and packet bridge compile on
+  Windows, while a native Wintun/TAP handle adapter remains Tier 1 roadmap work.
 - **Tier 1 — TUN/TAP:** a virtual packet source/sink for smoltcp, tests, and transparent adapters.
   It is not a wire carrier unless the complete deployment attaches it to a verified physical packet
   path.

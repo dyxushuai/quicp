@@ -574,13 +574,14 @@ result and output lengths before returning `INVALID_ARGUMENT`.
 | macOS | `NEPacketTunnelProvider` packet loop; raw socket only for a privileged probe | optional skeleton |
 | iOS | `NEPacketTunnelProvider.packetFlow` | optional skeleton; entitlement required |
 | Android | `VpnService` established TUN file descriptor | optional skeleton; no raw-underlay grant |
-| Windows | WFP/NDIS signed packet-injection adapter for Tier 0; Wintun/TAP for Tier 1 | roadmap; not admitted in this rollout |
+| Windows | Host-driven core and packet bridge; WFP/NDIS signed packet injection for Tier 0; Wintun/TAP for Tier 1 | core supported; native handles remain roadmap |
 
 `VpnService` and `NEPacketTunnelProvider` provide the virtual IP packet stream, but they do not
 magically grant arbitrary raw TCP injection on the physical underlay. Mobile admission therefore
-requires a separately verified carrier adapter or a platform-appropriate fallback. Windows remains
-a future roadmap item outside the current release matrix; its Tier 0 carrier must use a signed
-WFP/NDIS packet-injection path rather than assume `SOCK_RAW` can send arbitrary TCP packets.
+requires a separately verified carrier adapter or a platform-appropriate fallback. Windows
+host-driven and packet-bridge integrations are in the current build matrix; its Tier 0 carrier
+must use a signed WFP/NDIS packet-injection path rather than assume `SOCK_RAW` can send arbitrary
+TCP packets. A native Wintun/TAP handle adapter remains a separate roadmap item.
 
 ## 9. Configuration and trust boundaries
 

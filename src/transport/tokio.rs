@@ -5,16 +5,24 @@
 //! the parent. Windows requires a separate packet-injection adapter and is intentionally not
 //! routed through the Unix path.
 
+#[cfg(unix)]
 use std::io::{self, IoSliceMut};
+#[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
 use std::num::NonZeroUsize;
+#[cfg(unix)]
 use std::pin::Pin;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::task::{Context, Poll};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 use noq::udp::{RecvMeta, Transmit};
+#[cfg(unix)]
 use noq::{AsyncUdpSocket, UdpSender};
 
 #[cfg(unix)]
@@ -26,6 +34,7 @@ use crate::congestion::TransportOptions;
 #[cfg(unix)]
 use crate::faketcp::{CarrierDirection, FakeTcpSocket, FourTuple, SynDataMode};
 
+#[cfg(unix)]
 use super::{
     Client, Server, TransportError, ValidatedClientConfig, ValidatedServerConfig,
     build_client_endpoint_with_validated_config, build_server_endpoint_with_validated_config,
@@ -34,6 +43,7 @@ use super::{
 
 #[cfg(unix)]
 pub(crate) const SYN_COOKIE_EPOCH_SECONDS: u64 = 60;
+#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct MultipathSocket {
     children: [Box<dyn AsyncUdpSocket>; 2],
@@ -41,6 +51,7 @@ pub(crate) struct MultipathSocket {
     next_recv: usize,
 }
 
+#[cfg(unix)]
 impl MultipathSocket {
     pub(crate) fn new(
         primary: (Box<dyn AsyncUdpSocket>, SocketAddr),
@@ -64,6 +75,7 @@ impl MultipathSocket {
     }
 }
 
+#[cfg(unix)]
 impl AsyncUdpSocket for MultipathSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(MultipathSender {
@@ -120,6 +132,7 @@ impl AsyncUdpSocket for MultipathSocket {
     }
 }
 
+#[cfg(unix)]
 fn is_path_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -130,12 +143,14 @@ fn is_path_unavailable(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct MultipathSender {
     children: [Pin<Box<dyn UdpSender>>; 2],
     routes: [(IpAddr, SocketAddr); 2],
 }
 
+#[cfg(unix)]
 impl UdpSender for MultipathSender {
     fn poll_send(
         mut self: Pin<&mut Self>,
@@ -164,6 +179,7 @@ impl UdpSender for MultipathSender {
     }
 }
 
+#[cfg(unix)]
 impl Client {
     /// Binds a Unix `FakeTCP` client endpoint.
     ///
@@ -212,6 +228,7 @@ impl Client {
         ))
     }
 }
+#[cfg(unix)]
 impl Server {
     /// Binds a Unix `FakeTCP` server endpoint.
     ///

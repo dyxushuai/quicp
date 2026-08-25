@@ -27,8 +27,9 @@ integration and is not advertised as ISP-level FakeTCP camouflage.
 ## Consequences
 
 - A target cannot silently receive a platform implementation with different packet semantics.
-- Windows support can be added behind a real, reviewable adapter without changing FakeTCP's wire
-  contract.
+- Windows Tier 0 support can be added behind a real, reviewable adapter without changing
+  FakeTCP's wire contract; host-driven and packet-bridge integrations do not require that
+  adapter.
 - Cross-target CI must test the host-driven profile separately from privileged Tier 0 integration.
 - The Windows Tier 0 adapter remains roadmap work until driver, signing, privilege, packet capture,
   RST suppression, and rollback evidence exist.

@@ -94,6 +94,10 @@ jobs:
         run: cargo check --all-features --locked
       - name: Run the Windows host-driven tests
         run: cargo test --all-features --locked
+      - name: Run the Windows runtime-neutral examples
+        run: |
+          cargo run --all-features --locked --example echo
+          cargo run --all-features --locked --example host_loopback
 
   apple:
     runs-on: macos-14

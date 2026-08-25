@@ -214,15 +214,16 @@ cmake --build "$RUNNER_TEMP/quicp-jni" --parallel
 - [ ] The VpnService example is documented as a packet-loop/carrier skeleton and is not accepted as
   proof of arbitrary raw TCP injection.
 
-### 3.3 Windows (roadmap, not admitted)
+### 3.3 Windows host-driven and packet bridge
 
-Windows is intentionally excluded from the current release matrix and remains a future roadmap
-item. Do not claim Windows FakeTCP, raw sockets, or WFP/Wintun support until the native carrier and
-black-box evidence exist.
+The runtime-neutral host API, smoltcp packet bridge, and C packet ABI are supported on Windows.
+They do not create a TUN/Wintun handle or provide ISP-facing FakeTCP by themselves.
 
-- [ ] TODO: implement a supported WFP/Wintun carrier without exposing a fake-available Linux raw
-  socket builder.
-- [ ] TODO: verify construction-time unsupported errors and crash/rollback cleanup.
+- [ ] Run the native Windows host-driven echo and shutdown tests.
+- [ ] Run the C packet-bridge smoke test with caller-owned buffers.
+- [ ] TODO: implement and black-box test a signed WFP/NDIS Tier 0 carrier without exposing a
+  fake-available Winsock raw socket builder.
+- [ ] TODO: implement and test a native Wintun/TAP Tier 1 handle adapter with rollback cleanup.
 
 ### 3.4 Other non-Linux behavior
 

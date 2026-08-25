@@ -5,7 +5,9 @@
 
 use std::cmp::min;
 use std::collections::HashSet;
+#[cfg(any(unix, windows))]
 use std::fs::File;
+#[cfg(any(unix, windows))]
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
@@ -57,14 +59,19 @@ pub(crate) fn read_trusted_file(
         return Err(ConfigError::PathNotAbsolute);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut file = secure_open(path)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err(ConfigError::UnsupportedPlatform);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let metadata = verify_file(path, &file)?;
+        #[cfg(windows)]
+        if mode == TrustedFileMode::OwnerOnly {
+            return Err(ConfigError::UnsupportedPlatform);
+        }
+        #[cfg(unix)]
         if mode == TrustedFileMode::OwnerOnly && metadata.mode() & 0o077 != 0 {
             return Err(ConfigError::InsecurePermissions {
                 path: path.to_owned(),
@@ -139,6 +146,21 @@ fn secure_open(path: &Path) -> Result<File, ConfigError> {
     .map_err(secure_open_error)
 }
 
+#[cfg(windows)]
+fn secure_open(path: &Path) -> Result<File, ConfigError> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // FILE_FLAG_OPEN_REPARSE_POINT prevents the final path component from being followed.
+    // The handle metadata check below then rejects the reparse point instead of reading it.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(ConfigError::Io)
+}
+
 #[cfg(unix)]
 fn secure_open_error(error: rustix::io::Errno) -> ConfigError {
     ConfigError::SecureOpen(error.into())
@@ -151,6 +173,15 @@ fn verify_file(path: &Path, file: &File) -> Result<std::fs::Metadata, ConfigErro
         return Err(ConfigError::NotRegularFile(path.to_owned()));
     }
     verify_owner_and_mode(path, &metadata)?;
+    Ok(metadata)
+}
+
+#[cfg(windows)]
+fn verify_file(path: &Path, file: &File) -> Result<std::fs::Metadata, ConfigError> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError::NotRegularFile(path.to_owned()));
+    }
     Ok(metadata)
 }
 
@@ -1283,8 +1314,8 @@ pub enum ConfigError {
     /// A trusted-file path was relative.
     #[error("configuration path must be absolute")]
     PathNotAbsolute,
-    /// Secure trusted-file loading is unavailable on this platform.
-    #[error("configuration loading is supported only on Unix")]
+    /// Owner-only trusted-file loading is unavailable on this platform.
+    #[error("owner-only trusted-file loading is unavailable on this platform")]
     UnsupportedPlatform,
     /// A trusted-file I/O operation failed.
     #[error("configuration I/O failed: {0}")]
@@ -1624,10 +1655,12 @@ fn validate_path_candidate(candidate: &PathCandidate) -> Result<(), ConfigError>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::{ConfigError, TrustedFileMode, read_trusted_file};
 
+    #[cfg(unix)]
     #[test]
     fn private_material_must_be_owner_only() {
         let directory = tempfile::tempdir().unwrap();
@@ -1640,6 +1673,36 @@ mod tests {
         assert!(matches!(
             read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly),
             Err(ConfigError::InsecurePermissions { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_config_file_is_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("config.toml");
+        std::fs::write(&path, b"role = \"client\"\n").unwrap();
+
+        assert_eq!(
+            read_trusted_file(&path, 1024, TrustedFileMode::SharedReadable).unwrap(),
+            b"role = \"client\"\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_file_loading_fails_closed_until_acl_checks_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("secret");
+        std::fs::write(&path, b"secret").unwrap();
+
+        assert!(matches!(
+            read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly),
+            Err(ConfigError::UnsupportedPlatform)
         ));
     }
 }
