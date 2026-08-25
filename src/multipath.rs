@@ -1,9 +1,13 @@
-use std::time::Duration;
+use std::sync::Arc;
 
-use noq::{AckFrequencyConfig, PathEvent, PathId, PathStatus, TransportConfig, VarInt};
+use noq::{
+    AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, PathEvent, PathId, PathStatus,
+    TransportConfig, VarInt,
+};
 use thiserror::Error;
 
-use crate::config::MultipathMode;
+use crate::config::{CongestionControl, MultipathMode, PmtuMode, QuicpTransportConfig};
+use crate::congestion::{BackendFactory, CongestionControllerFactory};
 use crate::faketcp::FourTuple;
 
 const MAX_PATH_IDS: usize = 8;
@@ -11,11 +15,6 @@ const INITIAL_BACKOFF_SECONDS: u64 = 5;
 const MAX_BACKOFF_SECONDS: u64 = 60;
 const CHURN_BURST: u8 = 2;
 const CHURN_REFILL_SECONDS: u64 = 5;
-const CONNECTION_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
-// Keep one flow from stalling on transport-window updates while the connection cap bounds memory.
-const STREAM_WINDOW_BYTES: u32 = 128 * 1024;
-const MAX_BIDIRECTIONAL_STREAMS: u32 = 128;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PathRole {
     Primary,
@@ -30,19 +29,23 @@ impl PathRole {
         }
     }
 
-    const fn expected_status(self) -> PathStatus {
-        match self {
-            Self::Primary => PathStatus::Available,
-            Self::Backup => PathStatus::Backup,
-        }
+    const fn expected_status() -> PathStatus {
+        // Path status is local scheduler state. A peer-created path starts as Available on the
+        // remote endpoint even when this endpoint opened it as a local Backup path.
+        PathStatus::Available
     }
 }
 
+/// Aggregate readiness of the configured primary and backup paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathHealth {
+    /// Required path validation has not completed.
     NotReady,
+    /// Every required path is available.
     Ready,
+    /// The primary remains usable but a backup path is unavailable.
     Degraded,
+    /// No required path remains usable.
     Failed,
 }
 
@@ -65,15 +68,17 @@ struct Path {
 impl Path {
     fn usable(self) -> bool {
         self.state == PathState::Established
-            && self.remote_status == Some(self.role.expected_status())
+            && self.remote_status == Some(PathRole::expected_status())
     }
 }
 
 #[derive(Debug)]
 pub struct PathManager {
     mode: MultipathMode,
-    paths: Vec<Path>,
-    seen: Vec<PathId>,
+    paths: [Option<Path>; 2],
+    path_count: usize,
+    seen: [Option<PathId>; MAX_PATH_IDS],
+    seen_count: usize,
     retry_at: [u64; 2],
     retry_delay: [u64; 2],
     activated: bool,
@@ -85,8 +90,10 @@ impl PathManager {
     pub fn new(mode: MultipathMode) -> Self {
         Self {
             mode,
-            paths: Vec::with_capacity(usize::from(mode.path_limit())),
-            seen: Vec::with_capacity(MAX_PATH_IDS),
+            paths: [None; 2],
+            path_count: 0,
+            seen: [None; MAX_PATH_IDS],
+            seen_count: 0,
             retry_at: [0; 2],
             retry_delay: [INITIAL_BACKOFF_SECONDS; 2],
             activated: false,
@@ -110,23 +117,24 @@ impl PathManager {
             return Err(PathError::RoleDisabled);
         }
         let index = role.index();
-        if self.paths.iter().any(|path| path.role == role) {
+        if self.paths.iter().flatten().any(|path| path.role == role) {
             return Err(PathError::RoleBusy);
         }
         if self
             .paths
             .iter()
+            .flatten()
             .any(|path| path.state == PathState::Validating)
         {
             return Err(PathError::ValidationInFlight);
         }
-        if self.paths.len() == usize::from(self.mode.path_limit()) {
+        if self.path_count == usize::from(self.mode.path_limit()) {
             return Err(PathError::PathLimit);
         }
-        if self.seen.contains(&id) {
+        if self.seen[..self.seen_count].contains(&Some(id)) {
             return Err(PathError::ReusedPathId);
         }
-        if self.seen.len() == MAX_PATH_IDS {
+        if self.seen_count == MAX_PATH_IDS {
             return Err(PathError::LifetimeCap);
         }
         if now_seconds < self.retry_at[index] {
@@ -135,14 +143,19 @@ impl PathManager {
             });
         }
 
-        self.seen.push(id);
-        self.paths.push(Path {
+        let Some(slot) = self.paths.iter_mut().find(|path| path.is_none()) else {
+            return Err(PathError::PathLimit);
+        };
+        self.seen[self.seen_count] = Some(id);
+        self.seen_count += 1;
+        *slot = Some(Path {
             id,
             role,
             state: PathState::Validating,
             remote_status: None,
             carrier_tuple: None,
         });
+        self.path_count += 1;
         Ok(())
     }
 
@@ -159,6 +172,7 @@ impl PathManager {
         if self
             .paths
             .iter()
+            .flatten()
             .any(|path| path.carrier_tuple == Some(tuple))
         {
             return Err(PathError::CarrierTupleBusy);
@@ -176,6 +190,7 @@ impl PathManager {
     pub fn carrier_tuple(&self, id: PathId) -> Option<FourTuple> {
         self.paths
             .iter()
+            .flatten()
             .find(|path| path.id == id)
             .and_then(|path| path.carrier_tuple)
     }
@@ -187,13 +202,26 @@ impl PathManager {
     /// Returns an error for an unknown path, invalid transition, or unreliable event view.
     pub fn established(&mut self, id: PathId) -> Result<(), PathError> {
         self.ensure_reliable()?;
-        let path = self.path_mut(id)?;
-        if path.state != PathState::Validating {
-            return Err(PathError::InvalidTransition);
+        let Some(position) = self.path_position(id) else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        let Some(path) = self.paths[position].as_mut() else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        match path.state {
+            PathState::Established => Ok(()),
+            PathState::Validating => {
+                path.state = PathState::Established;
+                self.refresh_activation();
+                Ok(())
+            }
+            PathState::Lost => {
+                self.reliable = false;
+                Err(PathError::InvalidTransition)
+            }
         }
-        path.state = PathState::Established;
-        self.refresh_activation();
-        Ok(())
     }
 
     /// Records the peer's path status.
@@ -203,10 +231,21 @@ impl PathManager {
     /// Returns an error and makes the connection unusable if the event is unknown or mismatched.
     pub fn remote_status(&mut self, id: PathId, status: PathStatus) -> Result<(), PathError> {
         self.ensure_reliable()?;
-        let path = self.path_mut(id)?;
-        if status != path.role.expected_status() {
+        let Some(position) = self.path_position(id) else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        if status != PathRole::expected_status() {
             self.reliable = false;
             return Err(PathError::StatusMismatch);
+        }
+        let Some(path) = self.paths[position].as_mut() else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        if path.state == PathState::Lost {
+            self.reliable = false;
+            return Err(PathError::InvalidTransition);
         }
         if path.remote_status == Some(status) {
             return Ok(());
@@ -223,8 +262,16 @@ impl PathManager {
     /// Returns an error for an unknown path, invalid transition, or unreliable event view.
     pub fn lost(&mut self, id: PathId) -> Result<(), PathError> {
         self.ensure_reliable()?;
-        let path = self.path_mut(id)?;
+        let Some(position) = self.path_position(id) else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        let Some(path) = self.paths[position].as_mut() else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
         if !matches!(path.state, PathState::Validating | PathState::Established) {
+            self.reliable = false;
             return Err(PathError::InvalidTransition);
         }
         path.state = PathState::Lost;
@@ -238,11 +285,16 @@ impl PathManager {
     /// Returns an error for an unknown path or unreliable event view.
     pub fn discarded(&mut self, id: PathId, now_seconds: u64) -> Result<(), PathError> {
         self.ensure_reliable()?;
-        let Some(position) = self.paths.iter().position(|path| path.id == id) else {
+        let Some(position) = self.path_position(id) else {
             self.reliable = false;
             return Err(PathError::UnknownPath);
         };
-        let role = self.paths.swap_remove(position).role;
+        let Some(path) = self.paths[position].take() else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        let role = path.role;
+        self.path_count -= 1;
         let index = role.index();
         self.retry_at[index] = now_seconds.saturating_add(self.retry_delay[index]);
         self.retry_delay[index] = (self.retry_delay[index] * 2).min(MAX_BACKOFF_SECONDS);
@@ -263,22 +315,39 @@ impl PathManager {
         event: &PathEvent,
         now_seconds: u64,
     ) -> Result<(), PathError> {
-        match event {
+        let result = match event {
             PathEvent::Established { id, .. } => self.established(*id),
             PathEvent::Abandoned { id, .. } => self.lost(*id),
-            PathEvent::Discarded { id, .. } => self.discarded(*id, now_seconds),
+            PathEvent::Discarded { id, .. } => self.discarded_event(*id, now_seconds),
             PathEvent::RemoteStatus { id, status, .. } => self.remote_status(*id, *status),
             PathEvent::ObservedAddr { .. } => Ok(()),
             _ => {
                 self.reliable = false;
                 Err(PathError::UnknownTransportEvent)
             }
+        };
+        if result.is_err() {
+            self.reliable = false;
         }
+        result
+    }
+
+    fn discarded_event(&mut self, id: PathId, now_seconds: u64) -> Result<(), PathError> {
+        self.ensure_reliable()?;
+        let Some(path) = self.paths.iter().flatten().find(|path| path.id == id) else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        if path.state != PathState::Lost {
+            self.reliable = false;
+            return Err(PathError::InvalidTransition);
+        }
+        self.discarded(id, now_seconds)
     }
 
     #[must_use]
     pub fn retained_paths(&self) -> usize {
-        self.paths.len()
+        self.path_count
     }
 
     #[must_use]
@@ -289,7 +358,13 @@ impl PathManager {
         if !self.activated {
             return PathHealth::NotReady;
         }
-        match self.paths.iter().filter(|path| path.usable()).count() {
+        match self
+            .paths
+            .iter()
+            .flatten()
+            .filter(|path| path.usable())
+            .count()
+        {
             count if count == usize::from(self.mode.path_limit()) => PathHealth::Ready,
             0 => PathHealth::Failed,
             _ => PathHealth::Degraded,
@@ -305,16 +380,31 @@ impl PathManager {
     }
 
     fn path_mut(&mut self, id: PathId) -> Result<&mut Path, PathError> {
-        let Some(path) = self.paths.iter_mut().find(|path| path.id == id) else {
+        let Some(position) = self.path_position(id) else {
+            self.reliable = false;
+            return Err(PathError::UnknownPath);
+        };
+        let Some(path) = self.paths[position].as_mut() else {
             self.reliable = false;
             return Err(PathError::UnknownPath);
         };
         Ok(path)
     }
 
+    fn path_position(&self, id: PathId) -> Option<usize> {
+        self.paths
+            .iter()
+            .position(|path| path.is_some_and(|path| path.id == id))
+    }
+
     fn refresh_activation(&mut self) {
         self.activated = self.activated
-            || self.paths.iter().filter(|path| path.usable()).count()
+            || self
+                .paths
+                .iter()
+                .flatten()
+                .filter(|path| path.usable())
+                .count()
                 == usize::from(self.mode.path_limit());
     }
 }
@@ -354,20 +444,90 @@ pub enum PathError {
 /// Builds the bounded transport profile used by the current QUIC-compatible backend.
 #[must_use]
 pub fn backend_transport_config(mode: MultipathMode) -> TransportConfig {
+    backend_transport_config_with_congestion(mode, CongestionControl::default())
+}
+
+/// Builds the bounded transport profile with an explicit congestion controller.
+#[must_use]
+pub fn backend_transport_config_with_congestion(
+    mode: MultipathMode,
+    congestion_control: CongestionControl,
+) -> TransportConfig {
+    let policy = QuicpTransportConfig::default().with_congestion_control(congestion_control);
+    backend_transport_config_with_options(mode, &policy, None, None)
+}
+
+/// Builds a bounded transport profile with either a built-in or Rust custom controller.
+pub(crate) fn backend_transport_config_with_options(
+    mode: MultipathMode,
+    transport_policy: &QuicpTransportConfig,
+    custom_congestion: Option<Arc<dyn CongestionControllerFactory>>,
+    payload_ceiling: Option<u16>,
+) -> TransportConfig {
     let mut config = TransportConfig::default();
+    if let Some(factory) = custom_congestion {
+        config.congestion_controller_factory(Arc::new(BackendFactory::new(factory)));
+    } else {
+        match transport_policy.congestion_control {
+            CongestionControl::Cubic => {
+                config.congestion_controller_factory(Arc::new(
+                    noq::congestion::CubicConfig::default(),
+                ));
+            }
+            CongestionControl::NewReno => {
+                config.congestion_controller_factory(Arc::new(
+                    noq::congestion::NewRenoConfig::default(),
+                ));
+            }
+            CongestionControl::Bbr3 => {
+                config.congestion_controller_factory(Arc::new(
+                    noq::congestion::Bbr3Config::default(),
+                ));
+            }
+        }
+    }
     let mut ack_frequency = AckFrequencyConfig::default();
     ack_frequency
-        .ack_eliciting_threshold(10u32.into())
-        .max_ack_delay(Some(Duration::from_millis(1)));
+        .ack_eliciting_threshold(transport_policy.ack_eliciting_threshold.into())
+        .max_ack_delay(Some(transport_policy.max_ack_delay));
+    let mut mtu_discovery = MtuDiscoveryConfig::default();
+    let upper_bound = [
+        payload_ceiling,
+        transport_policy.mtu.max_quic_payload,
+        transport_policy.mtu.pmtu_upper_bound,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(crate::config::MAX_QUIC_PAYLOAD);
+    mtu_discovery
+        .interval(transport_policy.mtu.pmtu_interval)
+        .upper_bound(upper_bound)
+        .black_hole_cooldown(transport_policy.mtu.pmtu_black_hole_cooldown)
+        .minimum_change(transport_policy.mtu.pmtu_minimum_change);
     config
-        .max_idle_timeout(Some(VarInt::from_u32(60_000).into()))
-        .default_path_keep_alive_interval(Some(Duration::from_secs(5)))
-        .default_path_max_idle_timeout(Some(Duration::from_secs(15)))
-        .send_window(u64::from(CONNECTION_WINDOW_BYTES))
-        .receive_window(VarInt::from_u32(CONNECTION_WINDOW_BYTES))
-        .stream_receive_window(VarInt::from_u32(STREAM_WINDOW_BYTES))
-        .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDIRECTIONAL_STREAMS))
-        .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .initial_mtu(transport_policy.mtu.initial_quic_payload)
+        .min_mtu(transport_policy.mtu.min_quic_payload)
+        .mtu_discovery_config(
+            (transport_policy.mtu.pmtu != PmtuMode::Disabled).then_some(mtu_discovery),
+        )
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(transport_policy.idle_timeout)
+                .expect("validated QUICP idle timeout fits QUIC varint"),
+        ))
+        .default_path_keep_alive_interval(Some(transport_policy.keep_alive_interval))
+        .default_path_max_idle_timeout(Some(transport_policy.path_idle_timeout))
+        .send_window(transport_policy.connection_send_window)
+        .receive_window(
+            VarInt::from_u64(transport_policy.connection_receive_window).unwrap_or(VarInt::MAX),
+        )
+        .stream_receive_window(VarInt::from_u32(transport_policy.stream_receive_window))
+        .max_concurrent_bidi_streams(VarInt::from_u32(
+            transport_policy.max_concurrent_bidi_streams,
+        ))
+        .max_concurrent_uni_streams(VarInt::from_u32(
+            transport_policy.max_concurrent_uni_streams,
+        ))
         .datagram_receive_buffer_size(None)
         .datagram_send_buffer_size(0)
         .ack_frequency_config(Some(ack_frequency))
@@ -419,8 +579,9 @@ impl ChurnBucket {
 mod tests {
     use super::{
         ChurnBucket, PathError, PathHealth, PathManager, PathRole, backend_transport_config,
+        backend_transport_config_with_congestion,
     };
-    use crate::config::MultipathMode;
+    use crate::config::{CongestionControl, MultipathMode};
     use noq::{PathId, PathStatus};
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -435,7 +596,7 @@ mod tests {
         manager.remote_status(id(0), PathStatus::Available).unwrap();
         manager.begin_path(PathRole::Backup, id(1), 0).unwrap();
         manager.established(id(1)).unwrap();
-        manager.remote_status(id(1), PathStatus::Backup).unwrap();
+        manager.remote_status(id(1), PathStatus::Available).unwrap();
         manager
     }
 
@@ -452,7 +613,7 @@ mod tests {
         manager.begin_path(PathRole::Backup, id(1), 0).unwrap();
         manager.established(id(1)).unwrap();
         assert_eq!(manager.health(), PathHealth::NotReady);
-        manager.remote_status(id(1), PathStatus::Backup).unwrap();
+        manager.remote_status(id(1), PathStatus::Available).unwrap();
         assert_eq!(manager.health(), PathHealth::Ready);
     }
 
@@ -519,7 +680,7 @@ mod tests {
         mismatch.begin_path(PathRole::Backup, id(1), 0).unwrap();
         mismatch.established(id(1)).unwrap();
         assert_eq!(
-            mismatch.remote_status(id(1), PathStatus::Available),
+            mismatch.remote_status(id(1), PathStatus::Backup),
             Err(PathError::StatusMismatch)
         );
         assert_eq!(mismatch.health(), PathHealth::Failed);
@@ -528,6 +689,35 @@ mod tests {
         lagged.event_lagged();
         assert_eq!(lagged.health(), PathHealth::Failed);
         assert_eq!(lagged.established(id(99)), Err(PathError::Unreliable));
+    }
+
+    #[test]
+    fn late_and_repeated_events_fail_closed() {
+        let mut late = PathManager::new(MultipathMode::Failover);
+        late.begin_path(PathRole::Backup, id(1), 0).unwrap();
+        late.lost(id(1)).unwrap();
+        assert_eq!(late.established(id(1)), Err(PathError::InvalidTransition));
+        assert_eq!(late.health(), PathHealth::Failed);
+
+        let mut repeated = ready_failover();
+        repeated.lost(id(0)).unwrap();
+        assert_eq!(repeated.lost(id(0)), Err(PathError::InvalidTransition));
+        assert_eq!(repeated.health(), PathHealth::Failed);
+
+        let mut stale_status = ready_failover();
+        stale_status.lost(id(0)).unwrap();
+        assert_eq!(
+            stale_status.remote_status(id(0), PathStatus::Available),
+            Err(PathError::InvalidTransition)
+        );
+        assert_eq!(stale_status.health(), PathHealth::Failed);
+
+        let mut out_of_order_discard = ready_failover();
+        assert_eq!(
+            out_of_order_discard.discarded_event(id(0), 0),
+            Err(PathError::InvalidTransition)
+        );
+        assert_eq!(out_of_order_discard.health(), PathHealth::Failed);
     }
 
     #[test]
@@ -554,6 +744,17 @@ mod tests {
             assert!(profile.contains("datagram_receive_buffer_size: None"));
             assert!(profile.contains("datagram_send_buffer_size: 0"));
             assert!(profile.contains("enable_segmentation_offload: true"));
+        }
+    }
+
+    #[test]
+    fn transport_profile_accepts_each_built_in_congestion_controller() {
+        for algorithm in [
+            CongestionControl::Cubic,
+            CongestionControl::NewReno,
+            CongestionControl::Bbr3,
+        ] {
+            let _ = backend_transport_config_with_congestion(MultipathMode::Off, algorithm);
         }
     }
 

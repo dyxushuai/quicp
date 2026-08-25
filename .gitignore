@@ -1,6 +1,7 @@
 /target/
-/.context/
 /.tmp*/
 .DS_Store
 perf.data*
 *.profraw
+/sdk/apple/Artifacts/
+/sdk/apple/.build/

@@ -6,9 +6,10 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use alloc::{boxed::Box, vec, vec::Vec};
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -18,7 +19,7 @@ use thiserror::Error;
 /// `Arc` is fine for passing a ring to those two owners, but concurrent calls from multiple
 /// producers or multiple consumers are not supported.
 #[derive(Debug)]
-pub(crate) struct PacketRing {
+pub struct PacketRing {
     queue: SpscQueue<Vec<u8>>,
     free: Option<SpscQueue<Vec<u8>>>,
     slot_capacity: Option<usize>,
@@ -144,7 +145,7 @@ impl PacketRing {
     /// # Errors
     ///
     /// Returns an error when the packet exceeds the byte budget or no queue/pool slot is
-    /// available.
+    /// available. The `Full` error carries an empty vector because the input is borrowed.
     pub fn push_copy(&self, packet: &[u8]) -> Result<(), RingError> {
         if packet.len() > self.byte_budget {
             return Err(RingError::TooLarge {
@@ -153,22 +154,23 @@ impl PacketRing {
             });
         }
         if !self.can_fit(packet.len()) || !self.has_buffer_for(packet.len()) {
-            return Err(RingError::Full(packet.to_vec()));
+            return Err(RingError::Full(Vec::new()));
         }
         let mut buffer = self
             .acquire_buffer(0)
-            .ok_or_else(|| RingError::Full(packet.to_vec()))?;
+            .ok_or_else(|| RingError::Full(Vec::new()))?;
         // Extending an empty preallocated Vec writes the payload directly into spare capacity;
         // requesting `packet.len()` above would zero-fill it before this copy.
         buffer.extend_from_slice(packet);
         match self.push(buffer) {
             Ok(()) => Ok(()),
-            Err(RingError::Full(_buffer)) => Err(RingError::Full(packet.to_vec())),
+            Err(RingError::Full(_buffer)) => Err(RingError::Full(Vec::new())),
             Err(error) => Err(error),
         }
     }
 
     /// Removes the oldest packet, if one is available.
+    #[allow(dead_code)]
     pub fn pop(&self) -> Option<Vec<u8>> {
         let packet = self.queue.pop()?;
         let consumed = self.bytes.consumed.0.load(Ordering::Relaxed);
@@ -392,7 +394,7 @@ impl<T> SpscQueue<T> {
     }
 
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        SpscQueue::<T>::len(self) == 0
     }
 
     const fn capacity(&self) -> usize {
@@ -402,11 +404,12 @@ impl<T> SpscQueue<T> {
 
 impl<T> Drop for SpscQueue<T> {
     fn drop(&mut self) {
-        while self.pop().is_some() {}
+        while SpscQueue::<T>::pop(self).is_some() {}
     }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum RingError {
     #[error("packet ring capacity must be nonzero")]
     ZeroCapacity,
@@ -428,4 +431,111 @@ pub enum RingError {
     BufferTooSmall { required: usize, capacity: usize },
     #[error("packet ring is full")]
     Full(Vec<u8>),
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::{PacketRing, RingError};
+
+    #[test]
+    fn bounded_ring_moves_packets_without_copying_the_payload() {
+        let ring = PacketRing::new(2, 8).expect("ring");
+        let packet = vec![1, 2, 3];
+        let pointer = packet.as_ptr();
+        ring.push(packet).expect("push");
+        let packet = ring.pop().expect("pop");
+        assert_eq!(packet, [1, 2, 3]);
+        assert_eq!(packet.as_ptr(), pointer);
+        assert_eq!(ring.bytes(), 0);
+    }
+
+    #[test]
+    fn ring_rejects_byte_budget_and_slot_overflow_without_silent_drop() {
+        let ring = PacketRing::new(1, 4).expect("ring");
+        assert!(matches!(
+            ring.push(vec![1, 2, 3, 4, 5]),
+            Err(RingError::TooLarge { .. })
+        ));
+        ring.push(vec![1, 2, 3]).expect("first push");
+        let error = ring.push(vec![4]).expect_err("slot is full");
+        assert!(matches!(error, RingError::Full(_)));
+        assert_eq!(ring.pop().expect("first packet"), [1, 2, 3]);
+    }
+
+    #[test]
+    fn preallocated_ring_reuses_packet_buffers() {
+        let ring = PacketRing::with_preallocated(1, 8, 8).expect("ring");
+        assert_eq!(ring.available_buffers(), Some(1));
+        let mut packet = ring.acquire_buffer(3).expect("buffer");
+        packet.copy_from_slice(&[1, 2, 3]);
+        ring.push(packet).expect("push");
+        let packet = ring.pop().expect("pop");
+        let pointer = packet.as_ptr();
+        ring.recycle_buffer(packet);
+        assert_eq!(ring.available_buffers(), Some(1));
+        let packet = ring.acquire_buffer(4).expect("reused buffer");
+        assert_eq!(packet.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn preallocated_ring_charges_the_pool_to_the_budget() {
+        assert!(matches!(
+            PacketRing::with_preallocated(2, 3, 2),
+            Err(RingError::PoolBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn pop_into_keeps_a_packet_when_the_output_buffer_is_small() {
+        let ring = PacketRing::with_preallocated(1, 8, 8).expect("ring");
+        ring.push_copy(&[1, 2, 3]).expect("push");
+        let mut small = [0; 2];
+        assert!(matches!(
+            ring.pop_into(&mut small),
+            Err(RingError::BufferTooSmall {
+                required: 3,
+                capacity: 2
+            })
+        ));
+        assert_eq!(ring.len(), 1);
+        let mut output = [0; 8];
+        assert_eq!(ring.pop_into(&mut output).expect("pop"), Some(3));
+        assert_eq!(&output[..3], [1, 2, 3]);
+        assert_eq!(ring.available_buffers(), Some(1));
+    }
+
+    #[test]
+    fn spsc_ring_transfers_packets_between_two_threads() {
+        const COUNT: usize = 100_000;
+        let ring = Arc::new(PacketRing::new(64, COUNT).expect("ring"));
+        let producer_ring = Arc::clone(&ring);
+        let producer = thread::spawn(move || {
+            for value in 0..COUNT {
+                let packet = vec![u8::try_from(value % 251).expect("value fits")];
+                loop {
+                    if producer_ring.push(packet.clone()).is_ok() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        for value in 0..COUNT {
+            loop {
+                if let Some(packet) = ring.pop() {
+                    assert_eq!(packet, [u8::try_from(value % 251).expect("value fits")]);
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        }
+        producer.join().expect("producer");
+        assert!(ring.is_empty());
+        assert_eq!(ring.bytes(), 0);
+    }
 }

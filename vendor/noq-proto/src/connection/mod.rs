@@ -6224,6 +6224,8 @@ impl Connection {
             // MIN_INITIAL_SIZE (1200 bytes).
             && builder.buf.segment_size() >= usize::from(MIN_INITIAL_SIZE)
         {
+            let queue_path_status =
+                is_multipath_negotiated && !path.validated && path.pending_challenge;
             path.pending_challenge = false;
 
             let token = self.rng.random();
@@ -6243,7 +6245,7 @@ impl Connection {
                 self.qlog.with_time(now),
             );
 
-            if is_multipath_negotiated && !path.validated && path.pending_challenge {
+            if queue_path_status {
                 // queue informing the path status along with the challenge
                 space.pending.path_status.insert(path_id);
             }

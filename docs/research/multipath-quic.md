@@ -12,8 +12,8 @@ release tag.
 ## Decision
 
 Use a pinned `noq` 1.1.1-based fork only as the temporary backend candidate for
-Multipath QUIC semantics, but keep it behind QUICP's existing deep
-`run(Config, CancellationToken)` module. `noq` is a Rust, async-oriented Quinn
+Multipath QUIC semantics, but keep it behind QUICP's host-driven transport
+facade (`Client`/`Server` and caller-owned carrier I/O). `noq` is a Rust, async-oriented Quinn
 fork, enables `runtime-tokio` by default, advertises Multipath QUIC and 0-RTT,
 and exposes an explicit
 `Connection::open_path(FourTuple, PathStatus)` API
@@ -87,11 +87,9 @@ are guaranteed not to arise from replay and outgoing streams will not later be
 discarded due to 0-RTT rejection
 ([0-RTT contract](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq/src/connection.rs#L90-L148),
 [`authenticated`](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq/src/connection.rs#L744-L769)).
-Consequently, QUICP's `safe-open-only` profile may write only its bounded early
-`OPEN`; the server must not parse it, resolve, dial, or forward until this gate,
-and no path-1 action may be attempted before the handshake. That preserves the
-canonical replay boundary
-([QUICP early-open profile](../protocol.md#5-quicp-security-profiles)).
+QUICP does not currently admit this backend capability. If a future profile
+adds it, no path-1 action may be attempted before the handshake and application
+work must remain behind an explicit replay-safe admission gate.
 
 ## `noq` 1.1.1 source audit against draft-21
 
@@ -134,10 +132,10 @@ design:
   nonzero paths as local `Backup` before scheduler eligibility
   ([open behavior](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq-proto/src/connection/mod.rs#L561-L597),
   [status enqueue behavior](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq-proto/src/connection/mod.rs#L819-L840));
-- its endpoint/connection driver uses two `mpsc::unbounded_channel` queues, so a
-  capacity-256 fail-closed patch is required for either QUICP mode
-  ([connection channel](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq/src/endpoint.rs#L760-L780),
-  [endpoint channel](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq/src/endpoint.rs#L835-L852)); and
+- its endpoint/connection driver originally used unbounded channels. The vendored adapter now
+  replaces those paths with bounded 256-entry protocol queues and 8-entry control queues; protocol
+  saturation drops datagram work for QUIC retransmission while endpoint lifecycle events are
+  retained and retried ([bounded adapter](../../vendor/noq/src/connection.rs)); and
 - per-path keepalive and idle timeout default to `None`, so QUICP must explicitly
   configure them to detect forwarding blackholes
   ([transport defaults](https://github.com/n0-computer/noq/blob/noq-v1.1.1/noq-proto/src/config/transport.rs#L566-L595)).
@@ -180,7 +178,11 @@ therefore deferred from v1 until measured under heterogeneous RTT, loss, and MTU
 | ngtcp2 | The inspected transport-parameter registry has no `initial_max_path_id`/`0x3e`; it is not a native-MPQUIC engine at that revision. ([pinned registry](https://github.com/ngtcp2/ngtcp2/blob/d7fb3ed0407e1333e4ecbd011fcfd9c16499d5e0/lib/ngtcp2_transport_params.h#L38-L59)) |
 | picoquic | The inspected source advertises the evolving Multipath draft and exposes path creation/status APIs, but constants are still labeled draft-20 and the README says standard-version support remains planned. Use it only as an interop candidate after a draft-21/RFC delta check. ([README](https://github.com/private-octopus/picoquic/blob/467cb81bcafc652bae2a1c8824b70f12f470039c/README.md#L9-L34), [draft label](https://github.com/private-octopus/picoquic/blob/467cb81bcafc652bae2a1c8824b70f12f470039c/picoquic/picoquic.h#L255-L260), [path API](https://github.com/private-octopus/picoquic/blob/467cb81bcafc652bae2a1c8824b70f12f470039c/picoquic/picoquic.h#L1053-L1165)) |
 
-## Design A: one deep `run` module, one concrete adapter
+## Historical Design A: one deep `run` module, one concrete adapter
+
+This section records the earlier transparent-proxy proposal. It is superseded by the portable
+host-driven library boundary; TUN, FakeIP, DNS, and origin dialing now belong only to optional
+integration examples.
 
 **Module and Interface.** Preserve exactly the two existing public entry points:
 

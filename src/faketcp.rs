@@ -5,57 +5,15 @@
 //! QUICP engine owns packet recovery, stream ordering, congestion control, and multipath
 //! scheduling. Security is deliberately outside this carrier.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::ops::{BitOr, BitOrAssign};
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use std::sync::OnceLock;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::sync::atomic::{Ordering, fence};
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::sync::{Arc, Mutex};
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use fearless_simd::{Avx2, Level, prelude::*};
-#[cfg(target_arch = "x86")]
-use std::arch::x86::{
-    __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_hadd_epi32, _mm256_add_epi32,
-    _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_madd_epi16, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_setr_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
-    _mm256_sub_epi16,
-};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{
-    __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_hadd_epi32, _mm256_add_epi32,
-    _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_madd_epi16, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_setr_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
-    _mm256_sub_epi16,
-};
+use alloc::{sync::Arc, vec, vec::Vec};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use core::ops::{BitOr, BitOrAssign};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use noq::udp::{RecvMeta, Transmit};
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use noq::{AsyncUdpSocket, UdpSender};
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use socket2::{Domain, Protocol, SockAddr, SockFilter, Socket, Type};
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::ffi::CString;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::num::NonZeroUsize;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::os::fd::AsRawFd;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::pin::Pin;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::task::{Context, Poll};
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use std::{mem, ptr};
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-use tokio::io::unix::AsyncFd;
 
 pub const TCP_PROTOCOL: u8 = 6;
 const IPV4_HEADER_BYTES: usize = 20;
@@ -65,23 +23,15 @@ const MAX_TCP_OPTIONS_BYTES: usize = 40;
 const MAX_PACKET_BYTES: usize = u16::MAX as usize;
 const MAX_DATAGRAM_BYTES: usize = MAX_PACKET_BYTES - IPV6_HEADER_BYTES - TCP_HEADER_BYTES;
 const TFO_OPTION_KIND: u8 = 34;
-const REPLAY_WINDOW_SIZE: usize = 64;
-const REPLAY_WINDOW_BYTES: u32 = 64 * 65_535;
-const SYN_MSS: u16 = 1460;
+pub const DEFAULT_SYN_MSS: u16 = 1460;
 const SYN_WINDOW_SCALE: u8 = 7;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const RAW_PACKET_BUFFER_BYTES: usize = MAX_PACKET_BYTES;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const RAW_SEND_BATCH_SIZE: usize = 10;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const RAW_RECV_BATCH_SIZE: usize = 8;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const RAW_GRO_SEGMENTS: usize = 4;
 
 /// The two underlay endpoints that identify one `FakeTCP` path.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FourTuple {
+    /// Source socket address in packet direction.
     pub source: SocketAddr,
+    /// Destination socket address in packet direction.
     pub destination: SocketAddr,
 }
 
@@ -96,6 +46,7 @@ impl FourTuple {
     }
 
     #[must_use]
+    /// Reverses the packet direction.
     pub const fn reverse(self) -> Self {
         Self {
             source: self.destination,
@@ -107,7 +58,9 @@ impl FourTuple {
 /// Direction separates the two per-path sequence spaces.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CarrierDirection {
+    /// Packets sent from the QUICP client to the server.
     ClientToServer,
+    /// Packets sent from the QUICP server to the client.
     ServerToClient,
 }
 
@@ -123,6 +76,7 @@ impl CarrierDirection {
 /// Controls whether a SYN may carry the first QUICP datagram.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SynDataMode {
+    /// Disallows a QUICP datagram in the carrier SYN.
     Disabled,
     /// The value is the TFO-style cookie expected on the SYN option.
     Cookie([u8; 16]),
@@ -191,18 +145,29 @@ pub struct TcpOptions {
     sack_permitted: bool,
     timestamps: Option<(u32, u32)>,
     window_scale: Option<u8>,
-    fast_open_cookie: Option<Vec<u8>>,
+    fast_open_cookie: Option<([u8; 16], usize)>,
 }
 
 impl TcpOptions {
     #[must_use]
     pub fn for_syn(cookie: Option<&[u8]>) -> Self {
+        Self::for_syn_with_mss(DEFAULT_SYN_MSS, cookie)
+    }
+
+    #[must_use]
+    pub fn for_syn_with_mss(mss: u16, cookie: Option<&[u8]>) -> Self {
+        let fast_open_cookie = cookie.map(|cookie| {
+            let mut bytes = [0; 16];
+            let copy_length = cookie.len().min(bytes.len());
+            bytes[..copy_length].copy_from_slice(&cookie[..copy_length]);
+            (bytes, cookie.len())
+        });
         Self {
-            mss: Some(SYN_MSS),
+            mss: Some(mss),
             sack_permitted: true,
             timestamps: None,
             window_scale: Some(SYN_WINDOW_SCALE),
-            fast_open_cookie: cookie.map(ToOwned::to_owned),
+            fast_open_cookie,
         }
     }
 
@@ -228,7 +193,9 @@ impl TcpOptions {
 
     #[must_use]
     pub fn fast_open_cookie(&self) -> Option<&[u8]> {
-        self.fast_open_cookie.as_deref()
+        self.fast_open_cookie
+            .as_ref()
+            .and_then(|(cookie, length)| (*length <= cookie.len()).then(|| &cookie[..*length]))
     }
 
     #[inline]
@@ -238,13 +205,6 @@ impl TcpOptions {
             && self.timestamps.is_none()
             && self.window_scale.is_none()
             && self.fast_open_cookie.is_none()
-    }
-
-    fn encode(&self) -> Result<Vec<u8>, CarrierError> {
-        let mut bytes = vec![0; MAX_TCP_OPTIONS_BYTES];
-        let length = self.encode_into(&mut bytes)?;
-        bytes.truncate(length);
-        Ok(bytes)
     }
 
     fn encode_into(&self, bytes: &mut [u8]) -> Result<usize, CarrierError> {
@@ -264,15 +224,15 @@ impl TcpOptions {
         if let Some(scale) = self.window_scale {
             append_option(bytes, &mut length, &[3, 3, scale])?;
         }
-        if let Some(cookie) = &self.fast_open_cookie {
-            if cookie.len() > 16 {
+        if let Some((cookie, cookie_length)) = &self.fast_open_cookie {
+            if *cookie_length > cookie.len() {
                 return Err(CarrierError::InvalidTcpOption);
             }
-            let option_length = 2usize.saturating_add(cookie.len());
+            let option_length = 2usize.saturating_add(*cookie_length);
             let option_length =
                 u8::try_from(option_length).map_err(|_| CarrierError::InvalidTcpOption)?;
             append_option(bytes, &mut length, &[TFO_OPTION_KIND, option_length])?;
-            append_option(bytes, &mut length, cookie)?;
+            append_option(bytes, &mut length, &cookie[..*cookie_length])?;
         }
         while length % 4 != 0 {
             append_option(bytes, &mut length, &[1])?;
@@ -308,7 +268,10 @@ impl TcpOptions {
                             ));
                         }
                         TFO_OPTION_KIND if (2..=18).contains(&length) => {
-                            options.fast_open_cookie = Some(value.to_vec());
+                            let mut cookie = [0; 16];
+                            let cookie_length = value.len();
+                            cookie[..cookie_length].copy_from_slice(value);
+                            options.fast_open_cookie = Some((cookie, cookie_length));
                         }
                         _ => {}
                     }
@@ -390,20 +353,48 @@ impl FakeTcpPacket {
         {
             return Err(CarrierError::InvalidTuple);
         }
-        let options = self.options.encode()?;
+        let pseudo_header_prefix = tcp_pseudo_header_prefix(self.source, self.destination)
+            .ok_or(CarrierError::InvalidTuple)?;
+        let mut option_bytes = [0; MAX_TCP_OPTIONS_BYTES];
+        let option_length = if self.options.is_empty() {
+            0
+        } else {
+            self.options.encode_into(&mut option_bytes)?
+        };
         let tcp_length = TCP_HEADER_BYTES
-            .checked_add(options.len())
+            .checked_add(option_length)
             .and_then(|length| length.checked_add(self.payload.len()))
             .ok_or(CarrierError::PacketTooLarge)?;
         if tcp_length > MAX_PACKET_BYTES {
             return Err(CarrierError::PacketTooLarge);
         }
-        let tcp = self.encode_tcp(&options)?;
-        if self.source.is_ipv4() {
-            self.encode_ipv4(&tcp)
+        let ip_header_length = if self.source.is_ipv4() {
+            IPV4_HEADER_BYTES
         } else {
-            self.encode_ipv6(&tcp)
+            IPV6_HEADER_BYTES
+        };
+        let packet_length = ip_header_length
+            .checked_add(tcp_length)
+            .ok_or(CarrierError::PacketTooLarge)?;
+        if packet_length > MAX_PACKET_BYTES {
+            return Err(CarrierError::PacketTooLarge);
         }
+        let mut packet = vec![0; packet_length];
+        let length = encode_packet_into(
+            self.source,
+            self.destination,
+            self.sequence,
+            self.acknowledgment,
+            self.flags,
+            self.window,
+            &self.options,
+            &self.payload,
+            &mut packet,
+            pseudo_header_prefix,
+        )?;
+        debug_assert_eq!(length, packet_length);
+        packet.truncate(length);
+        Ok(packet)
     }
 
     /// Serializes the packet into caller-owned storage without allocating the packet buffer.
@@ -466,77 +457,6 @@ impl FakeTcpPacket {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
-    }
-
-    fn encode_tcp(&self, options: &[u8]) -> Result<Vec<u8>, CarrierError> {
-        let header_length = TCP_HEADER_BYTES
-            .checked_add(options.len())
-            .ok_or(CarrierError::PacketTooLarge)?;
-        let data_offset =
-            u8::try_from(header_length / 4).map_err(|_| CarrierError::TcpOptionsTooLong)?;
-        let mut tcp = Vec::with_capacity(header_length + self.payload.len());
-        tcp.extend_from_slice(&self.source.port().to_be_bytes());
-        tcp.extend_from_slice(&self.destination.port().to_be_bytes());
-        tcp.extend_from_slice(&self.sequence.to_be_bytes());
-        tcp.extend_from_slice(&self.acknowledgment.to_be_bytes());
-        tcp.push(data_offset << 4);
-        tcp.push(self.flags.bits());
-        tcp.extend_from_slice(&self.window.to_be_bytes());
-        tcp.extend_from_slice(&[0, 0]);
-        tcp.extend_from_slice(&[0, 0]);
-        tcp.extend_from_slice(options);
-        tcp.extend_from_slice(&self.payload);
-        let checksum = tcp_checksum(self.source, self.destination, &tcp);
-        tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
-        Ok(tcp)
-    }
-
-    fn encode_ipv4(&self, tcp: &[u8]) -> Result<Vec<u8>, CarrierError> {
-        let source = match self.source.ip() {
-            IpAddr::V4(value) => value,
-            IpAddr::V6(_) => return Err(CarrierError::InvalidTuple),
-        };
-        let destination = match self.destination.ip() {
-            IpAddr::V4(value) => value,
-            IpAddr::V6(_) => return Err(CarrierError::InvalidTuple),
-        };
-        let total_length = IPV4_HEADER_BYTES
-            .checked_add(tcp.len())
-            .ok_or(CarrierError::PacketTooLarge)?;
-        let total_length = u16::try_from(total_length).map_err(|_| CarrierError::PacketTooLarge)?;
-        let mut packet = vec![0; IPV4_HEADER_BYTES];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&total_length.to_be_bytes());
-        packet[6] = 0x40;
-        packet[8] = 64;
-        packet[9] = TCP_PROTOCOL;
-        packet[12..16].copy_from_slice(&source.octets());
-        packet[16..20].copy_from_slice(&destination.octets());
-        let checksum = ipv4_header_checksum(source, destination, total_length);
-        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-        packet.extend_from_slice(tcp);
-        Ok(packet)
-    }
-
-    fn encode_ipv6(&self, tcp: &[u8]) -> Result<Vec<u8>, CarrierError> {
-        let source = match self.source.ip() {
-            IpAddr::V6(value) => value,
-            IpAddr::V4(_) => return Err(CarrierError::InvalidTuple),
-        };
-        let destination = match self.destination.ip() {
-            IpAddr::V6(value) => value,
-            IpAddr::V4(_) => return Err(CarrierError::InvalidTuple),
-        };
-        let payload_length = u16::try_from(tcp.len()).map_err(|_| CarrierError::PacketTooLarge)?;
-        let mut packet = vec![0; IPV6_HEADER_BYTES];
-        packet[0] = 0x60;
-        packet[4..6].copy_from_slice(&payload_length.to_be_bytes());
-        packet[6] = TCP_PROTOCOL;
-        packet[7] = 64;
-        packet[8..24].copy_from_slice(&source.octets());
-        packet[24..40].copy_from_slice(&destination.octets());
-        packet.extend_from_slice(tcp);
-        Ok(packet)
     }
 }
 
@@ -786,16 +706,19 @@ pub struct DecodedDatagram {
 
 impl DecodedDatagram {
     #[must_use]
+    /// Returns the carrier sequence number used for diagnostics and ACK generation.
     pub const fn sequence(&self) -> u32 {
         self.sequence
     }
 
     #[must_use]
+    /// Returns whether the datagram arrived in a carrier SYN.
     pub const fn was_syn(&self) -> bool {
         self.was_syn
     }
 
     #[must_use]
+    /// Returns the owned QUICP datagram payload.
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
@@ -811,16 +734,19 @@ pub struct BorrowedDecodedDatagram<'a> {
 
 impl BorrowedDecodedDatagram<'_> {
     #[must_use]
+    /// Returns the carrier sequence number used for diagnostics and ACK generation.
     pub const fn sequence(&self) -> u32 {
         self.sequence
     }
 
     #[must_use]
+    /// Returns whether the datagram arrived in a carrier SYN.
     pub const fn was_syn(&self) -> bool {
         self.was_syn
     }
 
     #[must_use]
+    /// Returns the caller-owned QUICP datagram payload.
     pub const fn payload(&self) -> &[u8] {
         self.payload
     }
@@ -833,9 +759,10 @@ pub struct FakeTcpCarrier {
     pseudo_header_prefix: u32,
     syn_data: SynDataMode,
     send_sequence: u32,
-    acknowledgment: u32,
-    received: ReplayWindow,
+    acknowledgment: Arc<AtomicU32>,
     sent_syn: bool,
+    syn_mss: u16,
+    outer_mtu: u16,
 }
 
 impl FakeTcpCarrier {
@@ -843,25 +770,122 @@ impl FakeTcpCarrier {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unusable or mixed-family tuple.
+    /// Returns an error for an unusable or mixed-family tuple, or an MSS/MTU that cannot carry a
+    /// TCP payload.
     pub fn new(
         tuple: FourTuple,
         direction: CarrierDirection,
         syn_data: SynDataMode,
     ) -> Result<Self, CarrierError> {
-        tuple.validate()?;
-        let pseudo_header_prefix = tcp_pseudo_header_prefix(tuple.source, tuple.destination)
-            .ok_or(CarrierError::InvalidTuple)?;
+        Self::new_with_mtu(tuple, direction, syn_data, DEFAULT_SYN_MSS, u16::MAX)
+    }
+
+    /// Creates one carrier with an explicit SYN MSS and complete outer packet MTU.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unusable or mixed-family tuple, or an MSS/MTU that cannot carry a
+    /// TCP payload.
+    pub fn new_with_mtu(
+        tuple: FourTuple,
+        direction: CarrierDirection,
+        syn_data: SynDataMode,
+        syn_mss: u16,
+        outer_mtu: u16,
+    ) -> Result<Self, CarrierError> {
+        let pseudo_header_prefix = validated_pseudo_header_prefix(tuple)?;
+        let ip_header_bytes = if tuple.source.is_ipv4() {
+            IPV4_HEADER_BYTES
+        } else {
+            IPV6_HEADER_BYTES
+        };
+        let header_bytes = u16::try_from(ip_header_bytes + TCP_HEADER_BYTES)
+            .map_err(|_| CarrierError::InvalidOuterMtu(outer_mtu))?;
+        let maximum_mss = outer_mtu
+            .checked_sub(header_bytes)
+            .ok_or(CarrierError::InvalidOuterMtu(outer_mtu))?;
+        if syn_mss == 0 || syn_mss > maximum_mss {
+            return Err(CarrierError::InvalidMss {
+                mss: syn_mss,
+                maximum: maximum_mss,
+            });
+        }
         let send_sequence = initial_sequence(tuple, direction)?;
-        Ok(Self {
+        Ok(Self::from_parts(
             tuple,
             pseudo_header_prefix,
             syn_data,
             send_sequence,
-            acknowledgment: 0,
-            received: ReplayWindow::default(),
+            syn_mss,
+            outer_mtu,
+        ))
+    }
+
+    /// Creates one carrier with caller-provided initial sequence entropy.
+    ///
+    /// Callers that own sequence-number policy can use this constructor without changing the
+    /// packet codec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unusable or mixed-family tuple.
+    pub fn new_with_initial_sequence(
+        tuple: FourTuple,
+        syn_data: SynDataMode,
+        initial_sequence: u32,
+    ) -> Result<Self, CarrierError> {
+        let pseudo_header_prefix = validated_pseudo_header_prefix(tuple)?;
+        Ok(Self::from_parts(
+            tuple,
+            pseudo_header_prefix,
+            syn_data,
+            initial_sequence,
+            DEFAULT_SYN_MSS,
+            u16::MAX,
+        ))
+    }
+
+    fn from_parts(
+        tuple: FourTuple,
+        pseudo_header_prefix: u32,
+        syn_data: SynDataMode,
+        send_sequence: u32,
+        syn_mss: u16,
+        outer_mtu: u16,
+    ) -> Self {
+        Self {
+            tuple,
+            pseudo_header_prefix,
+            syn_data,
+            send_sequence,
+            acknowledgment: Arc::new(AtomicU32::new(0)),
             sent_syn: false,
-        })
+            syn_mss,
+            outer_mtu,
+        }
+    }
+
+    #[cfg(test)]
+    fn pair(
+        tuple: FourTuple,
+        direction: CarrierDirection,
+        syn_data: SynDataMode,
+    ) -> Result<(Self, Self), CarrierError> {
+        Self::pair_with_mtu(tuple, direction, syn_data, DEFAULT_SYN_MSS, u16::MAX)
+    }
+
+    #[cfg(any(test, all(unix, feature = "runtime-tokio")))]
+    fn pair_with_mtu(
+        tuple: FourTuple,
+        direction: CarrierDirection,
+        syn_data: SynDataMode,
+        syn_mss: u16,
+        outer_mtu: u16,
+    ) -> Result<(Self, Self), CarrierError> {
+        let inbound = Self::new_with_mtu(tuple, direction, syn_data, syn_mss, outer_mtu)?;
+        let mut outbound = Self::new_with_mtu(tuple, direction, syn_data, syn_mss, outer_mtu)?;
+        outbound.acknowledgment = Arc::clone(&inbound.acknowledgment);
+        Ok((inbound, outbound))
     }
 
     /// Encodes one ordinary QUICP datagram in one TCP-shaped packet.
@@ -977,7 +1001,7 @@ impl FakeTcpCarrier {
     ///
     /// # Errors
     ///
-    /// Returns an error for a malformed, replayed, or wrong-path packet.
+    /// Returns an error for a malformed or wrong-path packet.
     pub fn decode_datagram(&mut self, packet: &[u8]) -> Result<DecodedDatagram, CarrierError> {
         let packet = self.decode_datagram_borrowed(packet)?;
         Ok(DecodedDatagram {
@@ -989,16 +1013,19 @@ impl FakeTcpCarrier {
 
     /// Returns one packet's payload as a borrow of the caller's input buffer.
     ///
-    /// The input is not retained after the method returns. The carrier sequence/replay state is
-    /// updated before the borrowed result is returned.
+    /// The input is not retained after the method returns. QUICP owns duplicate detection because
+    /// the unauthenticated carrier sequence cannot safely drive replay state.
     ///
     /// # Errors
     ///
-    /// Returns an error for a malformed, replayed, or wrong-path packet.
+    /// Returns an error for a malformed or wrong-path packet.
     pub fn decode_datagram_borrowed<'a>(
         &mut self,
         packet: &'a [u8],
     ) -> Result<BorrowedDecodedDatagram<'a>, CarrierError> {
+        if packet.len() > usize::from(self.outer_mtu) {
+            return Err(CarrierError::PacketTooLarge);
+        }
         let packet = decode_packet_view(packet, Some(self.pseudo_header_prefix))?;
         let expected = self.tuple.reverse();
         if packet.source != expected.source || packet.destination != expected.destination {
@@ -1006,9 +1033,6 @@ impl FakeTcpCarrier {
         }
         if packet.payload.is_empty() {
             return Err(CarrierError::EmptyPayload);
-        }
-        if self.received.contains(packet.sequence) {
-            return Err(CarrierError::Replay);
         }
         if packet.flags.is_syn() {
             let SynDataMode::Cookie(expected_cookie) = self.syn_data else {
@@ -1018,12 +1042,13 @@ impl FakeTcpCarrier {
                 return Err(CarrierError::SynCookieRejected);
             }
         }
-        self.received.accept(packet.sequence)?;
-        if self.received.largest() == Some(packet.sequence) {
-            let consumed = u32::try_from(packet.payload.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(u32::from(packet.flags.is_syn()));
-            self.acknowledgment = packet.sequence.wrapping_add(consumed);
+        let consumed = u32::try_from(packet.payload.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(packet.flags.is_syn()));
+        let acknowledgment = packet.sequence.wrapping_add(consumed);
+        let previous = self.acknowledgment.load(Ordering::Relaxed);
+        if previous == 0 || acknowledgment.wrapping_sub(previous) < 0x8000_0000 {
+            self.acknowledgment.store(acknowledgment, Ordering::Relaxed);
         }
         Ok(BorrowedDecodedDatagram {
             sequence: packet.sequence,
@@ -1032,17 +1057,23 @@ impl FakeTcpCarrier {
         })
     }
 
-    #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-    const fn sent_syn(&self) -> bool {
-        self.sent_syn
-    }
-
     fn encode(
         &mut self,
         datagram: &[u8],
         flags: TcpFlags,
         cookie: Option<&[u8]>,
     ) -> Result<Vec<u8>, CarrierError> {
+        let options = if flags.is_syn() {
+            TcpOptions::for_syn_with_mss(self.syn_mss, cookie)
+        } else {
+            TcpOptions::default()
+        };
+        let mut option_bytes = [0; MAX_TCP_OPTIONS_BYTES];
+        let option_length = if options.is_empty() {
+            0
+        } else {
+            options.encode_into(&mut option_bytes)?
+        };
         let ip_header_length = if self.tuple.source.is_ipv4() {
             IPV4_HEADER_BYTES
         } else {
@@ -1050,9 +1081,12 @@ impl FakeTcpCarrier {
         };
         let capacity = ip_header_length
             .checked_add(TCP_HEADER_BYTES)
-            .and_then(|length| length.checked_add(MAX_TCP_OPTIONS_BYTES))
+            .and_then(|length| length.checked_add(option_length))
             .and_then(|length| length.checked_add(datagram.len()))
             .ok_or(CarrierError::PacketTooLarge)?;
+        if capacity > MAX_PACKET_BYTES {
+            return Err(CarrierError::PacketTooLarge);
+        }
         let mut packet = vec![0; capacity];
         let length = self.encode_into(datagram, flags, cookie, &mut packet)?;
         packet.truncate(length);
@@ -1073,7 +1107,7 @@ impl FakeTcpCarrier {
             .unwrap_or(u32::MAX)
             .saturating_add(u32::from(flags.is_syn()));
         let options = if flags.is_syn() {
-            TcpOptions::for_syn(cookie)
+            TcpOptions::for_syn_with_mss(self.syn_mss, cookie)
         } else {
             TcpOptions::default()
         };
@@ -1081,7 +1115,7 @@ impl FakeTcpCarrier {
             self.tuple.source,
             self.tuple.destination,
             self.send_sequence,
-            self.acknowledgment,
+            self.acknowledgment.load(Ordering::Relaxed),
             flags,
             u16::MAX,
             &options,
@@ -1089,1324 +1123,19 @@ impl FakeTcpCarrier {
             output,
             self.pseudo_header_prefix,
         )?;
-        self.send_sequence = self
-            .send_sequence
-            .checked_add(consumed)
-            .ok_or(CarrierError::SequenceExhausted)?;
+        if packet_length > usize::from(self.outer_mtu) {
+            return Err(CarrierError::PacketTooLarge);
+        }
+        self.send_sequence = self.send_sequence.wrapping_add(consumed);
         Ok(packet_length)
     }
 }
 
-/// A Linux raw-IP adapter that presents `FakeTCP` packets to the current `noq` backend as datagrams.
-///
-/// One adapter is bound to one four-tuple. Multipath therefore creates one adapter state per
-/// QUICP path while retaining one QUICP session and session ID above them. `noq` is an
-/// implementation backend here, not the QUICP wire contract. The adapter is intentionally
-/// Linux-only until equivalent source-address and raw-socket controls are verified on another
-/// operating system. Receive uses an `IPPROTO_TCP` raw socket for tuple filtering. Transmit uses
-/// the default `IPPROTO_TCP` raw socket without `IP_HDRINCL`; the explicit `packet_socket` option
-/// switches both directions to filtered `AF_PACKET` sockets and requires a resolvable
-/// interface/neighbor. On Linux, the packet receive socket opportunistically uses a bounded
-/// `TPACKET_V2` ring (64 128-KiB frames) and falls back to `recvmmsg` when the kernel cannot set
-/// up the ring.
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const PACKET_RING_FRAME_SIZE: usize = 128 * 1024;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const PACKET_RING_FRAME_COUNT: usize = 64;
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const PACKET_VERSION_OPTION: libc::c_int = 10;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const PACKET_RX_RING_OPTION: libc::c_int = 5;
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-const PACKET_TPACKET_V2: libc::c_int = 1;
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Debug)]
-struct PacketRxRing {
-    mapping: std::ptr::NonNull<u8>,
-    mapping_len: usize,
-    frame_size: usize,
-    frame_count: usize,
-    next_frame: usize,
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-unsafe impl Send for PacketRxRing {}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-unsafe impl Sync for PacketRxRing {}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-impl PacketRxRing {
-    fn try_new(socket: &Socket) -> Option<Self> {
-        Self::new(socket).ok()
-    }
-
-    #[allow(unsafe_code)]
-    fn new(socket: &Socket) -> std::io::Result<Self> {
-        let version = PACKET_TPACKET_V2;
-        set_packet_option(socket, PACKET_VERSION_OPTION, &version)?;
-        let block_size = PACKET_RING_FRAME_SIZE;
-        let block_count = PACKET_RING_FRAME_COUNT;
-        let frame_size = PACKET_RING_FRAME_SIZE;
-        let frame_count = PACKET_RING_FRAME_COUNT;
-        let request = libc::tpacket_req {
-            tp_block_size: libc::c_uint::try_from(block_size)
-                .expect("packet ring block size fits c_uint"),
-            tp_block_nr: libc::c_uint::try_from(block_count)
-                .expect("packet ring block count fits c_uint"),
-            tp_frame_size: libc::c_uint::try_from(frame_size)
-                .expect("packet ring frame size fits c_uint"),
-            tp_frame_nr: libc::c_uint::try_from(frame_count)
-                .expect("packet ring frame count fits c_uint"),
-        };
-        set_packet_option(socket, PACKET_RX_RING_OPTION, &request)?;
-        let mapping_len = block_size.checked_mul(block_count).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "packet ring size overflow",
-            )
-        })?;
-        let mapping = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                mapping_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                socket.as_raw_fd(),
-                0,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            let error = std::io::Error::last_os_error();
-            let _ = clear_packet_ring(socket);
-            return Err(error);
-        }
-        let Some(mapping) = std::ptr::NonNull::new(mapping.cast::<u8>()) else {
-            let _ = clear_packet_ring(socket);
-            return Err(std::io::Error::other(
-                "packet ring mmap returned a null pointer",
-            ));
-        };
-        Ok(Self {
-            mapping,
-            mapping_len,
-            frame_size,
-            frame_count,
-            next_frame: 0,
-        })
-    }
-
-    #[allow(unsafe_code)]
-    fn with_next_packet<T, F>(&mut self, callback: F) -> std::io::Result<Option<T>>
-    where
-        F: FnOnce(&[u8]) -> std::io::Result<T>,
-    {
-        let frame_offset = self
-            .next_frame
-            .checked_mul(self.frame_size)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "packet ring frame offset overflow",
-                )
-            })?;
-        let frame = unsafe { self.mapping.as_ptr().add(frame_offset) };
-        let header = frame.cast::<libc::tpacket2_hdr>();
-        let status = unsafe { ptr::read_volatile(ptr::addr_of!((*header).tp_status)) };
-        if status & libc::TP_STATUS_USER == 0 {
-            return Ok(None);
-        }
-        fence(Ordering::Acquire);
-        let snaplen =
-            usize::try_from(unsafe { ptr::read_unaligned(ptr::addr_of!((*header).tp_snaplen)) })
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "packet ring snaplen overflow",
-                    )
-                });
-        let snaplen = match snaplen {
-            Ok(snaplen) => snaplen,
-            Err(error) => {
-                self.release_frame(header);
-                return Err(error);
-            }
-        };
-        let packet_offset =
-            unsafe { usize::from(ptr::read_unaligned(ptr::addr_of!((*header).tp_mac))) };
-        let packet_end = packet_offset.checked_add(snaplen);
-        let packet_end = match packet_end {
-            Some(end) if end <= self.frame_size => end,
-            _ => {
-                self.release_frame(header);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "packet ring packet exceeds frame",
-                ));
-            }
-        };
-        let packet = unsafe {
-            std::slice::from_raw_parts(frame.add(packet_offset), packet_end - packet_offset)
-        };
-        let result = callback(packet);
-        self.release_frame(header);
-        result.map(Some)
-    }
-
-    #[allow(unsafe_code)]
-    fn has_user_frame(&self) -> std::io::Result<bool> {
-        let frame_offset = self
-            .next_frame
-            .checked_mul(self.frame_size)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "packet ring frame offset overflow",
-                )
-            })?;
-        let frame = unsafe { self.mapping.as_ptr().add(frame_offset) };
-        let header = frame.cast::<libc::tpacket2_hdr>();
-        let status = unsafe { ptr::read_volatile(ptr::addr_of!((*header).tp_status)) };
-        Ok(status & libc::TP_STATUS_USER != 0)
-    }
-
-    #[allow(unsafe_code)]
-    fn release_frame(&mut self, header: *mut libc::tpacket2_hdr) {
-        fence(Ordering::Release);
-        unsafe {
-            ptr::write_volatile(
-                ptr::addr_of_mut!((*header).tp_status),
-                libc::TP_STATUS_KERNEL,
-            );
-        }
-        self.next_frame = (self.next_frame + 1) % self.frame_count;
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-impl Drop for PacketRxRing {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        unsafe {
-            let _ = libc::munmap(self.mapping.as_ptr().cast(), self.mapping_len);
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-fn set_packet_option<T>(socket: &Socket, option: libc::c_int, value: &T) -> std::io::Result<()> {
-    let length = libc::socklen_t::try_from(mem::size_of::<T>())
-        .expect("packet socket option size fits socklen_t");
-    let result = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_PACKET,
-            option,
-            std::ptr::from_ref(value).cast(),
-            length,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-fn clear_packet_ring(socket: &Socket) -> std::io::Result<()> {
-    let request = libc::tpacket_req {
-        tp_block_size: 0,
-        tp_block_nr: 0,
-        tp_frame_size: 0,
-        tp_frame_nr: 0,
-    };
-    set_packet_option(socket, PACKET_RX_RING_OPTION, &request)
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Debug)]
-pub struct FakeTcpSocket {
-    io: Arc<AsyncFd<Socket>>,
-    send_io: Arc<AsyncFd<Socket>>,
-    receive_ring: Option<PacketRxRing>,
-    send_mode: RawSendMode,
-    tuple: FourTuple,
-    inbound: FakeTcpCarrier,
-    outbound: Arc<Mutex<FakeTcpCarrier>>,
-    server_side: bool,
-    receive_buffer: Vec<u8>,
-    receive_batch_count: usize,
-    receive_batch_index: usize,
-    receive_batch_lengths: [usize; RAW_RECV_BATCH_SIZE],
-    receive_pending: Option<DecodedRawPacket>,
-    receive_direct_pending: Option<usize>,
-    decode_rejects: u64,
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Clone, Copy, Debug)]
-struct DecodedRawPacket {
-    batch_index: usize,
-    payload_offset: usize,
-    payload_length: usize,
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Clone, Copy, Debug)]
-enum RingPayloadCopy {
-    Skipped,
-    Copied(usize),
-    Pending(usize),
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Clone, Copy, Debug)]
-enum RawSendMode {
-    Ip,
-    Packet,
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Clone, Copy, Debug)]
-struct PacketTarget {
-    ifindex: libc::c_int,
-    destination: [u8; 6],
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-impl FakeTcpSocket {
-    /// Binds a raw IPv4 TCP socket for one `FakeTCP` path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an OS error when raw-socket privileges, binding, or nonblocking setup is denied.
-    pub fn bind(
-        tuple: FourTuple,
-        outbound_direction: CarrierDirection,
-        syn_data: SynDataMode,
-        packet_socket: bool,
-    ) -> std::io::Result<Self> {
-        tuple.validate().map_err(carrier_io_error)?;
-        if !tuple.source.is_ipv4() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "FakeTcpSocket currently supports IPv4 raw sockets only",
-            ));
-        }
-        let packet_target = packet_socket
-            .then(|| resolve_packet_target(tuple.destination))
-            .transpose()?;
-        let (socket, receive_ring) = if let Some(target) = packet_target {
-            let socket = Socket::new(
-                Domain::PACKET,
-                Type::DGRAM,
-                Some(Protocol::from(libc::c_int::from(packet_protocol()))),
-            )?;
-            socket.attach_filter(&tuple_filter(tuple)?)?;
-            let receive_ring = PacketRxRing::try_new(&socket);
-            bind_packet_receive_socket(&socket, target)?;
-            (socket, receive_ring)
-        } else {
-            let socket = Socket::new_raw(Domain::IPV4, Type::RAW, Some(Protocol::TCP))?;
-            socket.set_header_included_v4(true)?;
-            socket.bind(&SockAddr::from(tuple.source))?;
-            socket.attach_filter(&tuple_filter(tuple)?)?;
-            (socket, None)
-        };
-        socket.set_nonblocking(true)?;
-        let io = Arc::new(AsyncFd::new(socket)?);
-        let (send_socket, send_mode) = if let Some(target) = packet_target {
-            let socket = Socket::new(
-                Domain::PACKET,
-                Type::DGRAM,
-                Some(Protocol::from(libc::c_int::from(packet_protocol()))),
-            )?;
-            bind_packet_socket(&socket, target)?;
-            (socket, RawSendMode::Packet)
-        } else {
-            let socket = Socket::new_raw(Domain::IPV4, Type::RAW, Some(Protocol::TCP))?;
-            socket.set_header_included_v4(false)?;
-            socket.bind(&SockAddr::from(tuple.source))?;
-            (socket, RawSendMode::Ip)
-        };
-        send_socket.set_nonblocking(true)?;
-        let send_io = Arc::new(AsyncFd::new(send_socket)?);
-        let inbound =
-            FakeTcpCarrier::new(tuple, outbound_direction, syn_data).map_err(carrier_io_error)?;
-        let outbound =
-            FakeTcpCarrier::new(tuple, outbound_direction, syn_data).map_err(carrier_io_error)?;
-        Ok(Self {
-            io,
-            send_io,
-            receive_ring,
-            send_mode,
-            tuple,
-            inbound,
-            outbound: Arc::new(Mutex::new(outbound)),
-            server_side: outbound_direction == CarrierDirection::ServerToClient,
-            receive_buffer: vec![0; RAW_PACKET_BUFFER_BYTES * RAW_RECV_BATCH_SIZE],
-            receive_batch_count: 0,
-            receive_batch_index: 0,
-            receive_batch_lengths: [0; RAW_RECV_BATCH_SIZE],
-            receive_pending: None,
-            receive_direct_pending: None,
-            decode_rejects: 0,
-        })
-    }
-
-    /// Number of underlay packets that failed carrier decode and were dropped.
-    #[must_use]
-    pub const fn rejected_datagrams(&self) -> u64 {
-        self.decode_rejects
-    }
-
-    fn next_decoded_packet(&mut self) -> std::io::Result<Option<DecodedRawPacket>> {
-        if let Some(packet) = self.receive_pending.take() {
-            return Ok(Some(packet));
-        }
-        while self.receive_batch_index < self.receive_batch_count {
-            let batch_index = self.receive_batch_index;
-            self.receive_batch_index += 1;
-            let length = self.receive_batch_lengths[batch_index];
-            let start = batch_index * RAW_PACKET_BUFFER_BYTES;
-            let end = start.checked_add(length).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "raw packet length overflow",
-                )
-            })?;
-            let Some(packet) = self.receive_buffer.get(start..end) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "raw packet exceeds receive storage",
-                ));
-            };
-            let decoded = match self.inbound.decode_datagram_borrowed(packet) {
-                Ok(decoded) => decoded,
-                Err(_error) => {
-                    self.decode_rejects = self.decode_rejects.saturating_add(1);
-                    continue;
-                }
-            };
-            let payload_length = decoded.payload().len();
-            return Ok(Some(DecodedRawPacket {
-                batch_index,
-                payload_offset: length - payload_length,
-                payload_length,
-            }));
-        }
-        Ok(None)
-    }
-
-    fn decoded_payload(&self, packet: DecodedRawPacket) -> std::io::Result<&[u8]> {
-        let packet_start = packet.batch_index * RAW_PACKET_BUFFER_BYTES;
-        let payload_start = packet_start
-            .checked_add(packet.payload_offset)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "raw payload offset overflow",
-                )
-            })?;
-        let payload_end = payload_start
-            .checked_add(packet.payload_length)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "raw payload length overflow",
-                )
-            })?;
-        self.receive_buffer
-            .get(payload_start..payload_end)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "raw payload exceeds receive storage",
-                )
-            })
-    }
-
-    fn copy_next_ring_payload(
-        &mut self,
-        target: &mut [u8],
-        offset: usize,
-        expected_stride: Option<usize>,
-    ) -> std::io::Result<Option<RingPayloadCopy>> {
-        let Some(ring) = self.receive_ring.as_mut() else {
-            return Err(std::io::Error::other("FakeTCP receive ring is unavailable"));
-        };
-        let inbound = &mut self.inbound;
-        let pending_storage = &mut self.receive_buffer;
-        let outcome = ring.with_next_packet(|packet| {
-            let decoded = match inbound.decode_datagram_borrowed(packet) {
-                Ok(decoded) => decoded,
-                Err(_error) => return Ok(RingPayloadCopy::Skipped),
-            };
-            let payload = decoded.payload();
-            if payload.len() > RAW_PACKET_BUFFER_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "QUICP payload exceeds receive storage",
-                ));
-            }
-            let same_stride = expected_stride.is_none_or(|stride| stride == payload.len());
-            if same_stride {
-                let end = offset.checked_add(payload.len()).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "QUICP payload offset overflow",
-                    )
-                })?;
-                let Some(destination) = target.get_mut(offset..end) else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "QUICP payload exceeds receive buffer",
-                    ));
-                };
-                destination.copy_from_slice(payload);
-                Ok(RingPayloadCopy::Copied(payload.len()))
-            } else {
-                pending_storage[..payload.len()].copy_from_slice(payload);
-                Ok(RingPayloadCopy::Pending(payload.len()))
-            }
-        })?;
-        if matches!(outcome, Some(RingPayloadCopy::Skipped)) {
-            self.decode_rejects = self.decode_rejects.saturating_add(1);
-        }
-        Ok(outcome)
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn poll_recv_ring(
-        &mut self,
-        cx: &mut Context<'_>,
-        bufs: &mut [std::io::IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<std::io::Result<usize>> {
-        let slots = bufs.len().min(meta.len());
-        let mut received_count = 0;
-        loop {
-            while received_count < slots {
-                let mut stride = None;
-                let mut group_count = 0;
-                loop {
-                    if group_count >= RAW_GRO_SEGMENTS {
-                        break;
-                    }
-                    if let Some(stride) = stride {
-                        let Some(end) = group_count
-                            .checked_add(1)
-                            .and_then(|count| count.checked_mul(stride))
-                        else {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "QUICP receive group length overflow",
-                            )));
-                        };
-                        if end > bufs[received_count].len() {
-                            break;
-                        }
-                    }
-                    let copied = if let Some(length) = self.receive_direct_pending.take() {
-                        let Some(destination) = bufs[received_count]
-                            .get_mut(group_count * length..(group_count + 1) * length)
-                        else {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "pending QUICP payload exceeds receive buffer",
-                            )));
-                        };
-                        destination.copy_from_slice(&self.receive_buffer[..length]);
-                        Some(RingPayloadCopy::Copied(length))
-                    } else {
-                        self.copy_next_ring_payload(
-                            &mut bufs[received_count],
-                            group_count * stride.unwrap_or(0),
-                            stride,
-                        )?
-                    };
-                    match copied {
-                        None => {
-                            if group_count == 0 {
-                                break;
-                            }
-                            break;
-                        }
-                        Some(RingPayloadCopy::Skipped) => {}
-                        Some(RingPayloadCopy::Copied(length)) => {
-                            if stride.is_none() {
-                                stride = Some(length);
-                            }
-                            group_count += 1;
-                        }
-                        Some(RingPayloadCopy::Pending(length)) => {
-                            self.receive_direct_pending = Some(length);
-                            break;
-                        }
-                    }
-                }
-                let Some(stride) = stride else {
-                    break;
-                };
-                let mut received = RecvMeta::default();
-                received.addr = self.tuple.destination;
-                received.len = group_count * stride;
-                received.stride = stride;
-                received.dst_ip = Some(self.tuple.source.ip());
-                meta[received_count] = received;
-                received_count += 1;
-            }
-
-            let mut guard = match self.io.poll_read_ready(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending if received_count > 0 => return Poll::Ready(Ok(received_count)),
-                Poll::Pending => return Poll::Pending,
-            };
-            let result = guard.try_io(|_| {
-                let Some(ring) = self.receive_ring.as_ref() else {
-                    return Err(std::io::Error::other("FakeTCP receive ring is unavailable"));
-                };
-                if ring.has_user_frame()? {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "packet ring has no user-owned frames",
-                    ))
-                }
-            });
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Poll::Ready(Err(error)),
-                Err(_would_block) if received_count > 0 => {
-                    return Poll::Ready(Ok(received_count));
-                }
-                Err(_would_block) => return Poll::Pending,
-            }
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn resolve_packet_target(destination: SocketAddr) -> std::io::Result<PacketTarget> {
-    let IpAddr::V4(destination) = destination.ip() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "AF_PACKET FakeTCP transmit currently supports IPv4 only",
-        ));
-    };
-    if destination.is_loopback() {
-        return Ok(PacketTarget {
-            ifindex: interface_index("lo")?,
-            destination: [0; 6],
-        });
-    }
-    let route = best_route(destination)?;
-    let next_hop = if route.gateway == 0 {
-        destination
-    } else {
-        Ipv4Addr::from(route.gateway)
-    };
-    Ok(PacketTarget {
-        ifindex: interface_index(&route.interface)?,
-        destination: arp_neighbor(route.interface.as_str(), next_hop)?,
-    })
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Debug)]
-struct RouteEntry {
-    interface: String,
-    gateway: u32,
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn best_route(destination: Ipv4Addr) -> std::io::Result<RouteEntry> {
-    let destination = u32::from(destination);
-    let contents = std::fs::read_to_string("/proc/net/route")?;
-    let mut best: Option<(u32, RouteEntry)> = None;
-    for line in contents.lines().skip(1) {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 8 {
-            continue;
-        }
-        let (Ok(route_destination), Ok(gateway), Ok(flags), Ok(mask)) = (
-            u32::from_str_radix(fields[1], 16),
-            u32::from_str_radix(fields[2], 16),
-            u32::from_str_radix(fields[3], 16),
-            u32::from_str_radix(fields[7], 16),
-        ) else {
-            continue;
-        };
-        let mask = u32::from_le(mask);
-        if flags & 1 == 0 || destination & mask != u32::from_le(route_destination) & mask {
-            continue;
-        }
-        let prefix = mask.count_ones();
-        if best.as_ref().is_some_and(|(current, _)| *current >= prefix) {
-            continue;
-        }
-        best = Some((
-            prefix,
-            RouteEntry {
-                interface: fields[0].to_owned(),
-                gateway: u32::from_le(gateway),
-            },
-        ));
-    }
-    best.map(|(_, route)| route).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no usable IPv4 route for AF_PACKET FakeTCP transmit",
-        )
-    })
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn arp_neighbor(interface: &str, address: Ipv4Addr) -> std::io::Result<[u8; 6]> {
-    let contents = std::fs::read_to_string("/proc/net/arp")?;
-    for line in contents.lines().skip(1) {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 6 || fields[0] != address.to_string() || fields[5] != interface {
-            continue;
-        }
-        let Ok(flags) = u32::from_str_radix(fields[2], 16) else {
-            continue;
-        };
-        if flags & 0x2 == 0 {
-            continue;
-        }
-        let octets: Vec<_> = fields[3]
-            .split(':')
-            .filter_map(|part| u8::from_str_radix(part, 16).ok())
-            .collect();
-        if octets.len() == 6 && octets.iter().any(|octet| *octet != 0) {
-            let address = octets.as_slice().try_into().expect("six-byte ARP address");
-            return Ok(address);
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no resolved ARP neighbor for AF_PACKET FakeTCP transmit",
-    ))
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-fn interface_index(interface: &str) -> std::io::Result<libc::c_int> {
-    let name = CString::new(interface).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "interface name contains NUL",
-        )
-    })?;
-    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    if index == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    libc::c_int::try_from(index).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "interface index overflows c_int",
-        )
-    })
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn packet_sockaddr(target: PacketTarget) -> libc::sockaddr_ll {
-    let mut address = [0; 8];
-    address[..target.destination.len()].copy_from_slice(&target.destination);
-    libc::sockaddr_ll {
-        sll_family: libc::c_ushort::try_from(libc::AF_PACKET).expect("AF_PACKET fits c_ushort"),
-        sll_protocol: packet_protocol(),
-        sll_ifindex: target.ifindex,
-        sll_hatype: 0,
-        sll_pkttype: 0,
-        sll_halen: if target.destination == [0; 6] { 0 } else { 6 },
-        sll_addr: address,
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn packet_protocol() -> libc::c_ushort {
-    u16::try_from(libc::ETH_P_IP)
-        .expect("ETH_P_IP fits u16")
-        .to_be()
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-fn bind_packet_socket(socket: &Socket, target: PacketTarget) -> std::io::Result<()> {
-    let address = packet_sockaddr(target);
-    let result = unsafe {
-        libc::bind(
-            socket.as_raw_fd(),
-            (&raw const address).cast(),
-            libc::socklen_t::try_from(mem::size_of::<libc::sockaddr_ll>())
-                .expect("sockaddr_ll size fits socklen_t"),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-fn bind_packet_receive_socket(socket: &Socket, target: PacketTarget) -> std::io::Result<()> {
-    let address = packet_sockaddr(PacketTarget {
-        ifindex: target.ifindex,
-        destination: [0; 6],
-    });
-    let result = unsafe {
-        libc::bind(
-            socket.as_raw_fd(),
-            (&raw const address).cast(),
-            libc::socklen_t::try_from(mem::size_of::<libc::sockaddr_ll>())
-                .expect("sockaddr_ll size fits socklen_t"),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn tuple_filter(tuple: FourTuple) -> std::io::Result<[SockFilter; 18]> {
-    // ponytail: fixed IPv4/TCP offsets match this encoder; use an IHL-aware filter if
-    // externally supplied packets with IPv4 options become supported.
-    let (IpAddr::V4(source), IpAddr::V4(destination)) = (tuple.destination.ip(), tuple.source.ip())
-    else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "FakeTCP tuple filter currently supports IPv4 only",
-        ));
-    };
-    let source = u32::from_be_bytes(source.octets());
-    let destination = u32::from_be_bytes(destination.octets());
-    let source_port = u32::from(tuple.destination.port());
-    let destination_port = u32::from(tuple.source.port());
-    Ok([
-        SockFilter::new(0x30, 0, 0, 0),
-        SockFilter::new(0x54, 0, 0, 0xf0),
-        SockFilter::new(0x15, 0, 14, 0x40),
-        SockFilter::new(0x30, 0, 0, 9),
-        SockFilter::new(0x15, 0, 12, u32::from(TCP_PROTOCOL)),
-        SockFilter::new(0x20, 0, 0, 12),
-        SockFilter::new(0x15, 0, 10, source),
-        SockFilter::new(0x20, 0, 0, 16),
-        SockFilter::new(0x15, 0, 8, destination),
-        SockFilter::new(0x28, 0, 0, 20),
-        SockFilter::new(0x15, 0, 6, source_port),
-        SockFilter::new(0x28, 0, 0, 22),
-        SockFilter::new(0x15, 0, 4, destination_port),
-        SockFilter::new(0x30, 0, 0, 33),
-        SockFilter::new(0x54, 0, 0, 0x0a),
-        SockFilter::new(0x15, 1, 0, 0),
-        SockFilter::new(0x06, 0, 0, u32::MAX),
-        SockFilter::new(0x06, 0, 0, 0),
-    ])
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code, clippy::too_many_arguments, clippy::too_many_lines)]
-fn send_raw_batch(
-    socket: &Socket,
-    destination: &SockAddr,
-    mode: RawSendMode,
-    storage: &[u8],
-    packet_capacity: usize,
-    lengths: &[usize],
-    first: usize,
-) -> std::io::Result<usize> {
-    let count = lengths.len().saturating_sub(first).min(RAW_SEND_BATCH_SIZE);
-    if count == 0 {
-        return Ok(0);
-    }
-
-    let packet_at = |index: usize| -> std::io::Result<&[u8]> {
-        let length = lengths[index];
-        let offset = index.checked_mul(packet_capacity).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "header offset overflow")
-        })?;
-        storage
-            .get(
-                offset..offset.checked_add(length).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "header length overflow")
-                })?,
-            )
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "packet header exceeds send storage",
-                )
-            })
-    };
-
-    let wire_packet = |index: usize| -> std::io::Result<&[u8]> {
-        let packet = packet_at(index)?;
-        match mode {
-            RawSendMode::Ip => Ok(packet.get(IPV4_HEADER_BYTES..).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "raw packet is missing an IPv4 header",
-                )
-            })?),
-            RawSendMode::Packet => Ok(packet),
-        }
-    };
-
-    if count == 1 {
-        let packet = wire_packet(first)?;
-        let sent = match mode {
-            RawSendMode::Ip => socket.send_to(packet, destination)?,
-            RawSendMode::Packet => socket.send(packet)?,
-        };
-        if sent != packet.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "raw FakeTCP packet was only partially sent",
-            ));
-        }
-        return Ok(1);
-    }
-
-    let mut iovs = [libc::iovec {
-        iov_base: ptr::null_mut(),
-        iov_len: 0,
-    }; RAW_SEND_BATCH_SIZE];
-    let mut messages = unsafe { mem::zeroed::<[libc::mmsghdr; RAW_SEND_BATCH_SIZE]>() };
-    for (index, message) in messages.iter_mut().enumerate().take(count) {
-        let packet = wire_packet(first + index)?;
-        iovs[index].iov_base = packet.as_ptr().cast_mut().cast();
-        iovs[index].iov_len = packet.len();
-        let (address, length) = match mode {
-            RawSendMode::Ip => (destination.as_ptr().cast_mut().cast(), destination.len()),
-            RawSendMode::Packet => (ptr::null_mut(), 0),
-        };
-        message.msg_hdr.msg_name = address;
-        message.msg_hdr.msg_namelen = length;
-        message.msg_hdr.msg_iov = &raw mut iovs[index];
-        message.msg_hdr.msg_iovlen = 1;
-    }
-    let sent = loop {
-        // SAFETY: every iovec points into `storage`, which remains borrowed for the syscall;
-        // each destination pointer refers to the live `SockAddr` argument.
-        let sent = unsafe {
-            libc::sendmmsg(
-                socket.as_raw_fd(),
-                messages.as_mut_ptr(),
-                libc::c_uint::try_from(count).expect("raw send batch size fits libc"),
-                0,
-            )
-        };
-        if sent >= 0 {
-            break usize::try_from(sent).expect("successful sendmmsg count is non-negative");
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
-    };
-    for (index, message) in messages.iter().enumerate().take(sent) {
-        if message.msg_len as usize != wire_packet(first + index)?.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "raw FakeTCP packet was only partially sent",
-            ));
-        }
-    }
-    Ok(sent)
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[allow(unsafe_code)]
-fn receive_raw_batch(
-    socket: &Socket,
-    storage: &mut [u8],
-    lengths: &mut [usize; RAW_RECV_BATCH_SIZE],
-) -> std::io::Result<usize> {
-    let mut iovs = [libc::iovec {
-        iov_base: ptr::null_mut(),
-        iov_len: 0,
-    }; RAW_RECV_BATCH_SIZE];
-    let mut messages = unsafe { mem::zeroed::<[libc::mmsghdr; RAW_RECV_BATCH_SIZE]>() };
-    for index in 0..RAW_RECV_BATCH_SIZE {
-        let offset = index.checked_mul(RAW_PACKET_BUFFER_BYTES).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "raw receive offset overflow",
-            )
-        })?;
-        let packet = storage
-            .get_mut(offset..offset + RAW_PACKET_BUFFER_BYTES)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "raw receive storage is too small",
-                )
-            })?;
-        iovs[index].iov_base = packet.as_mut_ptr().cast();
-        iovs[index].iov_len = packet.len();
-        messages[index].msg_hdr.msg_iov = &raw mut iovs[index];
-        messages[index].msg_hdr.msg_iovlen = 1;
-    }
-    let received = loop {
-        // SAFETY: every iovec points into `storage`, and the storage and message arrays remain
-        // borrowed until the syscall returns.
-        let received = unsafe {
-            libc::recvmmsg(
-                socket.as_raw_fd(),
-                messages.as_mut_ptr(),
-                libc::c_uint::try_from(RAW_RECV_BATCH_SIZE)
-                    .expect("raw receive batch size fits libc"),
-                0,
-                ptr::null_mut(),
-            )
-        };
-        if received >= 0 {
-            break usize::try_from(received).expect("successful recvmmsg count is non-negative");
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
-    };
-    for (index, length) in lengths.iter_mut().enumerate().take(received) {
-        if messages[index].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "raw FakeTCP packet was truncated",
-            ));
-        }
-        *length = usize::try_from(messages[index].msg_len).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "raw packet length overflow",
-            )
-        })?;
-    }
-    Ok(received)
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-impl AsyncUdpSocket for FakeTcpSocket {
-    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
-        Box::pin(FakeTcpSender {
-            io: Arc::clone(&self.send_io),
-            send_mode: self.send_mode,
-            tuple: self.tuple,
-            carrier: Arc::clone(&self.outbound),
-            server_side: self.server_side,
-            pending: vec![0; RAW_PACKET_BUFFER_BYTES],
-            pending_segment: 0,
-            pending_segments: 0,
-            pending_segment_size: 0,
-            pending_batch_count: 0,
-            pending_batch_sent: 0,
-            pending_batch_capacity: 0,
-            pending_batch_lengths: [0; RAW_SEND_BATCH_SIZE],
-        })
-    }
-
-    fn poll_recv(
-        &mut self,
-        cx: &mut Context<'_>,
-        bufs: &mut [std::io::IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<std::io::Result<usize>> {
-        if bufs.is_empty() || meta.is_empty() {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "no receive buffer",
-            )));
-        }
-        let slots = bufs.len().min(meta.len());
-        if self.receive_ring.is_some() {
-            return self.poll_recv_ring(cx, bufs, meta);
-        }
-        let mut received_count = 0;
-        loop {
-            while received_count < slots {
-                let Some(first) = self.next_decoded_packet()? else {
-                    break;
-                };
-                let stride = first.payload_length;
-                if stride > bufs[received_count].len() {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "QUICP datagram exceeds receive buffer",
-                    )));
-                }
-                let max_group = bufs[received_count]
-                    .len()
-                    .checked_div(stride.max(1))
-                    .unwrap_or(1)
-                    .clamp(1, RAW_GRO_SEGMENTS);
-                let first_payload = self.decoded_payload(first)?;
-                bufs[received_count][..stride].copy_from_slice(first_payload);
-                let mut group_count = 1;
-                while group_count < max_group {
-                    let Some(next) = self.next_decoded_packet()? else {
-                        break;
-                    };
-                    if next.payload_length != stride {
-                        self.receive_pending = Some(next);
-                        break;
-                    }
-                    let payload = self.decoded_payload(next)?;
-                    let start = group_count * stride;
-                    bufs[received_count][start..start + stride].copy_from_slice(payload);
-                    group_count += 1;
-                }
-                let mut received = RecvMeta::default();
-                received.addr = self.tuple.destination;
-                received.len = group_count * stride;
-                received.stride = stride;
-                received.dst_ip = Some(self.tuple.source.ip());
-                meta[received_count] = received;
-                received_count += 1;
-                if received_count == slots {
-                    return Poll::Ready(Ok(received_count));
-                }
-            }
-            self.receive_batch_count = 0;
-            self.receive_batch_index = 0;
-
-            let mut guard = match self.io.poll_read_ready(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending if received_count > 0 => return Poll::Ready(Ok(received_count)),
-                Poll::Pending => return Poll::Pending,
-            };
-            let result = guard.try_io(|inner| {
-                receive_raw_batch(
-                    inner.get_ref(),
-                    &mut self.receive_buffer,
-                    &mut self.receive_batch_lengths,
-                )
-            });
-            match result {
-                Ok(Ok(count)) if count > 0 => {
-                    self.receive_batch_count = count;
-                }
-                Ok(Ok(_)) => {
-                    if received_count > 0 {
-                        return Poll::Ready(Ok(received_count));
-                    }
-                }
-                Ok(Err(error)) => return Poll::Ready(Err(error)),
-                Err(_would_block) if received_count > 0 => {
-                    return Poll::Ready(Ok(received_count));
-                }
-                Err(_would_block) => {}
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        Ok(self.tuple.source)
-    }
-
-    fn max_receive_segments(&self) -> NonZeroUsize {
-        // Reuse noq's GRO contract to amortize one BytesMut copy over a bounded packet group.
-        NonZeroUsize::new(RAW_GRO_SEGMENTS).expect("non-zero receive segment batch")
-    }
-
-    fn may_fragment(&self) -> bool {
-        false
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-#[derive(Debug)]
-struct FakeTcpSender {
-    io: Arc<AsyncFd<Socket>>,
-    send_mode: RawSendMode,
-    tuple: FourTuple,
-    carrier: Arc<Mutex<FakeTcpCarrier>>,
-    server_side: bool,
-    pending: Vec<u8>,
-    pending_segment: usize,
-    pending_segments: usize,
-    pending_segment_size: usize,
-    pending_batch_count: usize,
-    pending_batch_sent: usize,
-    pending_batch_capacity: usize,
-    pending_batch_lengths: [usize; RAW_SEND_BATCH_SIZE],
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-impl UdpSender for FakeTcpSender {
-    #[allow(clippy::too_many_lines)]
-    fn poll_send(
-        mut self: Pin<&mut Self>,
-        transmit: &Transmit<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if transmit.destination != self.tuple.destination {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "FakeTCP sender destination does not match its path",
-            )));
-        }
-        if transmit
-            .src_ip
-            .is_some_and(|source| source != self.tuple.source.ip())
-        {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "FakeTCP sender source does not match its path",
-            )));
-        }
-        let destination = SockAddr::from(self.tuple.destination);
-        if self.pending_segments == 0 {
-            let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
-            if segment_size == 0 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "FakeTCP sender received invalid segmentation metadata",
-                )));
-            }
-            self.pending_segment_size = segment_size;
-            self.pending_segments = transmit.contents.len().div_ceil(segment_size);
-        }
-        loop {
-            if self.pending_batch_count == 0 {
-                let this = self.as_mut().get_mut();
-                let remaining = this.pending_segments - this.pending_segment;
-                let batch_count = remaining.min(RAW_SEND_BATCH_SIZE);
-                let server_side = this.server_side;
-                let Ok(mut carrier) = this.carrier.lock() else {
-                    return Poll::Ready(Err(std::io::Error::other("FakeTCP send state poisoned")));
-                };
-                let ip_header_bytes = if this.tuple.source.is_ipv4() {
-                    IPV4_HEADER_BYTES
-                } else {
-                    IPV6_HEADER_BYTES
-                };
-                let packet_capacity = this
-                    .pending_segment_size
-                    .checked_add(ip_header_bytes + TCP_HEADER_BYTES + MAX_TCP_OPTIONS_BYTES)
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "raw FakeTCP packet capacity overflow",
-                        )
-                    });
-                let packet_capacity = match packet_capacity {
-                    Ok(capacity) => capacity,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
-                let Some(storage_len) = packet_capacity.checked_mul(batch_count) else {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "raw FakeTCP header batch capacity overflow",
-                    )));
-                };
-                if this.pending.len() < storage_len {
-                    this.pending.resize(storage_len, 0);
-                }
-                for index in 0..batch_count {
-                    let segment = this.pending_segment + index;
-                    let start = segment * this.pending_segment_size;
-                    let end = (start + this.pending_segment_size).min(transmit.contents.len());
-                    let output_start = index * packet_capacity;
-                    let output_end = output_start + packet_capacity;
-                    let encoded = if carrier.sent_syn() {
-                        carrier.encode_datagram_into(
-                            &transmit.contents[start..end],
-                            &mut this.pending[output_start..output_end],
-                        )
-                    } else if server_side {
-                        carrier.encode_syn_ack_into(
-                            &transmit.contents[start..end],
-                            &mut this.pending[output_start..output_end],
-                        )
-                    } else {
-                        carrier.encode_syn_into(
-                            &transmit.contents[start..end],
-                            &mut this.pending[output_start..output_end],
-                        )
-                    };
-                    match encoded.map_err(carrier_io_error) {
-                        Ok(length) => this.pending_batch_lengths[index] = length,
-                        Err(error) => return Poll::Ready(Err(error)),
-                    }
-                }
-                this.pending_batch_count = batch_count;
-                this.pending_batch_sent = 0;
-                this.pending_batch_capacity = packet_capacity;
-            }
-            let mut guard = match self.io.poll_write_ready(cx) {
-                Poll::Ready(result) => match result {
-                    Ok(guard) => guard,
-                    Err(error) => return Poll::Ready(Err(error)),
-                },
-                Poll::Pending => return Poll::Pending,
-            };
-            let result = guard.try_io(|inner| {
-                send_raw_batch(
-                    inner.get_ref(),
-                    &destination,
-                    self.send_mode,
-                    &self.pending,
-                    self.pending_batch_capacity,
-                    &self.pending_batch_lengths[..self.pending_batch_count],
-                    self.pending_batch_sent,
-                )
-            });
-            match result {
-                Ok(Ok(sent)) => {
-                    if sent == 0 {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "raw FakeTCP batch sent no packets",
-                        )));
-                    }
-                    self.pending_batch_sent += sent;
-                    self.pending_segment += sent;
-                    if self.pending_batch_sent == self.pending_batch_count {
-                        self.pending_batch_count = 0;
-                        self.pending_batch_sent = 0;
-                        self.pending_batch_capacity = 0;
-                    }
-                    if self.pending_segment == self.pending_segments {
-                        self.pending_segment = 0;
-                        self.pending_segments = 0;
-                        self.pending_segment_size = 0;
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                Ok(Err(error)) => return Poll::Ready(Err(error)),
-                Err(_would_block) => {}
-            }
-        }
-    }
-
-    fn max_transmit_segments(&self) -> NonZeroUsize {
-        NonZeroUsize::new(RAW_SEND_BATCH_SIZE).expect("non-zero segment batch")
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
-fn carrier_io_error(error: CarrierError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-}
+// The codec above is runtime-neutral; only the Tokio raw-socket adapter needs both gates.
+#[cfg(all(unix, feature = "runtime-tokio"))]
+mod unix;
+#[cfg(all(unix, feature = "runtime-tokio"))]
+pub use unix::FakeTcpSocket;
 
 impl FourTuple {
     fn validate(self) -> Result<(), CarrierError> {
@@ -2422,85 +1151,41 @@ impl FourTuple {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ReplayWindow {
-    sequences: [u32; REPLAY_WINDOW_SIZE],
-    len: usize,
-    next: usize,
-    largest: Option<u32>,
+fn validated_pseudo_header_prefix(tuple: FourTuple) -> Result<u32, CarrierError> {
+    tuple.validate()?;
+    tcp_pseudo_header_prefix(tuple.source, tuple.destination).ok_or(CarrierError::InvalidTuple)
 }
 
-impl Default for ReplayWindow {
-    fn default() -> Self {
-        Self {
-            sequences: [0; REPLAY_WINDOW_SIZE],
-            len: 0,
-            next: 0,
-            largest: None,
-        }
-    }
-}
-
-impl ReplayWindow {
-    const fn largest(&self) -> Option<u32> {
-        self.largest
-    }
-
-    fn contains(&self, sequence: u32) -> bool {
-        if let Some(largest) = self.largest {
-            let forward = sequence.wrapping_sub(largest);
-            if forward != 0 && forward < 0x8000_0000 {
-                return false;
-            }
-        }
-        self.sequences[..self.len].contains(&sequence)
-    }
-
-    fn accept(&mut self, sequence: u32) -> Result<(), CarrierError> {
-        if self.contains(sequence) {
-            return Err(CarrierError::Replay);
-        }
-        if let Some(largest) = self.largest {
-            let forward = sequence.wrapping_sub(largest);
-            if forward < 0x8000_0000 {
-                self.largest = Some(sequence);
-            } else if largest.wrapping_sub(sequence) >= REPLAY_WINDOW_BYTES {
-                return Err(CarrierError::ReplayWindowExceeded);
-            }
-        } else {
-            self.largest = Some(sequence);
-        }
-        if self.len < REPLAY_WINDOW_SIZE {
-            self.sequences[self.len] = sequence;
-            self.len += 1;
-        } else {
-            self.sequences[self.next] = sequence;
-            self.next = (self.next + 1) % REPLAY_WINDOW_SIZE;
-        }
-        Ok(())
-    }
-}
-
-fn append_address(output: &mut Vec<u8>, address: SocketAddr) {
+fn append_address(output: &mut [u8], offset: &mut usize, address: SocketAddr) {
     match address.ip() {
         IpAddr::V4(value) => {
-            output.push(4);
-            output.extend_from_slice(&value.octets());
+            output[*offset] = 4;
+            *offset += 1;
+            let octets = value.octets();
+            output[*offset..*offset + octets.len()].copy_from_slice(&octets);
+            *offset += octets.len();
         }
         IpAddr::V6(value) => {
-            output.push(6);
-            output.extend_from_slice(&value.octets());
+            output[*offset] = 6;
+            *offset += 1;
+            let octets = value.octets();
+            output[*offset..*offset + octets.len()].copy_from_slice(&octets);
+            *offset += octets.len();
         }
     }
-    output.extend_from_slice(&address.port().to_be_bytes());
+    let port = address.port().to_be_bytes();
+    output[*offset..*offset + port.len()].copy_from_slice(&port);
+    *offset += port.len();
 }
 
 fn initial_sequence(tuple: FourTuple, direction: CarrierDirection) -> Result<u32, CarrierError> {
-    let mut input = Vec::with_capacity(40);
-    append_address(&mut input, tuple.source);
-    append_address(&mut input, tuple.destination);
-    input.push(direction.bit());
-    let checksum = crc32c::crc32c(&input);
+    let mut input = [0; 40];
+    let mut input_length = 0;
+    append_address(&mut input, &mut input_length, tuple.source);
+    append_address(&mut input, &mut input_length, tuple.destination);
+    input[input_length] = direction.bit();
+    input_length += 1;
+    let checksum = crc32c_checksum(&input[..input_length]);
     let mut random = [0; 4];
     SystemRandom::new()
         .fill(&mut random)
@@ -2508,115 +1193,29 @@ fn initial_sequence(tuple: FourTuple, direction: CarrierDirection) -> Result<u32
     Ok(u32::from_be_bytes(random) ^ checksum)
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-static SIMD_LEVEL: OnceLock<Level> = OnceLock::new();
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fearless_simd::kernel!(
-    #[inline]
-    #[allow(clippy::chunks_exact_to_as_chunks)]
-    fn checksum_blocks_avx2(avx2: Avx2, input: &[u8]) -> u32 {
-        let adjust = _mm256_set1_epi16(i16::MIN);
-        let ones = _mm256_set1_epi16(1);
-        let pair_bias = _mm256_set1_epi32(65_536);
-        let byte_swap = _mm256_setr_epi8(
-            1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11,
-            10, 13, 12, 15, 14,
-        );
-        let mut sum0 = _mm256_setzero_si256();
-        let mut sum1 = _mm256_setzero_si256();
-        macro_rules! add_block {
-            ($sum:ident, $chunk:expr) => {{
-                let input: &[u8; 32] = $chunk.try_into().expect("exact 32-byte checksum block");
-                let bytes: fearless_simd::u8x32<Avx2> = avx2.load_array_ref_u8x32(input);
-                let input: __m256i = bytes.into();
-                let swapped = _mm256_shuffle_epi8(input, byte_swap);
-                // Convert unsigned 16-bit words to signed values before using madd, then add
-                // back the constant bias for each pair. This avoids two unpack operations.
-                let adjusted = _mm256_sub_epi16(swapped, adjust);
-                let pair_sums = _mm256_madd_epi16(adjusted, ones);
-                $sum = _mm256_add_epi32($sum, _mm256_add_epi32(pair_sums, pair_bias));
-            }};
-        }
-        for chunk in input.chunks_exact(64) {
-            let mut blocks = chunk.chunks_exact(32);
-            add_block!(sum0, blocks.next().expect("two checksum blocks"));
-            add_block!(sum1, blocks.next().expect("two checksum blocks"));
-        }
-        let unrolled_len = input.len() / 64 * 64;
-        let mut sum = _mm256_add_epi32(sum0, sum1);
-        for chunk in input[unrolled_len..].chunks_exact(32) {
-            add_block!(sum, chunk);
-        }
-        let sum = _mm_add_epi32(
-            _mm256_castsi256_si128(sum),
-            _mm256_extracti128_si256::<1>(sum),
-        );
-        let sum = _mm_hadd_epi32(sum, sum);
-        let sum = _mm_hadd_epi32(sum, sum);
-        u32::try_from(_mm_cvtsi128_si32(sum)).unwrap_or_default()
-    }
-);
+#[inline]
+fn crc32c_checksum(input: &[u8]) -> u32 {
+    crc32c::crc32c(input)
+}
 
 #[inline]
 fn internet_checksum(input: &[u8]) -> u16 {
     !u16::try_from(fold_checksum(checksum_sum(input))).unwrap_or(u16::MAX)
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)]
 #[inline]
-fn checksum_sum_scalar(input: &[u8]) -> u32 {
+fn checksum_sum(input: &[u8]) -> u32 {
     // The maximum IP packet keeps this accumulator below u32::MAX; folding once enables
     // LLVM to vectorize the hot payload loop.
     let mut sum = 0u32;
-    let mut chunks = input.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (chunks, remainder) = input.as_chunks::<2>();
+    for &[high, low] in chunks {
+        sum += u32::from(u16::from_be_bytes([high, low]));
     }
-    if let Some(&byte) = chunks.remainder().first() {
+    if let Some(&byte) = remainder.first() {
         sum += u32::from(byte) << 8;
     }
     sum
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[inline]
-fn checksum_sum_avx2(avx2: Avx2, input: &[u8]) -> u32 {
-    let block_len = input.len() / 32 * 32;
-    checksum_blocks_avx2(avx2, &input[..block_len]) + checksum_sum_scalar(&input[block_len..])
-}
-
-#[inline]
-fn checksum_sum(input: &[u8]) -> u32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if input.len() >= 256
-        && let Some(avx2) = SIMD_LEVEL.get_or_init(Level::new).as_avx2()
-    {
-        return checksum_sum_avx2(avx2, input);
-    }
-    checksum_sum_scalar(input)
-}
-
-#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
-mod checksum_tests {
-    use super::{Level, SIMD_LEVEL, checksum_sum_avx2, checksum_sum_scalar};
-
-    #[test]
-    fn avx2_checksum_matches_scalar_for_all_lengths() {
-        let Some(avx2) = SIMD_LEVEL.get_or_init(Level::new).as_avx2() else {
-            return;
-        };
-        for size in 0..=4096 {
-            let input: Vec<u8> = (0..size)
-                .map(|value| u8::try_from(value % 256).unwrap_or_default())
-                .collect();
-            assert_eq!(
-                checksum_sum_avx2(avx2, &input),
-                checksum_sum_scalar(&input),
-                "length {size}"
-            );
-        }
-    }
 }
 
 #[inline]
@@ -2679,11 +1278,14 @@ fn cookie_tuple(tuple: FourTuple) -> FourTuple {
 pub fn issue_syn_cookie(secret: &[u8], tuple: FourTuple, epoch: u64) -> [u8; 16] {
     let tuple = cookie_tuple(tuple);
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
-    let mut message = Vec::with_capacity(48);
-    append_address(&mut message, tuple.source);
-    append_address(&mut message, tuple.destination);
-    message.extend_from_slice(&epoch.to_be_bytes());
-    let tag = hmac::sign(&key, &message);
+    let mut message = [0; 48];
+    let mut message_length = 0;
+    append_address(&mut message, &mut message_length, tuple.source);
+    append_address(&mut message, &mut message_length, tuple.destination);
+    let epoch = epoch.to_be_bytes();
+    message[message_length..message_length + epoch.len()].copy_from_slice(&epoch);
+    message_length += epoch.len();
+    let tag = hmac::sign(&key, &message[..message_length]);
     let mut cookie = [0; 16];
     cookie.copy_from_slice(&tag.as_ref()[..16]);
     cookie
@@ -2695,44 +1297,169 @@ pub fn verify_syn_cookie(secret: &[u8], tuple: FourTuple, epoch: u64, cookie: &[
     cookie.ct_eq(&issue_syn_cookie(secret, tuple, epoch)).into()
 }
 
+/// Packet validation, bounded encoding, and carrier-state errors.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CarrierError {
+    /// Source and destination do not form a usable same-family path.
     #[error("invalid FakeTCP four-tuple")]
     InvalidTuple,
+    /// The packet has an unsupported IP version.
     #[error("unsupported IP version")]
     UnsupportedIpVersion,
+    /// The input ends before the declared headers or payload.
     #[error("packet is too short")]
     PacketTooShort,
+    /// The packet exceeds the IP length limit.
     #[error("packet is too large")]
     PacketTooLarge,
+    /// The complete outer MTU is too small for the IP and TCP headers.
+    #[error("outer MTU {0} is too small for the IP and TCP headers")]
+    InvalidOuterMtu(u16),
+    /// The advertised MSS cannot fit the configured outer packet MTU.
+    #[error("MSS {mss} exceeds the carrier maximum {maximum}")]
+    InvalidMss {
+        /// Rejected MSS.
+        mss: u16,
+        /// Maximum MSS for the outer packet MTU.
+        maximum: u16,
+    },
+    /// The caller-owned output buffer cannot hold the encoded packet.
     #[error("output buffer capacity {available} is smaller than packet size {required}")]
-    OutputTooSmall { required: usize, available: usize },
+    OutputTooSmall {
+        /// Required packet bytes.
+        required: usize,
+        /// Supplied output capacity.
+        available: usize,
+    },
+    /// The IP header or checksum is invalid.
     #[error("invalid IPv4/IPv6 header")]
     InvalidIpHeader,
+    /// The TCP-shaped header or checksum is invalid.
     #[error("invalid TCP header")]
     InvalidTcpHeader,
+    /// A TCP option is malformed.
     #[error("invalid TCP option")]
     InvalidTcpOption,
+    /// Encoded TCP options exceed the protocol maximum.
     #[error("TCP options exceed 40 bytes")]
     TcpOptionsTooLong,
+    /// A QUICP datagram cannot fit in one carrier packet.
     #[error("datagram exceeds the carrier limit")]
     DatagramTooLarge,
+    /// SYN data was requested while disabled.
     #[error("SYN data is disabled")]
     SynDataDisabled,
+    /// The SYN did not carry the expected tuple-bound cookie.
     #[error("SYN data cookie was rejected")]
     SynCookieRejected,
+    /// The requested SYN/data transition is not valid for current state.
     #[error("carrier state transition is invalid")]
     InvalidState,
+    /// The decoded packet belongs to a different carrier tuple.
     #[error("packet tuple does not match the carrier path")]
     WrongTuple,
+    /// The carrier packet contains no QUICP datagram.
     #[error("packet has no carrier payload")]
     EmptyPayload,
-    #[error("carrier sequence was already received")]
-    Replay,
-    #[error("carrier sequence is outside the replay window")]
-    ReplayWindowExceeded,
-    #[error("carrier sequence space is exhausted; create a new path")]
-    SequenceExhausted,
+    /// The operating system did not provide secure randomness.
     #[error("system randomness is unavailable")]
     Randomness,
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn sequence_numbers_wrap_like_tcp() {
+        let tuple = FourTuple::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 40_001)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 44_443)),
+        );
+        let mut carrier = FakeTcpCarrier::new(
+            tuple,
+            CarrierDirection::ClientToServer,
+            SynDataMode::Disabled,
+        )
+        .expect("carrier");
+        carrier.send_sequence = u32::MAX - 1;
+
+        let first = carrier.encode_datagram(b"1234").expect("first packet");
+        let second = carrier.encode_datagram(b"5678").expect("wrapped packet");
+        let first = decode_packet_view(&first, None).expect("first view");
+        let second = decode_packet_view(&second, None).expect("second view");
+        assert_eq!(first.sequence, u32::MAX - 1);
+        assert_eq!(second.sequence, 2);
+    }
+
+    #[test]
+    fn paired_sender_acknowledges_packets_decoded_by_receiver() {
+        let tuple = FourTuple::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 40_001)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 44_443)),
+        );
+        let cookie = SynDataMode::Cookie([7; 16]);
+        let mut client =
+            FakeTcpCarrier::new(tuple.reverse(), CarrierDirection::ServerToClient, cookie)
+                .expect("client carrier");
+        let (mut inbound, mut outbound) =
+            FakeTcpCarrier::pair(tuple, CarrierDirection::ClientToServer, cookie)
+                .expect("server carriers");
+
+        let syn = client.encode_syn(b"initial").expect("client SYN");
+        inbound
+            .decode_datagram_borrowed(&syn)
+            .expect("server receives SYN");
+        let syn = decode_packet_view(&syn, None).expect("client SYN view");
+        let syn_ack = outbound
+            .encode_syn_ack(b"response")
+            .expect("server SYN-ACK");
+        let syn_ack = decode_packet_view(&syn_ack, None).expect("server SYN-ACK view");
+
+        assert_eq!(
+            syn_ack.acknowledgment,
+            syn.sequence
+                .wrapping_add(u32::try_from(syn.payload.len()).expect("payload length"))
+                .wrapping_add(1)
+        );
+    }
+}
+
+#[cfg(all(test, unix, feature = "runtime-tokio"))]
+mod unix_socket_tests {
+    use super::unix::{MAX_DECODE_REJECTS_PER_POLL, reject_budget_exhausted};
+    #[cfg(not(target_os = "linux"))]
+    use super::{CarrierDirection, FourTuple, SynDataMode};
+    #[cfg(not(target_os = "linux"))]
+    use core::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn malformed_packet_budget_forces_a_scheduler_yield() {
+        let mut budget = MAX_DECODE_REJECTS_PER_POLL;
+        for _ in 1..MAX_DECODE_REJECTS_PER_POLL {
+            assert!(!reject_budget_exhausted(&mut budget));
+        }
+        assert!(reject_budget_exhausted(&mut budget));
+        assert!(reject_budget_exhausted(&mut budget));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn packet_socket_mode_is_linux_only() {
+        let tuple = FourTuple::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 44_000)),
+        );
+        let error = super::unix::FakeTcpSocket::bind(
+            tuple,
+            CarrierDirection::ClientToServer,
+            SynDataMode::Disabled,
+            1460,
+            1500,
+            true,
+        )
+        .expect_err("non-Linux packet sockets must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
 }

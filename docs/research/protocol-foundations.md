@@ -9,26 +9,28 @@ they do not define the QUICP wire format or require TLS. Sources were checked on
 
 ## Decision
 
-Build a TCP-compatible proxy, not a new general-purpose transport stack:
+Build a portable QUICP transport library, not a VPN daemon or a new general-purpose
+IP stack:
 
 ```text
-local application
-  -> kernel TCP -> TUN -> smoltcp TCP termination
-  -> at most one active bidirectional QUICP flow per local TCP flow
-  -> one QUICP session with one or two validated network paths
-  -> gateway -> origin TCP
+host-owned socket/runtime
+  -> QUICP session and flows
+  -> one or two validated carrier paths
+  -> caller-owned egress handling
+
+optional transparent example:
+local application -> TUN/smoltcp -> QUICP -> gateway -> origin
 ```
 
-The selected public boundary is one process-shaped `load_config` plus
-`run(Config, CancellationToken)` API. FakeDNS and its persistent FakeIP directory
-stay inside the client configuration variant. TUN packet pumping, smoltcp
-ownership, QUICP session reuse, stream framing, early-open fallback, flow backpressure,
-and origin dialing all stay hidden.
+The selected public boundary is the host-driven `Client`/`Server` facade with caller-owned
+carrier I/O and runtime progress. QUICP accepts the caller's target authority; FakeDNS,
+FakeIP allocation, TUN packet pumping, and route management are optional integration concerns,
+not transport requirements. QUICP session reuse, stream framing, early-open fallback, flow
+backpressure, and path failover stay inside the transport adapter.
 
-This scope replaces TCP only on the client-to-gateway overlay leg. The local
-application still sees TCP, and a gateway that talks to an ordinary origin still
-uses TCP on the egress leg. Claiming end-to-end removal of TCP head-of-line (HOL)
-blocking would therefore be false.
+This scope provides an alternative transport for callers that need better connectivity. A
+transparent example may replace only the client-to-gateway overlay leg, while the local
+application and gateway origin leg continue to use their platform's normal transport.
 
 The design deliberately does not copy Tinect's fake-TCP carrier. In Tinect,
 "fake TCP" means making datagrams look like TCP packets to middleboxes. In this
@@ -242,38 +244,20 @@ addresses. If the core transport passes but multipath-specific admission fails,
 ship single-path mode only. Detailed evidence and patch boundaries are in
 [`multipath-quic.md`](multipath-quic.md).
 
-## Canonical FakeIP and public boundary decision
+## Optional transparent integration boundary
 
-An earlier alternative put a reusable FakeIP allocator behind a public callback
-and exposed separate `run_client`/`run_server` functions. It was rejected: v1 has
-one Linux client, no FakeIP reuse, and no second allocator implementation to
-justify that seam.
-
-The canonical module owns FakeDNS, the persistent bidirectional mapping, TUN and
-route lifecycle, and smoltcp. It exposes only:
-
-```rust
-pub fn load_config(path: &std::path::Path) -> Result<Config, ConfigError>;
-
-pub async fn run(
-    config: Config,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(), RunError>;
-```
-
-`Config` is tagged as client or server. Each established local flow looks up its
-destination FakeIP exactly once before opening QUICP and retains the resulting
-canonical hostname. A missing or corrupt mapping fails closed. Mappings are
-persisted before DNS answers and are never reassigned in v1; leases and reuse
-tests therefore do not exist. The gateway still resolves and authorizes every
-concrete egress address independently.
+FakeDNS and its persistent FakeIP directory remain useful for a transparent TUN/VPN example,
+but are deliberately outside the transport contract. That integration may resolve a local
+FakeIP to a canonical hostname before opening a QUICP flow, while the host-driven library path
+receives the hostname or socket target directly. A missing or corrupt mapping must fail closed;
+the gateway still resolves and authorizes every concrete egress address independently.
 
 ## Hidden implementation and adapter locality
 
 | Category | Hidden adapter/seam | Local responsibility |
 | --- | --- | --- |
-| Fake IP | Internal persisted directory | One lookup per established flow, canonical hostname validation, no v1 reuse |
-| Platform I/O | TUN adapter | Create/configure TUN, packet read/write, cleanup; no protocol decisions |
+| Fake IP | Optional transparent integration | One lookup per established flow, canonical hostname validation, no v1 reuse |
+| Platform I/O | Host carrier or optional TUN adapter | Packet I/O and cleanup; no protocol decisions |
 | Local TCP | `netstack-smoltcp` prototype adapter or admitted smoltcp adapter | Turn IP packets into async TCP flows; own all smoltcp state in one locality |
 | Async runtime | Tokio | Readiness, timers, bounded channels, task supervision, shutdown |
 | QUICP backend | Current `noq` adapter (temporary) | One long-lived session per gateway, bounded driver events, source/destination enforcement, one or two concurrent validated paths, at most one active flow per local flow; TLS is adapter-only |
@@ -358,56 +342,18 @@ is deferred.
 
 ## Early-open and replay boundary
 
-Early-open is a QUICP feature, not standard QUIC 0-RTT. It is attempted only
-when the configured peer/policy admission state is compatible with the selected
-`quicp/1` or `quicp/1-mp` profile. A cold session performs the normal bounded
-setup. The cached state binds the profile token, header limits, security mode,
-and authorization-policy epoch; incompatibility rejects early data.
-`safe-open-only` is explicit opt-in and remains off until its admission checks
-pass.
+Transport 0-RTT is not admitted by the current QUICP profile. The TFO-style
+carrier may place the backend handshake datagram in a TCP-shaped SYN, but no
+application `OPEN`, target hostname, DNS action, origin dial, or payload is
+accepted before the ordinary QUICP handshake and policy gate complete. A future
+early-open profile needs a separately reviewed resumption and replay contract;
+the current API deliberately exposes no placeholder switch for it.
 
-The current implementation keeps transport 0-RTT disabled on both peers because
-the server admission path cannot yet prove that buffered early bytes contain
-exactly one bounded `OPEN` header. The policy and cache remain fail-closed
-preparation, not an enabled capability.
-
-When the optional TLS adapter is used, its resumption ticket and peer
-fingerprint are inputs to this policy. In the no-security profile, the caller
-must provide an equivalent explicit peer admission record. Missing or stale
-metadata clears cached state, so an untrusted identity receives no target
-hostname in early data.
-
-The replay boundary is exact:
-
-- Replayable: only the bounded `OPEN` header written before the transport's
-  authentication gate completes. Application payload stays in smoltcp.
-- Allowed before the gate: only bounded transport buffering on path 0. Additional
-  multipath paths and path frames are available only after session admission.
-  Application code does not accept or parse a flow until the admission step
-  completes.
-- Forbidden before the gate: external DNS queries, origin TCP connect, origin
-  writes, quota/accounting commits, or any other externally visible/non-idempotent
-  effect.
-- Commit point: only after the server admission step succeeds may the gateway
-  accept and parse a flow, resolve, connect, write, and return `STATUS(ok)`.
-- Rejection: the client discards the rejected attempt, opens a fresh ordinary
-  flow, and retransmits only `OPEN` exactly once, but only after a successful,
-  still-open session explicitly rejected early data. Ambiguous outcomes abort.
-  At most one attempt is active; accepted flows and application bytes are never
-  replayed.
-- Capacity: when the server early-header budget is full, stop reading and apply
-  backpressure. Never read generic TCP payload before `STATUS(ok)` and never
-  switch to an unbounded queue.
-
-This exercises QUICP early-open without performing replayable upstream actions.
-Because the gateway waits for admission, it does not accelerate origin
-establishment versus an ordinary admitted session. If a future requirement
-demands origin connect/write before authentication, it needs an explicit
-idempotency contract plus durable, deployment-wide anti-replay; that is outside
-v1. After authentication, the server re-checks the resumed client certificate
-fingerprint, expiry, allowlist, and policy epoch when TLS/PSK is enabled; the
-no-security profile re-checks its configured peer policy. Authorization changes
-rotate or flush cached state.
+Before ordinary connection admission, only bounded handshake processing on path
+0 is allowed. Additional paths, flow parsing, DNS, origin connects, writes, and
+other external effects remain unavailable. A future transport 0-RTT profile must
+define remembered parameters, identity binding, replay behavior, capacity, and
+fallback as one reviewed contract rather than reusing the carrier cookie.
 
 ## Errors and failure locality
 
@@ -473,9 +419,9 @@ rotate or flush cached state.
 2. Replaying an early `OPEN` must create zero DNS queries, origin connections, or
    writes before the admission gate; early-open rejection must produce one ordinary
    retry and no duplicated origin bytes.
-3. FakeIP tests must prove persist-before-answer, stable no-reuse mappings,
-   single-writer enforcement, torn-tail recovery, checksum validation, and
-   fail-closed missing mappings.
+3. If the optional transparent integration is enabled, FakeIP tests must prove
+   persist-before-answer, stable no-reuse mappings, single-writer enforcement,
+   torn-tail recovery, checksum validation, and fail-closed missing mappings.
 4. Flow/data-queue saturation must close TCP windows or return `busy`; internal
    driver-channel saturation must close the affected connection or endpoint
    fail-closed. Both cases must keep memory flat over a sustained test.

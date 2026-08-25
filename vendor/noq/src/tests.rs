@@ -21,9 +21,9 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
+use crate::UdpSender;
 use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime};
 use crate::udp::{RecvMeta, Transmit};
-use crate::UdpSender;
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{

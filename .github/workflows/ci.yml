@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Audit dependencies with RustSec
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - name: Verify Cargo target inventory
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          root = pathlib.Path.cwd()
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                  text=True,
+              )
+          )
+          package = next(package for package in metadata["packages"] if package["name"] == "quicp")
+          declared = {
+              pathlib.Path(target["src_path"]).relative_to(root).as_posix()
+              for target in package["targets"]
+              if any(kind in {"test", "bench", "example"} for kind in target["kind"])
+          }
+          discovered = {
+              path.relative_to(root).as_posix()
+              for folder in ("tests", "examples", "benches")
+              for path in (root / folder).glob("*.rs")
+          }
+          missing = sorted(discovered - declared)
+          if missing:
+              raise SystemExit("Cargo target inventory missing: " + ", ".join(missing))
+          PY
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-features --all-targets --locked -- -D warnings
+      - run: cargo test --no-default-features --locked
+      - run: cargo test --all-features --locked
+      - run: cargo run --locked --example smoltcp_bridge --features platform-smoltcp
+      - run: cargo +1.88.0 check --no-default-features --all-targets --locked
+      - run: cargo +1.88.0 check --all-features --all-targets --locked
+      - name: Verify docs.rs metadata
+        run: >-
+          cargo metadata --format-version 1 --no-deps |
+          jq -e '.packages[] | select(.name == "quicp") | .metadata.docs.rs as $d |
+          ($d.features | index("internal-bench") | not)'
+      - name: Build stable API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --features runtime-tokio,tls-rustls,platform-smoltcp,ffi-c --no-deps --locked
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: 1.88.0
+      - name: C ABI header smoke
+        run: |
+          printf '%s\n' \
+            '#include <stdint.h>' \
+            '#include "quicp.h"' \
+            '_Static_assert(sizeof(quicp_input_packet_t) == 16 || sizeof(void*) == 4, "input layout");' \
+            '_Static_assert(sizeof(quicp_output_packet_t) == 16, "output layout");' \
+            'int main(void) { return (int)quicp_abi_version(); }' \
+            | cc -std=c11 -Wall -Wextra -Werror -Iinclude -x c -fsyntax-only -
+
+  apple:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+      - run: cargo check --locked --features ffi-c --target aarch64-apple-ios
+      - run: cargo check --locked --features ffi-c --target aarch64-apple-ios-sim
+      - run: cargo check --locked --features ffi-c --target x86_64-apple-ios
+      - run: cargo check --locked --features runtime-tokio --target aarch64-apple-darwin
+      - run: cargo test --locked
+      - run: cargo test --all-features --locked
+      - run: sh sdk/apple/build-xcframework.sh
+      - run: swift test --package-path sdk/apple
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-21 build-tools;35.0.0 ndk;28.2.13676358
+      - name: Pin Android NDK path
+        run: |
+          printf 'ANDROID_NDK_ROOT=%s\n' "$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          printf 'ANDROID_NDK_HOME=%s\n' "$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - run: cargo ndk -t arm64-v8a -t x86_64 -P 21 check --locked --features ffi-c
+      - run: cargo ndk -t arm64-v8a -P 21 rustc --locked --features ffi-c --crate-type staticlib
+      - name: Build arm64 JNI bridge
+        run: |
+          cmake -S sdk/android -B "$RUNNER_TEMP/quicp-jni" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DQUICP_RUST_LIB="$GITHUB_WORKSPACE/target/aarch64-linux-android/debug/libquicp.a"
+          cmake --build "$RUNNER_TEMP/quicp-jni" --parallel
