@@ -24,13 +24,17 @@ use tokio::io::unix::AsyncFd;
 #[cfg(target_os = "linux")]
 #[path = "unix/linux.rs"]
 mod linux;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[path = "unix/macos.rs"]
 mod macos;
 #[cfg(target_os = "linux")]
 use linux as platform;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use macos as platform;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "QUICP raw FakeTCP is not implemented for this Unix target; use the host-driven carrier or add an explicit platform adapter"
+);
 use platform::RawPlatform;
 
 const RAW_PACKET_BUFFER_BYTES: usize = MAX_PACKET_BYTES;
@@ -86,8 +90,7 @@ pub struct FakeTcpSocket {
 impl FakeTcpSocket {
     /// Binds a privileged raw IPv4 TCP socket for one `FakeTCP` path.
     ///
-    /// Linux may select `AF_PACKET` with `packet_socket`; macOS and other Unix targets reject that
-    /// option and use the IP raw-socket fallback.
+    /// Linux may select `AF_PACKET` with `packet_socket`; macOS uses the IP raw-socket fallback.
     ///
     /// # Errors
     ///

@@ -1,7 +1,9 @@
-//! Tokio runtime adapter and Unix `FakeTCP` endpoint extensions.
+//! Tokio runtime adapter and explicitly supported Unix `FakeTCP` endpoint extensions.
 //!
-//! This module is the only place that combines the Tokio executor with runtime adapters. Its Unix
-//! raw-socket extensions are target-gated; the protocol and host-carrier API remain in the parent.
+//! This module is the only place that combines the Tokio executor with runtime adapters. Its Linux
+//! and macOS raw-socket extensions are target-gated; the protocol and host-carrier API remain in
+//! the parent. Windows requires a separate packet-injection adapter and is intentionally not
+//! routed through the Unix path.
 
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
@@ -25,9 +27,9 @@ use crate::congestion::TransportOptions;
 use crate::faketcp::{CarrierDirection, FakeTcpSocket, FourTuple, SynDataMode};
 
 use super::{
-    Client, Server, TransportError, build_client_endpoint_with_socket_and_options_and_mtu,
-    build_server_endpoint_with_socket_and_options_and_mtu, configured_backup_path,
-    listen_addr_admits,
+    Client, Server, TransportError, ValidatedClientConfig, ValidatedServerConfig,
+    build_client_endpoint_with_validated_config, build_server_endpoint_with_validated_config,
+    configured_backup_path, listen_addr_admits,
 };
 
 #[cfg(unix)]
@@ -270,7 +272,7 @@ pub fn build_fake_tcp_client_endpoint_with_options(
     tuples: &[FourTuple],
     options: &TransportOptions,
 ) -> Result<noq::Endpoint, TransportError> {
-    config.validate()?;
+    let config = ValidatedClientConfig::new(config)?;
     let paths = configure_fake_tcp_paths(&config.carrier, config.transport(), tuples)?;
     if paths.len() != usize::from(config.multipath.mode.path_limit())
         || paths.len() != config.multipath.candidates.len()
@@ -297,7 +299,7 @@ pub fn build_fake_tcp_client_endpoint_with_options(
         CarrierDirection::ClientToServer,
         config.carrier.packet_socket,
     )?;
-    build_client_endpoint_with_socket_and_options_and_mtu(
+    build_client_endpoint_with_validated_config(
         config,
         socket,
         Arc::new(noq::TokioRuntime),
@@ -333,7 +335,7 @@ pub fn build_fake_tcp_server_endpoint_with_options(
     tuples: &[FourTuple],
     options: &TransportOptions,
 ) -> Result<noq::Endpoint, TransportError> {
-    config.validate()?;
+    let config = ValidatedServerConfig::new(config)?;
     let paths = configure_fake_tcp_paths(&config.carrier, config.transport(), tuples)?;
     if paths.is_empty()
         || paths.len() > 2
@@ -356,7 +358,7 @@ pub fn build_fake_tcp_server_endpoint_with_options(
         CarrierDirection::ServerToClient,
         config.carrier.packet_socket,
     )?;
-    build_server_endpoint_with_socket_and_options_and_mtu(
+    build_server_endpoint_with_validated_config(
         config,
         socket,
         Arc::new(noq::TokioRuntime),

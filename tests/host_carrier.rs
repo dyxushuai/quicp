@@ -167,6 +167,18 @@ fn host_carrier_round_trips_caller_owned_datagrams() {
 }
 
 #[test]
+fn cloned_host_carrier_serializes_concurrent_ingress() {
+    let socket = HostDatagramSocket::new(local(), peer(), 2, 1200).unwrap();
+    std::thread::scope(|scope| {
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let socket = socket.clone();
+            scope.spawn(move || socket.ingress_datagram(payload).unwrap());
+        }
+    });
+    assert_eq!(socket.ingress_len(), 2);
+}
+
+#[test]
 fn host_carrier_preserves_datagram_reordering() {
     let sender_socket = HostDatagramSocket::new(local(), peer(), 4, 1200).unwrap();
     let receiver_socket = HostDatagramSocket::new(peer(), local(), 4, 1200).unwrap();

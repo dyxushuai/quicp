@@ -36,9 +36,10 @@ remote Tier 0 gateway. Their packets are not ISP-visible FakeTCP unless the comp
 separately verified physical packet path.
 
 The protocol core is shared across tiers; packet I/O, privileges, RST suppression, and batching are
-platform-specific. Unix raw IPv4 is the admitted Tier 0 implementation. Linux `AF_PACKET`/`TPACKET_V2`
-is an optional performance path, not a different wire protocol; other Unix targets use the portable
-IP raw-socket fallback.
+platform-specific. Linux and macOS have explicit Unix raw IPv4 adapters. Linux `AF_PACKET`/`TPACKET_V2`
+is an optional performance path, not a different wire protocol; macOS remains probe-only until
+packet capture and narrowly scoped RST-suppression evidence is complete. Other Unix targets fail
+closed instead of inheriting a Darwin implementation.
 
 There is no UDP header inside the TCP packet and no ordered FakeTCP byte stream around QUICP. Every
 carrier payload is exactly one QUICP datagram (which may contain coalesced QUIC packets). A missing
@@ -573,13 +574,13 @@ result and output lengths before returning `INVALID_ARGUMENT`.
 | macOS | `NEPacketTunnelProvider` packet loop; raw socket only for a privileged probe | optional skeleton |
 | iOS | `NEPacketTunnelProvider.packetFlow` | optional skeleton; entitlement required |
 | Android | `VpnService` established TUN file descriptor | optional skeleton; no raw-underlay grant |
-| Windows | WFP/Wintun or a signed packet adapter | roadmap; not admitted in this rollout |
+| Windows | WFP/NDIS signed packet-injection adapter for Tier 0; Wintun/TAP for Tier 1 | roadmap; not admitted in this rollout |
 
 `VpnService` and `NEPacketTunnelProvider` provide the virtual IP packet stream, but they do not
 magically grant arbitrary raw TCP injection on the physical underlay. Mobile admission therefore
-requires a separately verified carrier adapter or a platform-appropriate fallback. Windows is a
-future roadmap item outside the current release matrix; its carrier must use the supported
-WFP/Wintun packet modification path rather than assume `SOCK_RAW` can send arbitrary TCP packets.
+requires a separately verified carrier adapter or a platform-appropriate fallback. Windows remains
+a future roadmap item outside the current release matrix; its Tier 0 carrier must use a signed
+WFP/NDIS packet-injection path rather than assume `SOCK_RAW` can send arbitrary TCP packets.
 
 ## 9. Configuration and trust boundaries
 
