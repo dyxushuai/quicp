@@ -11,7 +11,7 @@ not a packet callback and is not part of the C, Swift, or Kotlin packet-bridge A
 
 ## Decision
 
-Keep `PluginRegistry` and `QuicpPlugin` as the single Rust-only configuration extension seam. Do
+Keep `PluginRegistry` and `QuicpPlugin` as the single Rust-only configuration-plugin seam. Do
 not add packet callbacks, a second plugin framework, or a foreign-language plugin ABI. Revisit the
 registry's depth only when a second independent production adapter needs behavior that cannot be
 expressed through `TransportOptions`.

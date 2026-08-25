@@ -474,8 +474,8 @@ output/input paths and does not provide a portable route or neighbor abstraction
 require `CAP_NET_RAW` (or an equivalent privileged service), and must run with kernel TCP RST
 generation suppressed for the selected destination/port. A typical deployment needs a narrowly
 scoped nftables/iptables rule and a rollback rule; never disable TCP RST globally. Other Unix
-targets use one-packet IPv4 raw send/receive fallbacks and userspace tuple validation. IPv6 raw
-I/O and non-Unix carrier adapters are not admitted by this implementation profile.
+targets have no admitted raw carrier adapter and must fail closed. IPv6 raw I/O and non-Unix
+carrier adapters are not admitted by this implementation profile.
 
 Tokio is an optional crate feature (`runtime-tokio`) and is disabled by default. The repository-only
 `internal-bench` feature exposes `transport::build_*_endpoint_with_socket` for raw benchmarks and
@@ -621,6 +621,9 @@ permissions. It is never accepted inline in TOML or logged. Unix `FakeTCP` endpo
 this file during construction and derive the tuple-bound SYN cookie for the current 60-second
 epoch; callers provide only the path tuples. A missing, unreadable, or disabled cookie policy
 fails endpoint construction rather than silently falling back to an unprotected raw profile.
+Windows host-driven configurations use a `%PROGRAMDATA%\\quicp` default path, but owner-only
+cookie/private-file loading remains fail-closed until a Windows ACL adapter is admitted; Windows
+Tier 0 therefore remains outside this profile.
 
 The QUICP transport core accepts a caller-provided canonical hostname or socket target and does
 not allocate FakeIP or operate a DNS server. A transparent VPN or TUN example may use FakeIP as a

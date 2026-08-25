@@ -97,13 +97,13 @@ socket differences that Cargo features cannot express.
 
 ## Supported integrations
 
-| Surface | Linux | Apple | Android | Windows |
-| --- | --- | --- | --- | --- |
-| Host-driven Rust API | Yes | Yes | Yes | Yes |
-| Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | Roadmap: WFP/driver adapter |
-| smoltcp packet bridge | Yes | Yes | Yes | Yes (host-owned packet I/O) |
-| C packet-bridge ABI | Yes | Yes | Yes | Yes |
-| Swift/Kotlin wrappers | — | Packet bridge | Packet bridge | — |
+| Surface | Linux | macOS | iOS | Android | Windows |
+| --- | --- | --- | --- | --- | --- |
+| Host-driven Rust API | Yes | Yes | Yes | Yes | Yes |
+| Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | No | Roadmap: WFP/driver adapter |
+| smoltcp packet bridge | Yes | Yes | Yes | Yes | Yes (host-owned packet I/O) |
+| C packet-bridge ABI | Yes | Yes | Yes | Yes | Yes |
+| Swift/Kotlin wrappers | — | Packet bridge | Packet bridge | Packet bridge | — |
 
 The C, Swift, and Kotlin surfaces intentionally expose packet bridging only. They do not create
 QUICP connections, open flows, manage multipath, or bypass Network Extension and `VpnService`

@@ -1,4 +1,4 @@
-//! macOS/portable-Unix Tier 0 raw-carrier backend.
+//! macOS Tier 0 raw-carrier backend.
 //!
 //! This backend uses privileged IPv4 IP raw sockets. It deliberately does not emulate Linux
 //! `AF_PACKET` or packet-ring APIs; tuple and checksum validation stays in the shared decoder.

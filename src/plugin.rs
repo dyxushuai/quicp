@@ -2,8 +2,8 @@
 //!
 //! Plugins run once while building [`TransportOptions`]. They are deliberately not packet
 //! callbacks and are not exposed through the C ABI, so the data plane keeps the same ownership
-//! and allocation rules as the core library. This is the one configuration extension seam; a
-//! second plugin must justify additional interface depth before another registry is introduced.
+//! and allocation rules as the core library. This is the configuration-plugin seam; a second
+//! plugin must justify additional interface depth before another registry is introduced.
 
 use std::fmt;
 use std::sync::Arc;
