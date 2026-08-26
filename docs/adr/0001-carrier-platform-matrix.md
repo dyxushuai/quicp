@@ -19,7 +19,7 @@ integration and is not advertised as ISP-level FakeTCP camouflage.
 
 1. Keep FakeTCP codec, tuple validation, and carrier state platform-neutral.
 2. Select Linux and macOS raw adapters explicitly.
-3. Select a future Windows Tier 0 adapter explicitly; do not inherit the macOS implementation.
+3. Select the Windows WinDivert packet adapter explicitly; do not inherit the macOS implementation.
 4. Unsupported Unix targets fail closed when the raw Tokio carrier is requested.
 5. Keep host-driven core, C packet bridge, and virtual packet integrations separate from Tier 0
    raw-carrier admission.
@@ -27,9 +27,9 @@ integration and is not advertised as ISP-level FakeTCP camouflage.
 ## Consequences
 
 - A target cannot silently receive a platform implementation with different packet semantics.
-- Windows Tier 0 support can be added behind a real, reviewable adapter without changing
-  FakeTCP's wire contract; host-driven and packet-bridge integrations do not require that
-  adapter.
+- Windows Tier 0 uses a dynamically loaded WinDivert API and the matching signed WFP/WDF driver,
+  without changing FakeTCP's wire contract; host-driven and packet-bridge integrations do not
+  require that adapter.
 - Cross-target CI must test the host-driven profile separately from privileged Tier 0 integration.
-- The Windows Tier 0 adapter remains roadmap work until driver, signing, privilege, packet capture,
+- Windows packet admission remains a release gate until driver, signing, privilege, packet capture,
   RST suppression, and rollback evidence exist.

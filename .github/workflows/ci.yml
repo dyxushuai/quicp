@@ -94,6 +94,8 @@ jobs:
         run: cargo check --all-features --locked
       - name: Run the Windows host-driven tests
         run: cargo test --all-features --locked
+      - name: Compile the native Windows Tier 0 smoke test
+        run: cargo test --all-features --locked --test windows_windivert -- --list
       - name: Run the Windows runtime-neutral examples
         run: |
           cargo run --all-features --locked --example echo

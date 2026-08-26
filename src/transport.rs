@@ -42,11 +42,15 @@ use crate::{FlowError, OpenRequest, PendingFlow, QuicpFlow};
 mod tokio_adapter;
 #[cfg(all(test, feature = "runtime-tokio"))]
 pub(crate) use tokio_adapter::MultipathSocket;
-#[cfg(all(test, unix, feature = "runtime-tokio"))]
+#[cfg(all(test, any(unix, windows), feature = "runtime-tokio"))]
 pub(crate) use tokio_adapter::{
     SYN_COOKIE_EPOCH_SECONDS, configure_fake_tcp_paths, validate_fake_tcp_syn_data,
 };
-#[cfg(all(unix, feature = "runtime-tokio", feature = "internal-bench"))]
+#[cfg(all(
+    any(unix, windows),
+    feature = "runtime-tokio",
+    feature = "internal-bench"
+))]
 pub use tokio_adapter::{
     build_fake_tcp_client_endpoint, build_fake_tcp_client_endpoint_with_options,
     build_fake_tcp_server_endpoint, build_fake_tcp_server_endpoint_with_options,

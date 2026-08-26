@@ -27,8 +27,9 @@ focuses on using the Rust crate and platform SDKs.
 > crates.io distribution. `cargo package` intentionally omits path dependencies, so it is not a
 > valid QUICP release artifact; publish a repository source archive that retains `vendor/**` and
 > the project licenses instead.
-> Windows host-driven and packet-bridge builds are supported; the ISP-facing Windows Tier 0
-> carrier and native Wintun/TAP adapter remain roadmap work.
+> Windows Tier 0 is implemented through the external WinDivert signed WFP/WDF provider. Native
+> packet admission still requires the Windows driver, Administrator privileges, and the black-box
+> evidence listed in [the Windows carrier guide](docs/windows.md); Wintun/TAP remains Tier 1.
 
 ## Start here
 
@@ -48,7 +49,7 @@ through your underlay, pass received datagrams to `ingress_datagram_from`, and c
 ### Configure the path envelope
 
 Transport policy is runtime-neutral and does not expose `noq` types. The same policy is used by
-host carriers and Unix raw `FakeTCP`; raw paths derive MSS from the address family and complete
+host carriers and native raw `FakeTCP`; raw paths derive MSS from the address family and complete
 outer IP MTU.
 
 ```rust
@@ -76,7 +77,7 @@ TOML duration fields use Serde's `{ secs = ..., nanos = ... }` shape.
 | You need | Enable | What it provides |
 | --- | --- | --- |
 | QUICP core and runtime-neutral Rust API | None | Host-driven carrier, connection, flow, and validated configuration |
-| Tokio and Unix raw `FakeTCP` | `runtime-tokio` | Tokio adapter and Unix raw-carrier socket |
+| Tokio and native raw `FakeTCP` | `runtime-tokio` | Tokio adapter and Unix/Windows packet carrier |
 | Mutual TLS | `tls-rustls` | Optional rustls authentication and encryption |
 | smoltcp packet bridge | `platform-smoltcp` | Bounded packet processing for TUN/mobile adapters |
 | C packet-bridge ABI | `ffi-c` | Synchronous C ABI; implies `platform-smoltcp` |
@@ -100,7 +101,7 @@ socket differences that Cargo features cannot express.
 | Surface | Linux | macOS | iOS | Android | Windows |
 | --- | --- | --- | --- | --- | --- |
 | Host-driven Rust API | Yes | Yes | Yes | Yes | Yes |
-| Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | No | Roadmap: WFP/driver adapter |
+| Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | No | Yes, through WinDivert signed WFP/WDF provider; Administrator required |
 | smoltcp packet bridge | Yes | Yes | Yes | Yes | Yes (host-owned packet I/O) |
 | C packet-bridge ABI | Yes | Yes | Yes | Yes | Yes |
 | Swift/Kotlin wrappers | — | Packet bridge | Packet bridge | Packet bridge | — |
@@ -118,9 +119,9 @@ those pieces at their platform boundary.
   Linux `AF_PACKET`/`TPACKET_V2` is an optional fast path. macOS uses the portable IP raw-socket
   fallback and still needs a privileged runtime probe plus a narrowly scoped PF RST rule before
   production admission.
-  Windows must use a separately reviewed WFP/driver packet-injection adapter; Winsock raw TCP is
-  not an admitted Tier 0 implementation. The host-driven core and packet bridge compile on
-  Windows, while a native Wintun/TAP handle adapter remains Tier 1 roadmap work.
+  Windows uses the WinDivert WFP/WDF packet-injection adapter; Winsock raw TCP is not an admitted
+  Tier 0 implementation. The adapter requires the matching signed `WinDivert.dll`/driver files
+  and Administrator privileges. A native Wintun/TAP handle adapter remains Tier 1 roadmap work.
 - **Tier 1 — TUN/TAP:** a virtual packet source/sink for smoltcp, tests, and transparent adapters.
   It is not a wire carrier unless the complete deployment attaches it to a verified physical packet
   path.

@@ -47,6 +47,7 @@ Any failure in this section is a release blocker.
 - [ ] `cargo test --locked` passes.
 - [ ] `cargo test --all-features --locked` passes.
 - [ ] Rust `1.88` minimum-version checks pass for base and all-feature library targets.
+- [ ] Native Windows `x86_64-pc-windows-msvc` all-feature checks pass on a Windows runner.
 - [ ] The SDK minimum matrix is recorded: iOS 15, macOS 12, Android API 21, and Swift tools 5.7.
 - [ ] `cargo check --locked --all-targets` proves the base build has no Tokio executor requirement.
 - [ ] Every public type exported from the crate root is constructible, or is gated out on the
@@ -216,13 +217,17 @@ cmake --build "$RUNNER_TEMP/quicp-jni" --parallel
 
 ### 3.3 Windows host-driven and packet bridge
 
-The runtime-neutral host API, smoltcp packet bridge, and C packet ABI are supported on Windows.
-They do not create a TUN/Wintun handle or provide ISP-facing FakeTCP by themselves.
+The runtime-neutral host API, smoltcp packet bridge, C packet ABI, and WinDivert-backed Tier 0
+carrier are supported on Windows. The native carrier requires the external signed WinDivert
+provider and Administrator privileges; it does not create a Wintun/TAP handle.
 
 - [ ] Run the native Windows host-driven echo and shutdown tests.
 - [ ] Run the C packet-bridge smoke test with caller-owned buffers.
-- [ ] TODO: implement and black-box test a signed WFP/NDIS Tier 0 carrier without exposing a
-  fake-available Winsock raw socket builder.
+- [ ] Install the matching signed `WinDivert.dll` and `WinDivert64.sys` beside the test binary and
+  run `cargo test --locked --features runtime-tokio,internal-bench --test windows_windivert -- --ignored`
+  from an elevated Windows shell.
+- [ ] Capture an external-interface packet round trip, including SYN data, tuple filtering, kernel
+  RST suppression, loss/reordering, and shutdown cleanup.
 - [ ] TODO: implement and test a native Wintun/TAP Tier 1 handle adapter with rollback cleanup.
 
 ### 3.4 Other non-Linux behavior

@@ -1,49 +1,48 @@
-//! Tokio runtime adapter and explicitly supported Unix `FakeTCP` endpoint extensions.
+//! Tokio runtime adapter and explicitly supported native `FakeTCP` endpoint extensions.
 //!
-//! This module is the only place that combines the Tokio executor with runtime adapters. Its Linux
-//! and macOS raw-socket extensions are target-gated; the protocol and host-carrier API remain in
-//! the parent. Windows requires a separate packet-injection adapter and is intentionally not
-//! routed through the Unix path.
+//! This module is the only place that combines the Tokio executor with runtime adapters. Its Linux,
+//! macOS, and Windows packet adapters are target-gated; the protocol and host-carrier API remain in
+//! the parent.
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use std::io::{self, IoSliceMut};
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use std::net::{IpAddr, SocketAddr};
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use std::num::NonZeroUsize;
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use std::pin::Pin;
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use std::sync::Arc;
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use std::task::{Context, Poll};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use noq::udp::{RecvMeta, Transmit};
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 use noq::{AsyncUdpSocket, UdpSender};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::config::{
     CarrierConfig, ClientConfig, ConfigError, MssMode, ServerConfig, SynDataPolicy,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::congestion::TransportOptions;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::faketcp::{CarrierDirection, FakeTcpSocket, FourTuple, SynDataMode};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use super::{
     Client, Server, TransportError, ValidatedClientConfig, ValidatedServerConfig,
     build_client_endpoint_with_validated_config, build_server_endpoint_with_validated_config,
     configured_backup_path, listen_addr_admits,
 };
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) const SYN_COOKIE_EPOCH_SECONDS: u64 = 60;
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 #[derive(Debug)]
 pub(crate) struct MultipathSocket {
     children: [Box<dyn AsyncUdpSocket>; 2],
@@ -51,7 +50,7 @@ pub(crate) struct MultipathSocket {
     next_recv: usize,
 }
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 impl MultipathSocket {
     pub(crate) fn new(
         primary: (Box<dyn AsyncUdpSocket>, SocketAddr),
@@ -75,7 +74,7 @@ impl MultipathSocket {
     }
 }
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 impl AsyncUdpSocket for MultipathSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(MultipathSender {
@@ -132,7 +131,7 @@ impl AsyncUdpSocket for MultipathSocket {
     }
 }
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 fn is_path_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -143,14 +142,14 @@ fn is_path_unavailable(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 #[derive(Debug)]
 struct MultipathSender {
     children: [Pin<Box<dyn UdpSender>>; 2],
     routes: [(IpAddr, SocketAddr); 2],
 }
 
-#[cfg(any(test, unix))]
+#[cfg(any(test, unix, windows))]
 impl UdpSender for MultipathSender {
     fn poll_send(
         mut self: Pin<&mut Self>,
@@ -179,14 +178,13 @@ impl UdpSender for MultipathSender {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Client {
-    /// Binds a Unix `FakeTCP` client endpoint.
+    /// Binds a native `FakeTCP` client endpoint.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid paths or socket setup failure.
-    #[cfg(unix)]
     pub fn bind_fake_tcp(
         config: &ClientConfig,
         tuples: &[FourTuple],
@@ -194,12 +192,11 @@ impl Client {
         Self::bind_fake_tcp_with_options(config, tuples, &TransportOptions::default())
     }
 
-    /// Binds a Unix `FakeTCP` client endpoint with runtime-neutral Rust extension options.
+    /// Binds a native `FakeTCP` client endpoint with runtime-neutral Rust extension options.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid paths, raw-socket setup failure, or endpoint construction.
-    #[cfg(unix)]
     pub fn bind_fake_tcp_with_options(
         config: &ClientConfig,
         tuples: &[FourTuple],
@@ -228,14 +225,13 @@ impl Client {
         ))
     }
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Server {
-    /// Binds a Unix `FakeTCP` server endpoint.
+    /// Binds a native `FakeTCP` server endpoint.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid paths or socket setup failure.
-    #[cfg(unix)]
     pub fn bind_fake_tcp(
         config: &ServerConfig,
         tuples: &[FourTuple],
@@ -243,12 +239,11 @@ impl Server {
         Self::bind_fake_tcp_with_options(config, tuples, &TransportOptions::default())
     }
 
-    /// Binds a Unix `FakeTCP` server endpoint with runtime-neutral Rust extension options.
+    /// Binds a native `FakeTCP` server endpoint with runtime-neutral Rust extension options.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid paths, raw-socket setup failure, or endpoint construction.
-    #[cfg(unix)]
     pub fn bind_fake_tcp_with_options(
         config: &ServerConfig,
         tuples: &[FourTuple],
@@ -267,9 +262,8 @@ impl Server {
 ///
 /// # Errors
 ///
-/// Returns an error for the temporary TLS-backed adapter, raw-socket setup, or the selected
-/// runtime adapter.
-#[cfg(unix)]
+/// Returns an error for TLS configuration, native packet-adapter setup, or endpoint construction.
+#[cfg(any(unix, windows))]
 pub fn build_fake_tcp_client_endpoint(
     config: &ClientConfig,
     tuples: &[FourTuple],
@@ -277,13 +271,13 @@ pub fn build_fake_tcp_client_endpoint(
     build_fake_tcp_client_endpoint_with_options(config, tuples, &TransportOptions::default())
 }
 
-/// Builds a Unix `FakeTCP` client endpoint with runtime-neutral Rust extension options.
+/// Builds a native `FakeTCP` client endpoint with runtime-neutral Rust extension options.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid paths, an unavailable cookie secret, raw-socket setup failure, or
 /// endpoint construction.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn build_fake_tcp_client_endpoint_with_options(
     config: &ClientConfig,
     tuples: &[FourTuple],
@@ -331,8 +325,8 @@ pub fn build_fake_tcp_client_endpoint_with_options(
 ///
 /// # Errors
 ///
-/// Returns an error for the temporary TLS-backed adapter or raw-socket setup.
-#[cfg(unix)]
+/// Returns an error for TLS configuration, native packet-adapter setup, or endpoint construction.
+#[cfg(any(unix, windows))]
 pub fn build_fake_tcp_server_endpoint(
     config: &ServerConfig,
     tuples: &[FourTuple],
@@ -340,13 +334,13 @@ pub fn build_fake_tcp_server_endpoint(
     build_fake_tcp_server_endpoint_with_options(config, tuples, &TransportOptions::default())
 }
 
-/// Builds a Unix `FakeTCP` server endpoint with runtime-neutral Rust extension options.
+/// Builds a native `FakeTCP` server endpoint with runtime-neutral Rust extension options.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid paths, an unavailable cookie secret, raw-socket setup failure, or
 /// endpoint construction.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn build_fake_tcp_server_endpoint_with_options(
     config: &ServerConfig,
     tuples: &[FourTuple],
@@ -384,7 +378,7 @@ pub fn build_fake_tcp_server_endpoint_with_options(
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bind_fake_tcp_paths(
     paths: &[(FourTuple, SynDataMode, u16, u16)],
     direction: CarrierDirection,
@@ -426,7 +420,7 @@ fn bind_fake_tcp_paths(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn validate_fake_tcp_syn_data(
     policy: SynDataPolicy,
     paths: &[(FourTuple, SynDataMode, u16, u16)],
@@ -444,7 +438,7 @@ pub(crate) fn validate_fake_tcp_syn_data(
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn configure_fake_tcp_paths(
     carrier: &CarrierConfig,
     transport: &crate::config::QuicpTransportConfig,

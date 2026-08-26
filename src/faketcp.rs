@@ -874,7 +874,11 @@ impl FakeTcpCarrier {
         Self::pair_with_mtu(tuple, direction, syn_data, DEFAULT_SYN_MSS, u16::MAX)
     }
 
-    #[cfg(any(test, all(unix, feature = "runtime-tokio")))]
+    #[cfg(any(
+        test,
+        all(unix, feature = "runtime-tokio"),
+        all(windows, feature = "runtime-tokio")
+    ))]
     fn pair_with_mtu(
         tuple: FourTuple,
         direction: CarrierDirection,
@@ -1131,11 +1135,15 @@ impl FakeTcpCarrier {
     }
 }
 
-// The codec above is runtime-neutral; only the Tokio raw-socket adapter needs both gates.
+// The codec above is runtime-neutral; only runtime adapters need both gates.
 #[cfg(all(unix, feature = "runtime-tokio"))]
 mod unix;
 #[cfg(all(unix, feature = "runtime-tokio"))]
 pub use unix::FakeTcpSocket;
+#[cfg(all(windows, feature = "runtime-tokio"))]
+mod windows;
+#[cfg(all(windows, feature = "runtime-tokio"))]
+pub use windows::FakeTcpSocket;
 
 impl FourTuple {
     fn validate(self) -> Result<(), CarrierError> {
