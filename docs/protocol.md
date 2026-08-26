@@ -36,9 +36,11 @@ remote Tier 0 gateway. Their packets are not ISP-visible FakeTCP unless the comp
 separately verified physical packet path.
 
 The protocol core is shared across tiers; packet I/O, privileges, RST suppression, and batching are
-platform-specific. Unix raw IPv4 is the admitted Tier 0 implementation. Linux `AF_PACKET`/`TPACKET_V2`
-is an optional performance path, not a different wire protocol; other Unix targets use the portable
-IP raw-socket fallback.
+platform-specific. Linux and macOS have explicit Unix raw IPv4 adapters. Windows uses the
+WinDivert signed WFP/WDF packet adapter. Linux `AF_PACKET`/`TPACKET_V2` is an optional performance
+path, not a different wire protocol; macOS remains probe-only until packet capture and narrowly
+scoped RST-suppression evidence is complete. Other targets fail closed instead of inheriting a
+different platform implementation.
 
 There is no UDP header inside the TCP packet and no ordered FakeTCP byte stream around QUICP. Every
 carrier payload is exactly one QUICP datagram (which may contain coalesced QUIC packets). A missing
@@ -261,7 +263,8 @@ unauthenticated TCP sequence number: QUICP packet numbers own duplicate and repl
 TCP checksum only detects accidental corruption; it is not an authenticity boundary.
 
 `FakeTcpCarrier` also exposes caller-buffer `encode_*_into` methods. The Unix raw sender reuses a
-growable batch buffer; Linux batches up to 10 encoded packets, removing per-packet user-space allocation;
+growable batch buffer; the Windows WinDivert sender reuses one packet buffer per sender; Linux
+batches up to 10 encoded packets, removing per-packet user-space allocation;
 the kernel send remains an ordinary socket copy and is not claimed as zero-copy. Its
 `decode_datagram_borrowed` path validates the packet and returns a borrow of the caller's input;
 the Linux receiver drains bounded raw packets from the packet ring when `packet_socket = true`
@@ -456,8 +459,9 @@ maximum delay to reduce carrier packets on high-throughput paths. Any adapter th
 ring buffers must include them in admission accounting. Segmentation metadata is consumed only
 inside the adapter; the FakeTCP wire always contains one QUICP datagram per TCP-shaped packet.
 
-The current raw socket adapter implements the temporary backend's `noq::AsyncUdpSocket` on Unix
-with Tokio's `AsyncFd`.
+The current native raw adapters implement the temporary backend's `noq::AsyncUdpSocket` with Tokio.
+Unix uses `AsyncFd`; Windows uses a WinDivert receive thread and the dynamically loaded network-layer
+API.
 The default uses an `IPPROTO_TCP` raw IPv4 socket for filtered receive and a separate
 `IPPROTO_TCP` raw socket without `IP_HDRINCL` for transmit; Linux supplies the IPv4 header while
 the carrier owns the TCP-shaped segment. Setting `carrier.packet_socket = true` switches both
@@ -468,13 +472,13 @@ buffer, avoiding the IP/TCP raw receive path. When the kernel supports `TPACKET_
 side uses a bounded 8 MiB `PACKET_RX_RING` (64 128-KiB frames) to remove the `recvmmsg` syscall
 from the hot path; it falls back to `recvmmsg` if ring setup is unavailable. The ring is an
 opt-in consequence of `packet_socket = true`, so the default IP-raw path keeps its original
-memory profile. It is not the default because it bypasses the IP
-output/input paths and does not provide a portable route or neighbor abstraction. Both modes
-require `CAP_NET_RAW` (or an equivalent privileged service), and must run with kernel TCP RST
-generation suppressed for the selected destination/port. A typical deployment needs a narrowly
-scoped nftables/iptables rule and a rollback rule; never disable TCP RST globally. Other Unix
-targets use one-packet IPv4 raw send/receive fallbacks and userspace tuple validation. IPv6 raw
-I/O and non-Unix carrier adapters are not admitted by this implementation profile.
+memory profile. It is not the default because it bypasses the IP output/input paths and does not
+provide a portable route or neighbor abstraction. Both Unix modes require `CAP_NET_RAW` (or an
+equivalent privileged service), and must run with kernel TCP RST generation suppressed for the
+selected destination/port. Windows uses the signed WinDivert provider and requires Administrator
+privileges; its current adapter is IPv4-only. A typical Unix deployment needs a narrowly scoped
+nftables/iptables rule and a rollback rule; never disable TCP RST globally. Other targets have no
+admitted raw carrier adapter and must fail closed.
 
 Tokio is an optional crate feature (`runtime-tokio`) and is disabled by default. The repository-only
 `internal-bench` feature exposes `transport::build_*_endpoint_with_socket` for raw benchmarks and
@@ -573,13 +577,14 @@ result and output lengths before returning `INVALID_ARGUMENT`.
 | macOS | `NEPacketTunnelProvider` packet loop; raw socket only for a privileged probe | optional skeleton |
 | iOS | `NEPacketTunnelProvider.packetFlow` | optional skeleton; entitlement required |
 | Android | `VpnService` established TUN file descriptor | optional skeleton; no raw-underlay grant |
-| Windows | WFP/Wintun or a signed packet adapter | roadmap; not admitted in this rollout |
+| Windows | Host-driven core and packet bridge; WinDivert signed WFP/WDF packet injection for Tier 0; Wintun/TAP for Tier 1 | Tier 0 adapter implemented; provider and packet evidence required |
 
 `VpnService` and `NEPacketTunnelProvider` provide the virtual IP packet stream, but they do not
 magically grant arbitrary raw TCP injection on the physical underlay. Mobile admission therefore
-requires a separately verified carrier adapter or a platform-appropriate fallback. Windows is a
-future roadmap item outside the current release matrix; its carrier must use the supported
-WFP/Wintun packet modification path rather than assume `SOCK_RAW` can send arbitrary TCP packets.
+requires a separately verified carrier adapter or a platform-appropriate fallback. Windows
+host-driven and packet-bridge integrations are in the current build matrix. Its Tier 0 carrier
+uses the signed WinDivert WFP/WDF packet-injection path rather than assuming `SOCK_RAW` can send
+arbitrary TCP packets. A native Wintun/TAP handle adapter remains a separate roadmap item.
 
 ## 9. Configuration and trust boundaries
 
@@ -619,6 +624,10 @@ permissions. It is never accepted inline in TOML or logged. Unix `FakeTCP` endpo
 this file during construction and derive the tuple-bound SYN cookie for the current 60-second
 epoch; callers provide only the path tuples. A missing, unreadable, or disabled cookie policy
 fails endpoint construction rather than silently falling back to an unprotected raw profile.
+Windows host-driven and native-carrier configurations use a `%PROGRAMDATA%\\quicp` default path;
+owner-only cookie/private-file loading verifies the current owner and write-capable ACL entries.
+The WinDivert carrier additionally requires the matching signed provider files and Administrator
+privileges; see [the Windows carrier guide](windows.md).
 
 The QUICP transport core accepts a caller-provided canonical hostname or socket target and does
 not allocate FakeIP or operate a DNS server. A transparent VPN or TUN example may use FakeIP as a
@@ -667,11 +676,13 @@ Before production admission, run:
    SYN-cookie rotation, and direct QUICP payload delivery;
 2. Linux raw-socket integration tests with packet capture, RST suppression, NAT rebinding, MTU
    boundaries, loss/reordering, and both path tuples;
-3. QUICP profile tests for no-security operation, the optional TLS adapter, early-open rejection,
+3. Windows WinDivert integration tests with signed-driver startup, external-interface packet
+   capture, RST suppression, tuple filtering, shutdown cleanup, and both path tuples;
+4. QUICP profile tests for no-security operation, the optional TLS adapter, early-open rejection,
    profile-token mismatch, and multipath failover; PSK remains `N/A/not admitted`;
-4. memory and CPU benchmarks at the configured flow/path limits, including the checksum and copy
+5. memory and CPU benchmarks at the configured flow/path limits, including the checksum and copy
    paths used on the target CPU;
-5. license, dependency, capability, and rollback review for the privileged raw-socket service.
+6. license, dependency, capability, and rollback review for the privileged raw-socket service.
 
 Until those gates pass, ship the ordinary UDP adapter or single-path profile as a separate,
 explicit deployment choice. Do not silently fall back from a failed FakeTCP admission check to an

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
 #[cfg(feature = "tls-rustls")]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -41,11 +42,15 @@ use crate::{FlowError, OpenRequest, PendingFlow, QuicpFlow};
 mod tokio_adapter;
 #[cfg(all(test, feature = "runtime-tokio"))]
 pub(crate) use tokio_adapter::MultipathSocket;
-#[cfg(all(test, unix, feature = "runtime-tokio"))]
+#[cfg(all(test, any(unix, windows), feature = "runtime-tokio"))]
 pub(crate) use tokio_adapter::{
     SYN_COOKIE_EPOCH_SECONDS, configure_fake_tcp_paths, validate_fake_tcp_syn_data,
 };
-#[cfg(all(unix, feature = "runtime-tokio", feature = "internal-bench"))]
+#[cfg(all(
+    any(unix, windows),
+    feature = "runtime-tokio",
+    feature = "internal-bench"
+))]
 pub use tokio_adapter::{
     build_fake_tcp_client_endpoint, build_fake_tcp_client_endpoint_with_options,
     build_fake_tcp_server_endpoint, build_fake_tcp_server_endpoint_with_options,
@@ -60,6 +65,46 @@ const BACKUP_PATH_RETRY_DELAY: Duration = Duration::from_millis(20);
 struct BackupPath {
     remote: SocketAddr,
     local_ip: IpAddr,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedClientConfig<'a> {
+    config: &'a ClientConfig,
+}
+
+impl<'a> ValidatedClientConfig<'a> {
+    fn new(config: &'a ClientConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+}
+
+impl Deref for ValidatedClientConfig<'_> {
+    type Target = ClientConfig;
+
+    fn deref(&self) -> &Self::Target {
+        self.config
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedServerConfig<'a> {
+    config: &'a ServerConfig,
+}
+
+impl<'a> ValidatedServerConfig<'a> {
+    fn new(config: &'a ServerConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+}
+
+impl Deref for ValidatedServerConfig<'_> {
+    type Target = ServerConfig;
+
+    fn deref(&self) -> &Self::Target {
+        self.config
+    }
 }
 
 fn configured_backup_path(config: &ClientConfig) -> Option<BackupPath> {
@@ -144,7 +189,7 @@ impl Client {
         server_name: impl Into<String>,
     ) -> Result<Self, TransportError> {
         Self::from_socket_with_options_internal(
-            config,
+            ValidatedClientConfig::new(config)?,
             socket,
             runtime,
             server_addr,
@@ -169,7 +214,7 @@ impl Client {
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
         Self::from_socket_with_options_internal(
-            config,
+            ValidatedClientConfig::new(config)?,
             socket,
             runtime,
             server_addr,
@@ -180,7 +225,7 @@ impl Client {
     }
 
     fn from_socket_with_options_internal(
-        config: &ClientConfig,
+        config: ValidatedClientConfig<'_>,
         socket: Box<dyn noq::AsyncUdpSocket>,
         runtime: Arc<dyn noq::Runtime>,
         server_addr: SocketAddr,
@@ -188,7 +233,6 @@ impl Client {
         options: &TransportOptions,
         adapter_mtu: Option<u16>,
     ) -> Result<Self, TransportError> {
-        config.validate()?;
         if config.multipath.candidates[0].server_addr != server_addr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -197,7 +241,7 @@ impl Client {
             .into());
         }
         let runtime_for_client = Arc::clone(&runtime);
-        let endpoint = build_client_endpoint_with_socket_and_options_and_mtu(
+        let endpoint = build_client_endpoint_with_validated_config(
             config,
             socket,
             runtime,
@@ -209,7 +253,7 @@ impl Client {
             server_addr,
             server_name.into(),
             Some(runtime_for_client),
-            configured_backup_path(config),
+            configured_backup_path(&config),
             Some(FourTuple::new(
                 SocketAddr::new(config.multipath.candidates[0].local_ip, 0),
                 server_addr,
@@ -248,7 +292,7 @@ impl Client {
         runtime: Arc<HostRuntime>,
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
-        config.validate()?;
+        let config = ValidatedClientConfig::new(config)?;
         if config.multipath.mode != MultipathMode::Off {
             return Err(TransportError::UnsupportedMultipathCarrier);
         }
@@ -500,7 +544,7 @@ impl Server {
         runtime: Arc<dyn noq::Runtime>,
     ) -> Result<Self, TransportError> {
         Self::from_socket_with_options_internal(
-            config,
+            ValidatedServerConfig::new(config)?,
             socket,
             runtime,
             &TransportOptions::default(),
@@ -520,24 +564,30 @@ impl Server {
         runtime: Arc<dyn noq::Runtime>,
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
-        Self::from_socket_with_options_internal(config, socket, runtime, options, None)
+        Self::from_socket_with_options_internal(
+            ValidatedServerConfig::new(config)?,
+            socket,
+            runtime,
+            options,
+            None,
+        )
     }
 
     fn from_socket_with_options_internal(
-        config: &ServerConfig,
+        config: ValidatedServerConfig<'_>,
         socket: Box<dyn noq::AsyncUdpSocket>,
         runtime: Arc<dyn noq::Runtime>,
         options: &TransportOptions,
         adapter_mtu: Option<u16>,
     ) -> Result<Self, TransportError> {
-        let endpoint = build_server_endpoint_with_socket_and_options_and_mtu(
+        let endpoint = build_server_endpoint_with_validated_config(
             config,
             socket,
             runtime,
             options,
             adapter_mtu,
         )?;
-        Ok(Self::from_endpoint_with_config(endpoint, config))
+        Ok(Self::from_endpoint_with_config(endpoint, &config))
     }
 
     /// Creates a portable server from the built-in host-driven carrier and runtime.
@@ -564,6 +614,7 @@ impl Server {
         runtime: Arc<HostRuntime>,
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
+        let config = ValidatedServerConfig::new(config)?;
         let local_addr = socket.local_addr();
         if !listen_addr_admits(&config.listen_addrs, local_addr) {
             return Err(io::Error::new(
@@ -876,15 +927,14 @@ pub fn build_client_config_with_options(
     config: &ClientConfig,
     options: &TransportOptions,
 ) -> Result<noq::ClientConfig, TransportError> {
-    build_client_config_with_options_and_payload(config, options, None)
+    build_client_config_with_options_and_payload(ValidatedClientConfig::new(config)?, options, None)
 }
 
 fn build_client_config_with_options_and_payload(
-    config: &ClientConfig,
+    config: ValidatedClientConfig<'_>,
     options: &TransportOptions,
     payload_ceiling: Option<u16>,
 ) -> Result<noq::ClientConfig, TransportError> {
-    config.validate()?;
     let custom_header_protection = options.custom_header_protection();
     if config.tls.is_some() && custom_header_protection.is_some() {
         return Err(TransportError::HeaderProtectionWithTls);
@@ -953,15 +1003,14 @@ pub fn build_server_config_with_options(
     config: &ServerConfig,
     options: &TransportOptions,
 ) -> Result<noq::ServerConfig, TransportError> {
-    build_server_config_with_options_and_payload(config, options, None)
+    build_server_config_with_options_and_payload(ValidatedServerConfig::new(config)?, options, None)
 }
 
 fn build_server_config_with_options_and_payload(
-    config: &ServerConfig,
+    config: ValidatedServerConfig<'_>,
     options: &TransportOptions,
     payload_ceiling: Option<u16>,
 ) -> Result<noq::ServerConfig, TransportError> {
-    config.validate()?;
     let custom_header_protection = options.custom_header_protection();
     if config.tls.is_some() && custom_header_protection.is_some() {
         return Err(TransportError::HeaderProtectionWithTls);
@@ -1069,7 +1118,23 @@ fn build_client_endpoint_with_socket_and_options_and_mtu(
     options: &TransportOptions,
     adapter_mtu: Option<u16>,
 ) -> Result<noq::Endpoint, TransportError> {
-    let payload_ceiling = effective_payload_ceiling(config, socket.as_ref(), adapter_mtu)?;
+    build_client_endpoint_with_validated_config(
+        ValidatedClientConfig::new(config)?,
+        socket,
+        runtime,
+        options,
+        adapter_mtu,
+    )
+}
+
+fn build_client_endpoint_with_validated_config(
+    config: ValidatedClientConfig<'_>,
+    socket: Box<dyn noq::AsyncUdpSocket>,
+    runtime: Arc<dyn noq::Runtime>,
+    options: &TransportOptions,
+    adapter_mtu: Option<u16>,
+) -> Result<noq::Endpoint, TransportError> {
+    let payload_ceiling = effective_payload_ceiling(&config, socket.as_ref(), adapter_mtu)?;
     let mut endpoint_config = noq::EndpointConfig::default();
     endpoint_config.grease_quic_bit(config.tls.is_some());
     endpoint_config
@@ -1124,7 +1189,23 @@ fn build_server_endpoint_with_socket_and_options_and_mtu(
     options: &TransportOptions,
     adapter_mtu: Option<u16>,
 ) -> Result<noq::Endpoint, TransportError> {
-    let payload_ceiling = effective_server_payload_ceiling(config, socket.as_ref(), adapter_mtu)?;
+    build_server_endpoint_with_validated_config(
+        ValidatedServerConfig::new(config)?,
+        socket,
+        runtime,
+        options,
+        adapter_mtu,
+    )
+}
+
+fn build_server_endpoint_with_validated_config(
+    config: ValidatedServerConfig<'_>,
+    socket: Box<dyn noq::AsyncUdpSocket>,
+    runtime: Arc<dyn noq::Runtime>,
+    options: &TransportOptions,
+    adapter_mtu: Option<u16>,
+) -> Result<noq::Endpoint, TransportError> {
+    let payload_ceiling = effective_server_payload_ceiling(&config, socket.as_ref(), adapter_mtu)?;
     let mut endpoint_config = noq::EndpointConfig::default();
     endpoint_config.grease_quic_bit(config.tls.is_some());
     endpoint_config

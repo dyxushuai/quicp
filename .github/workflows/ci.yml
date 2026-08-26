@@ -83,6 +83,24 @@ jobs:
             'int main(void) { return (int)quicp_abi_version(); }' \
             | cc -std=c11 -Wall -Wextra -Werror -Iinclude -x c -fsyntax-only -
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check the host-driven Windows profile
+        run: cargo check --no-default-features --locked
+      - name: Check all runtime-neutral feature combinations
+        run: cargo check --all-features --locked
+      - name: Run the Windows host-driven tests
+        run: cargo test --all-features --locked
+      - name: Compile the native Windows Tier 0 smoke test
+        run: cargo test --all-features --locked --test windows_windivert -- --list
+      - name: Run the Windows runtime-neutral examples
+        run: |
+          cargo run --all-features --locked --example echo
+          cargo run --all-features --locked --example host_loopback
+
   apple:
     runs-on: macos-14
     steps:

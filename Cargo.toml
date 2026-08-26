@@ -16,6 +16,7 @@ include = [
     "Cargo.lock",
     "Cargo.toml",
     "README.md",
+    "CONTEXT.md",
     "CHANGELOG.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -81,6 +82,16 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 rcgen = "=0.14.8"
@@ -153,6 +164,10 @@ name = "public_api"
 
 [[test]]
 name = "raw_faketcp_multipath"
+
+[[test]]
+name = "windows_windivert"
+required-features = ["runtime-tokio", "internal-bench"]
 
 [[test]]
 name = "session"

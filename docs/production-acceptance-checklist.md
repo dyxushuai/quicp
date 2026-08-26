@@ -47,6 +47,7 @@ Any failure in this section is a release blocker.
 - [ ] `cargo test --locked` passes.
 - [ ] `cargo test --all-features --locked` passes.
 - [ ] Rust `1.88` minimum-version checks pass for base and all-feature library targets.
+- [ ] Native Windows `x86_64-pc-windows-msvc` all-feature checks pass on a Windows runner.
 - [ ] The SDK minimum matrix is recorded: iOS 15, macOS 12, Android API 21, and Swift tools 5.7.
 - [ ] `cargo check --locked --all-targets` proves the base build has no Tokio executor requirement.
 - [ ] Every public type exported from the crate root is constructible, or is gated out on the
@@ -214,15 +215,20 @@ cmake --build "$RUNNER_TEMP/quicp-jni" --parallel
 - [ ] The VpnService example is documented as a packet-loop/carrier skeleton and is not accepted as
   proof of arbitrary raw TCP injection.
 
-### 3.3 Windows (roadmap, not admitted)
+### 3.3 Windows host-driven and packet bridge
 
-Windows is intentionally excluded from the current release matrix and remains a future roadmap
-item. Do not claim Windows FakeTCP, raw sockets, or WFP/Wintun support until the native carrier and
-black-box evidence exist.
+The runtime-neutral host API, smoltcp packet bridge, C packet ABI, and WinDivert-backed Tier 0
+carrier are supported on Windows. The native carrier requires the external signed WinDivert
+provider and Administrator privileges; it does not create a Wintun/TAP handle.
 
-- [ ] TODO: implement a supported WFP/Wintun carrier without exposing a fake-available Linux raw
-  socket builder.
-- [ ] TODO: verify construction-time unsupported errors and crash/rollback cleanup.
+- [ ] Run the native Windows host-driven echo and shutdown tests.
+- [ ] Run the C packet-bridge smoke test with caller-owned buffers.
+- [ ] Install the matching signed `WinDivert.dll` and `WinDivert64.sys` beside the test binary and
+  run `cargo test --locked --features runtime-tokio,internal-bench --test windows_windivert -- --ignored`
+  from an elevated Windows shell.
+- [ ] Capture an external-interface packet round trip, including SYN data, tuple filtering, kernel
+  RST suppression, loss/reordering, and shutdown cleanup.
+- [ ] TODO: implement and test a native Wintun/TAP Tier 1 handle adapter with rollback cleanup.
 
 ### 3.4 Other non-Linux behavior
 

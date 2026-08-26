@@ -22,7 +22,9 @@ use crate::packet_ring::{PacketRing, RingError};
 ///
 /// The host side owns the input/output buffers and calls the two `*_datagram` methods.  The QUIC
 /// endpoint sees the same object through the private transport adapter. One socket represents one
-/// local address and one remote peer; multipath uses one socket per path.
+/// local address and one remote peer; multipath uses one socket per path. Clones may be shared
+/// between host threads: per-direction guards preserve one logical producer and consumer for the
+/// SPSC rings, while the endpoint runtime remains single-owner.
 #[derive(Clone)]
 pub struct HostDatagramSocket {
     inner: Arc<HostDatagramInner>,

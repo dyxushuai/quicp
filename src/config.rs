@@ -5,11 +5,15 @@
 
 use std::cmp::min;
 use std::collections::HashSet;
+#[cfg(any(unix, windows))]
 use std::fs::File;
+#[cfg(any(unix, windows))]
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -57,14 +61,19 @@ pub(crate) fn read_trusted_file(
         return Err(ConfigError::PathNotAbsolute);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut file = secure_open(path)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err(ConfigError::UnsupportedPlatform);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let metadata = verify_file(path, &file)?;
+        #[cfg(windows)]
+        if mode == TrustedFileMode::OwnerOnly {
+            verify_owner_and_acl(path, &file)?;
+        }
+        #[cfg(unix)]
         if mode == TrustedFileMode::OwnerOnly && metadata.mode() & 0o077 != 0 {
             return Err(ConfigError::InsecurePermissions {
                 path: path.to_owned(),
@@ -139,6 +148,21 @@ fn secure_open(path: &Path) -> Result<File, ConfigError> {
     .map_err(secure_open_error)
 }
 
+#[cfg(windows)]
+fn secure_open(path: &Path) -> Result<File, ConfigError> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // FILE_FLAG_OPEN_REPARSE_POINT prevents the final path component from being followed.
+    // The handle metadata check below then rejects the reparse point instead of reading it.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(ConfigError::Io)
+}
+
 #[cfg(unix)]
 fn secure_open_error(error: rustix::io::Errno) -> ConfigError {
     ConfigError::SecureOpen(error.into())
@@ -152,6 +176,219 @@ fn verify_file(path: &Path, file: &File) -> Result<std::fs::Metadata, ConfigErro
     }
     verify_owner_and_mode(path, &metadata)?;
     Ok(metadata)
+}
+
+#[cfg(windows)]
+fn verify_file(path: &Path, file: &File) -> Result<std::fs::Metadata, ConfigError> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError::NotRegularFile(path.to_owned()));
+    }
+    Ok(metadata)
+}
+
+#[cfg(windows)]
+struct LocalSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::LocalFree(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
+    use std::mem::size_of;
+    use std::ptr::{addr_of, addr_of_mut, null_mut};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            addr_of_mut!(owner),
+            null_mut(),
+            addr_of_mut!(dacl),
+            null_mut(),
+            addr_of_mut!(descriptor),
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+
+    let mut token = null_mut();
+    let process = unsafe { GetCurrentProcess() };
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token)) } == 0 {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+    struct TokenGuard(windows_sys::Win32::Foundation::HANDLE);
+    #[allow(unsafe_code)]
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    let _token = TokenGuard(token);
+
+    let mut token_bytes = 0u32;
+    let first =
+        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, addr_of_mut!(token_bytes)) };
+    if first != 0
+        || token_bytes == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+    {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+    let mut token_buffer = vec![0u8; usize::try_from(token_bytes).unwrap_or(0)];
+    if token_buffer.is_empty()
+        || unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                token_buffer.as_mut_ptr().cast(),
+                token_bytes,
+                addr_of_mut!(token_bytes),
+            )
+        } == 0
+    {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+    let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
+
+    let mut owner_defaulted = 0;
+    if owner.is_null()
+        || unsafe {
+            GetSecurityDescriptorOwner(
+                descriptor,
+                addr_of_mut!(owner),
+                addr_of_mut!(owner_defaulted),
+            )
+        } == 0
+        || unsafe { EqualSid(owner, token_user.User.Sid) } == 0
+    {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            addr_of_mut!(dacl_present),
+            addr_of_mut!(dacl),
+            addr_of_mut!(dacl_defaulted),
+        )
+    } == 0
+        || dacl_present == 0
+        || dacl.is_null()
+    {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+
+    let mut acl_info = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            addr_of_mut!(acl_info).cast(),
+            u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(ConfigError::InsecureAcl(path.to_owned()));
+    }
+
+    // Do not include READ_CONTROL or SYNCHRONIZE from FILE_GENERIC_WRITE. Those bits are also
+    // present in read-only ACEs and would make a normal read grant look writable.
+    let write_mask = FILE_APPEND_DATA
+        | FILE_DELETE_CHILD
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_WRITE_DATA
+        | FILE_WRITE_EA
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    for index in 0..acl_info.AceCount {
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, index, addr_of_mut!(ace)) } == 0 || ace.is_null() {
+            return Err(ConfigError::InsecureAcl(path.to_owned()));
+        }
+        let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+        let ace_size = usize::from(header.AceSize);
+        if ace_size < size_of::<windows_sys::Win32::Security::ACE_HEADER>() {
+            return Err(ConfigError::InsecureAcl(path.to_owned()));
+        }
+        match u32::from(header.AceType) {
+            ACCESS_DENIED_ACE_TYPE => {}
+            ACCESS_ALLOWED_ACE_TYPE => {
+                if ace_size < size_of::<ACCESS_ALLOWED_ACE>() {
+                    return Err(ConfigError::InsecureAcl(path.to_owned()));
+                }
+                let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                if allowed.Mask & write_mask == 0 {
+                    continue;
+                }
+                let sid = addr_of!(allowed.SidStart).cast::<core::ffi::c_void>() as PSID;
+                let mut trusted = unsafe { EqualSid(sid, owner) } != 0;
+                for well_known in [WinLocalSystemSid, WinBuiltinAdministratorsSid] {
+                    let mut buffer = [0u8; 68];
+                    let mut length = buffer.len() as u32;
+                    if unsafe {
+                        CreateWellKnownSid(
+                            well_known,
+                            null_mut(),
+                            buffer.as_mut_ptr().cast(),
+                            addr_of_mut!(length),
+                        )
+                    } != 0
+                        && unsafe { EqualSid(sid, buffer.as_mut_ptr().cast()) } != 0
+                    {
+                        trusted = true;
+                        break;
+                    }
+                }
+                if !trusted {
+                    return Err(ConfigError::InsecureAcl(path.to_owned()));
+                }
+            }
+            _ => return Err(ConfigError::InsecureAcl(path.to_owned())),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1128,7 +1365,22 @@ impl CarrierConfig {
 }
 
 fn default_cookie_secret_file() -> PathBuf {
-    PathBuf::from("/etc/quicp/carrier-cookie.secret")
+    #[cfg(unix)]
+    {
+        PathBuf::from("/etc/quicp/carrier-cookie.secret")
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("quicp")
+            .join("carrier-cookie.secret")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        PathBuf::from("/etc/quicp/carrier-cookie.secret")
+    }
 }
 
 /// Policy for TCP-shaped SYN payloads on the raw carrier.
@@ -1283,8 +1535,8 @@ pub enum ConfigError {
     /// A trusted-file path was relative.
     #[error("configuration path must be absolute")]
     PathNotAbsolute,
-    /// Secure trusted-file loading is unavailable on this platform.
-    #[error("configuration loading is supported only on Unix")]
+    /// Owner-only trusted-file loading is unavailable on this platform.
+    #[error("owner-only trusted-file loading is unavailable on this platform")]
     UnsupportedPlatform,
     /// A trusted-file I/O operation failed.
     #[error("configuration I/O failed: {0}")]
@@ -1315,6 +1567,10 @@ pub enum ConfigError {
         /// Observed Unix permission mode.
         mode: u32,
     },
+    /// A trusted Windows file has an unsafe owner or ACL.
+    #[cfg(windows)]
+    #[error("configuration path has an unsafe Windows ACL: {0}")]
+    InsecureAcl(PathBuf),
     /// TOML parsing failed.
     #[error("invalid TOML: {0}")]
     Toml(String),
@@ -1624,10 +1880,12 @@ fn validate_path_candidate(candidate: &PathCandidate) -> Result<(), ConfigError>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::{ConfigError, TrustedFileMode, read_trusted_file};
 
+    #[cfg(unix)]
     #[test]
     fn private_material_must_be_owner_only() {
         let directory = tempfile::tempdir().unwrap();
@@ -1641,5 +1899,45 @@ mod tests {
             read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly),
             Err(ConfigError::InsecurePermissions { .. })
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_config_file_is_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("config.toml");
+        std::fs::write(&path, b"role = \"client\"\n").unwrap();
+
+        assert_eq!(
+            read_trusted_file(&path, 1024, TrustedFileMode::SharedReadable).unwrap(),
+            b"role = \"client\"\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_file_loading_accepts_a_user_owned_acl() {
+        let home = std::env::var_os("USERPROFILE").expect("USERPROFILE is required");
+        let directory = tempfile::tempdir_in(home).unwrap();
+        let path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("secret");
+        std::fs::write(&path, b"secret").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME is required");
+        let status = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:F"))
+            .args(["*S-1-5-18:F", "*S-1-5-32-544:F"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed with {status}");
+
+        assert_eq!(
+            read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly).unwrap(),
+            b"secret"
+        );
     }
 }
