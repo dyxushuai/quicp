@@ -1909,7 +1909,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn owner_only_file_loading_accepts_a_user_owned_acl() {
-        let directory = tempfile::tempdir().unwrap();
+        let home = std::env::var_os("USERPROFILE").expect("USERPROFILE is required");
+        let directory = tempfile::tempdir_in(home).unwrap();
         let path = std::fs::canonicalize(directory.path())
             .unwrap()
             .join("secret");
