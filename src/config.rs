@@ -1915,6 +1915,15 @@ mod tests {
             .unwrap()
             .join("secret");
         std::fs::write(&path, b"secret").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME is required");
+        let status = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:F"))
+            .args(["*S-1-5-18:F", "*S-1-5-32-544:F"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed with {status}");
 
         assert_eq!(
             read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly).unwrap(),
