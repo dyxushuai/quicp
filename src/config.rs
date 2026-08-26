@@ -217,7 +217,8 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DELETE_CHILD, FILE_GENERIC_WRITE, WRITE_DAC, WRITE_OWNER,
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
@@ -331,7 +332,16 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
 
-    let write_mask = FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+    // Do not include READ_CONTROL or SYNCHRONIZE from FILE_GENERIC_WRITE. Those bits are also
+    // present in read-only ACEs and would make a normal read grant look writable.
+    let write_mask = FILE_APPEND_DATA
+        | FILE_DELETE_CHILD
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_WRITE_DATA
+        | FILE_WRITE_EA
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
     for index in 0..acl_info.AceCount {
         let mut ace = null_mut();
         if unsafe { GetAce(dacl, index, addr_of_mut!(ace)) } == 0 || ace.is_null() {
