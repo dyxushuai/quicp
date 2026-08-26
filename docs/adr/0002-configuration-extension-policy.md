@@ -1,9 +1,13 @@
 # ADR 0002: Preserve the configuration extension seam
 
-- Status: Accepted
+- Status: Superseded by ADR 0003
 - Date: 2026-08-25
 
 ## Context
+
+This decision described the QUICP/1 configuration seam. ADR 0003 supersedes it for QUICP/2, where
+adaptive recovery becomes core protocol behavior and explicit typed configuration replaces the
+generic registry.
 
 The repository currently has one production configuration adapter, `QueqiaoPlugin`, but the
 project requires a plugin system as an intentional extension point. The registry is deliberately

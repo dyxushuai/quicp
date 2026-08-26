@@ -9,6 +9,11 @@
 - [Rust examples](../examples/README.md)
 - [Benchmark commands](../benches/README.md)
 
+## Architecture decisions
+
+- [Carrier platform matrix](adr/0001-carrier-platform-matrix.md)
+- [Datagram-first adaptive recovery](adr/0003-datagram-first-recovery.md)
+
 ## Background material
 
 - `research/` records external protocol and backend investigations.
