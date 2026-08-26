@@ -1035,6 +1035,9 @@ impl FakeTcpCarrier {
         if packet.source != expected.source || packet.destination != expected.destination {
             return Err(CarrierError::WrongTuple);
         }
+        if packet.flags.is_rst() {
+            return Err(CarrierError::InvalidTcpHeader);
+        }
         if packet.payload.is_empty() {
             return Err(CarrierError::EmptyPayload);
         }
