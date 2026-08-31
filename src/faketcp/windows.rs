@@ -57,6 +57,27 @@ const _: () = assert!(core::mem::align_of::<WinDivertAddress>() == 8);
 #[allow(unsafe_code)]
 mod ffi {
     use super::{WinDivertAddress, c_char, c_void, io};
+    use crate::config::{TrustedFileMode, verify_owner_and_acl};
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{File, OpenOptions};
+    use std::io::Read;
+    use std::iter::once;
+    use std::mem::size_of;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Component, Path, PathBuf};
+    use std::ptr::{addr_of_mut, null_mut};
+    use windows_sys::Win32::Security::WinTrust::{
+        DRIVER_ACTION_VERIFY, WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CHOICE_FILE,
+        WTD_DISABLE_MD2_MD4, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+        WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_READ, FileIdInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
 
     type Open = unsafe extern "system" fn(*const c_char, i32, i16, u64) -> isize;
     type Receive =
@@ -74,13 +95,255 @@ mod ffi {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn FreeLibrary(module: *mut c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, name: *mut u16, size: u32) -> u32;
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    }
+
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    const WINDIVERT_DLL_SHA256: [u8; 32] = [
+        0xc1, 0xe0, 0x60, 0xee, 0x19, 0x44, 0x4a, 0x25, 0x9b, 0x21, 0x62, 0xf8, 0xaf, 0x0f, 0x3f,
+        0xe8, 0xc4, 0x42, 0x8a, 0x1c, 0x6f, 0x69, 0x4d, 0xce, 0x20, 0xde, 0x19, 0x4a, 0xc8, 0xd7,
+        0xd9, 0xa2,
+    ];
+    const WINDIVERT_DRIVER_SHA256: [u8; 32] = [
+        0x8d, 0xa0, 0x85, 0x33, 0x27, 0x82, 0x70, 0x8d, 0x87, 0x67, 0xbc, 0xac, 0xe5, 0x32, 0x7a,
+        0x6e, 0xc7, 0x28, 0x3c, 0x17, 0xcf, 0xb8, 0x5e, 0x40, 0xb0, 0x3c, 0xd2, 0x32, 0x3a, 0x90,
+        0xdd, 0xc2,
+    ];
+
+    pub(super) fn application_library_path(file_name: &OsStr) -> io::Result<PathBuf> {
+        let mut components = Path::new(file_name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "library name must be one path component",
+            ));
+        }
+
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let application_dir = executable.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current executable has no application directory",
+            )
+        })?;
+        let library = application_dir.join(file_name).canonicalize()?;
+        if !library.is_absolute() || library.parent() != Some(application_dir) || !library.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "library must resolve to an application-directory file",
+            ));
+        }
+        Ok(library)
+    }
+
+    fn open_trusted_path(path: &Path, directory: bool) -> io::Result<File> {
+        let flags = FILE_FLAG_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                0
+            };
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(flags)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trusted WinDivert path has the wrong file type",
+            ));
+        }
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe {
+            GetFileInformationByHandle(file.as_raw_handle().cast(), addr_of_mut!(information))
+        } == 0
+            || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trusted WinDivert path must not be a reparse point",
+            ));
+        }
+        verify_owner_and_acl(path, &file, TrustedFileMode::SystemOwned)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        Ok(file)
+    }
+
+    pub(super) fn verify_sha256(
+        file: &mut File,
+        expected: &[u8; 32],
+        name: &str,
+    ) -> io::Result<()> {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        if digest.finish().as_ref() == expected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("unsupported {name} binary hash"),
+            ))
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn verify_driver_authenticode(path: &Path, file: &File) -> io::Result<()> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect::<Vec<_>>();
+        let mut file_info = WINTRUST_FILE_INFO {
+            cbStruct: u32::try_from(size_of::<WINTRUST_FILE_INFO>()).expect("structure fits u32"),
+            pcwszFilePath: wide.as_ptr(),
+            hFile: file.as_raw_handle().cast(),
+            pgKnownSubject: null_mut(),
+        };
+        let mut trust = WINTRUST_DATA {
+            cbStruct: u32::try_from(size_of::<WINTRUST_DATA>()).expect("structure fits u32"),
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOKE_NONE,
+            dwUnionChoice: WTD_CHOICE_FILE,
+            Anonymous: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0 {
+                pFile: addr_of_mut!(file_info),
+            },
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            dwProvFlags: WTD_REVOCATION_CHECK_NONE | WTD_DISABLE_MD2_MD4,
+            ..WINTRUST_DATA::default()
+        };
+        let mut action = DRIVER_ACTION_VERIFY;
+        let status =
+            unsafe { WinVerifyTrust(null_mut(), addr_of_mut!(action), addr_of_mut!(trust).cast()) };
+        trust.dwStateAction = WTD_STATEACTION_CLOSE;
+        unsafe {
+            let _ = WinVerifyTrust(null_mut(), addr_of_mut!(action), addr_of_mut!(trust).cast());
+        }
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("WinDivert driver Authenticode verification failed: 0x{status:08x}"),
+            ))
+        }
+    }
+
+    fn file_identity(file: &File) -> io::Result<(u64, [u8; 16])> {
+        let mut information = FILE_ID_INFO::default();
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle().cast(),
+                FileIdInfo,
+                addr_of_mut!(information).cast(),
+                u32::try_from(size_of::<FILE_ID_INFO>()).expect("file identity structure fits u32"),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            information.VolumeSerialNumber,
+            information.FileId.Identifier,
+        ))
+    }
+
+    #[allow(unsafe_code)]
+    fn verify_loaded_path(module: *mut c_void, expected: &Path, held: &File) -> io::Result<()> {
+        let mut wide = vec![0u16; 32_768];
+        let length = unsafe {
+            GetModuleFileNameW(
+                module,
+                wide.as_mut_ptr(),
+                u32::try_from(wide.len()).expect("Windows path buffer fits u32"),
+            )
+        };
+        if length == 0 || usize::try_from(length).ok() == Some(wide.len()) {
+            return Err(io::Error::last_os_error());
+        }
+        let loaded = PathBuf::from(OsString::from_wide(
+            &wide[..usize::try_from(length).expect("module path length fits usize")],
+        ))
+        .canonicalize()?;
+        let loaded_file = open_trusted_path(&loaded, false)?;
+        if loaded == expected && file_identity(&loaded_file)? == file_identity(held)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "loaded WinDivert module does not match the verified file",
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TrustedWinDivertDistribution {
+        _application_dir: File,
+        dll: File,
+        _driver: File,
+    }
+
+    impl TrustedWinDivertDistribution {
+        fn open() -> io::Result<(Self, PathBuf)> {
+            #[cfg(not(target_pointer_width = "64"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "QUICP supports only the x64 WinDivert distribution",
+            ));
+
+            #[cfg(target_pointer_width = "64")]
+            {
+                let library = application_library_path(OsStr::new("WinDivert.dll"))?;
+                let driver = application_library_path(OsStr::new("WinDivert64.sys"))?;
+                let application_dir = library.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WinDivert has no parent directory",
+                    )
+                })?;
+                if driver.parent() != Some(application_dir) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "WinDivert files must share one application directory",
+                    ));
+                }
+                let application_dir_file = open_trusted_path(application_dir, true)?;
+                let mut dll = open_trusted_path(&library, false)?;
+                let mut driver_file = open_trusted_path(&driver, false)?;
+                verify_sha256(&mut dll, &WINDIVERT_DLL_SHA256, "WinDivert.dll")?;
+                verify_sha256(
+                    &mut driver_file,
+                    &WINDIVERT_DRIVER_SHA256,
+                    "WinDivert64.sys",
+                )?;
+                verify_driver_authenticode(&driver, &driver_file)?;
+                Ok((
+                    Self {
+                        _application_dir: application_dir_file,
+                        dll,
+                        _driver: driver_file,
+                    },
+                    library,
+                ))
+            }
+        }
     }
 
     #[derive(Debug)]
     pub(super) struct Api {
         module: usize,
+        _distribution: TrustedWinDivertDistribution,
         pub(super) open: Open,
         pub(super) receive: Receive,
         pub(super) send: Send,
@@ -91,20 +354,34 @@ mod ffi {
     impl Api {
         #[allow(unsafe_code)]
         pub(super) fn load() -> io::Result<Self> {
-            let module = unsafe { LoadLibraryA(c"WinDivert.dll".as_ptr().cast()) };
+            let (distribution, library) = TrustedWinDivertDistribution::open()?;
+            let wide = library
+                .as_os_str()
+                .encode_wide()
+                .chain(once(0))
+                .collect::<Vec<_>>();
+            let module = unsafe {
+                LoadLibraryExW(
+                    wide.as_ptr(),
+                    core::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
             if module.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let result = unsafe {
+            let result = (|| unsafe {
+                verify_loaded_path(module, &library, &distribution.dll)?;
                 Ok(Self {
                     module: module as usize,
+                    _distribution: distribution,
                     open: load_symbol(module, c"WinDivertOpen".as_ptr())?,
                     receive: load_symbol(module, c"WinDivertRecv".as_ptr())?,
                     send: load_symbol(module, c"WinDivertSend".as_ptr())?,
                     shutdown: load_symbol(module, c"WinDivertShutdown".as_ptr())?,
                     close: load_symbol(module, c"WinDivertClose".as_ptr())?,
                 })
-            };
+            })();
             if result.is_err() {
                 unsafe {
                     let _ = FreeLibrary(module);
@@ -294,9 +571,10 @@ pub struct FakeTcpSocket {
 impl FakeTcpSocket {
     /// Binds a Windows Tier 0 carrier through the signed WinDivert WFP driver.
     ///
-    /// The caller must install `WinDivert.dll` and its matching signed driver files, and the
-    /// process must have administrator privileges. The tuple is reserved exclusively by this
-    /// handle; malformed packets and kernel-generated RSTs are diverted and dropped.
+    /// The caller must install the pinned WinDivert 2.2.2-A x64 DLL and its matching signed driver
+    /// in a protected application directory, and the process must have administrator privileges.
+    /// The tuple is reserved exclusively by this handle; malformed packets and kernel-generated
+    /// RSTs are diverted and dropped.
     ///
     /// # Errors
     ///
@@ -342,12 +620,6 @@ impl FakeTcpSocket {
             waker,
             decode_rejects: 0,
         })
-    }
-
-    /// Number of packets rejected by the carrier decoder.
-    #[must_use]
-    pub const fn rejected_datagrams(&self) -> u64 {
-        self.decode_rejects
     }
 
     fn next_packet(&mut self, cx: &Context<'_>) -> Option<io::Result<Vec<u8>>> {
@@ -563,7 +835,59 @@ impl UdpSender for FakeTcpSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::io::{Seek, Write};
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn windivert_library_path_is_application_local_and_fail_closed() {
+        let executable = std::env::current_exe()
+            .expect("current executable")
+            .canonicalize()
+            .expect("resolved current executable");
+        assert_eq!(
+            ffi::application_library_path(executable.file_name().expect("executable file name"))
+                .expect("the test executable is application-local"),
+            executable
+        );
+        assert_eq!(
+            ffi::application_library_path(OsStr::new("../WinDivert.dll"))
+                .expect_err("parent traversal must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let missing = OsString::from(format!(
+            "quicp-missing-{}-WinDivert.dll",
+            std::process::id()
+        ));
+        assert_eq!(
+            ffi::application_library_path(&missing)
+                .expect_err("missing application-local DLL must fail")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn windivert_hash_check_accepts_only_the_expected_bytes() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abc").unwrap();
+        file.rewind().unwrap();
+        let expected = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        ffi::verify_sha256(&mut file, &expected, "test").unwrap();
+        file.rewind().unwrap();
+        assert_eq!(
+            ffi::verify_sha256(&mut file, &[0; 32], "test")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn filter_covers_both_directions_of_one_tuple() {
@@ -595,5 +919,24 @@ mod tests {
                 .kind(),
             io::ErrorKind::Unsupported
         );
+    }
+
+    #[test]
+    #[ignore = "requires the signed WinDivert driver and Administrator privileges"]
+    fn windivert_carrier_binds_a_filtered_tuple() {
+        let tuple = FourTuple::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 40_000)),
+            SocketAddr::from((Ipv4Addr::new(198, 51, 100, 1), 44_443)),
+        );
+        let socket = FakeTcpSocket::bind(
+            tuple,
+            CarrierDirection::ClientToServer,
+            SynDataMode::Disabled,
+            1460,
+            1500,
+            false,
+        )
+        .expect("WinDivert should open the filtered tuple");
+        assert_eq!(socket.local_addr().expect("local address"), tuple.source);
     }
 }

@@ -55,8 +55,8 @@ impl TcpFlowBuffers {
             return Err(SmoltcpError::ZeroFlowBuffer);
         }
         Ok(smoltcp::socket::tcp::Socket::new(
-            managed::ManagedSlice::Owned(vec![0u8; self.receive_bytes]),
-            managed::ManagedSlice::Owned(vec![0u8; self.send_bytes]),
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; self.receive_bytes]),
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; self.send_bytes]),
         ))
     }
 }
@@ -244,12 +244,10 @@ impl Device for RingDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        (self.egress.can_fit(self.mtu) && self.egress.has_buffer_for(self.mtu)).then(|| {
-            RingTxToken {
-                queue: Arc::clone(&self.egress),
-                mtu: self.mtu,
-                _device: PhantomData,
-            }
+        self.egress.can_push(self.mtu).then(|| RingTxToken {
+            queue: Arc::clone(&self.egress),
+            mtu: self.mtu,
+            _device: PhantomData,
         })
     }
 

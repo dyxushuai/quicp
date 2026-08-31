@@ -4,7 +4,11 @@
 //! needed by the current `noq` stream engine, with optional user-provided packet-header protection.
 //! The TLS adapter remains available as an opt-in configuration.
 
-use std::{any::Any, io::Cursor, sync::Arc};
+use std::{
+    any::Any,
+    io::Cursor,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use bytes::BytesMut;
 use noq_proto::{
@@ -25,6 +29,7 @@ const CLIENT_HELLO: u8 = 1;
 const SERVER_HELLO: u8 = 2;
 const CLIENT_CONFIRM: u8 = 3;
 const MAX_PROFILE_TOKEN: usize = 32;
+const MAX_HANDSHAKE_MESSAGE: usize = 65_575;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PlainKey;
@@ -96,6 +101,7 @@ pub(crate) struct NoSecurityHandshakeData {
 enum Stage {
     New,
     ServerKeysReady,
+    AwaitingConfirm,
     HelloSent,
     Established,
 }
@@ -109,6 +115,7 @@ pub(crate) struct NoSecuritySession {
     peer_params: Option<TransportParameters>,
     input: Vec<u8>,
     header_keys: Option<Arc<HeaderProtectionKeys>>,
+    remembered_params: Option<Arc<Mutex<Option<TransportParameters>>>>,
 }
 
 impl NoSecuritySession {
@@ -117,16 +124,21 @@ impl NoSecuritySession {
         profile_token: Vec<u8>,
         params: &TransportParameters,
         header_keys: Option<Arc<HeaderProtectionKeys>>,
+        remembered_params: Option<Arc<Mutex<Option<TransportParameters>>>>,
     ) -> Self {
+        let peer_params = remembered_params
+            .as_ref()
+            .and_then(|remembered| *remembered.lock().unwrap_or_else(PoisonError::into_inner));
         Self {
             side,
             profile_token,
             params: *params,
             stage: Stage::New,
             peer_token: None,
-            peer_params: None,
+            peer_params,
             input: Vec::new(),
             header_keys,
+            remembered_params,
         }
     }
 
@@ -186,11 +198,41 @@ impl NoSecuritySession {
     }
 
     fn validate_peer_token(&self, token: &[u8]) -> Result<(), TransportError> {
-        let valid = token == b"quicp/1" || token == b"quicp/1-mp";
+        let valid = token == crate::wire::QUICP_V2_PROFILE;
         if !valid || (self.side == Side::Client && token != self.profile_token) {
             return Err(Self::protocol_error("unsupported QUICP profile token"));
         }
         Ok(())
+    }
+
+    fn incoming_message_len(&self, buf: &[u8]) -> Result<Option<usize>, TransportError> {
+        let total = self
+            .input
+            .len()
+            .checked_add(buf.len())
+            .ok_or_else(|| Self::protocol_error("QUICP plaintext handshake is too large"))?;
+        if total > MAX_HANDSHAKE_MESSAGE {
+            return Err(Self::protocol_error(
+                "QUICP plaintext handshake is too large",
+            ));
+        }
+        if total < 8 {
+            return Ok(None);
+        }
+
+        let mut header = [0; 8];
+        let retained = self.input.len().min(header.len());
+        header[..retained].copy_from_slice(&self.input[..retained]);
+        if retained < header.len() {
+            let missing = header.len() - retained;
+            header[retained..].copy_from_slice(&buf[..missing]);
+        }
+        let token_len = usize::from(header[5]);
+        if token_len == 0 || token_len > MAX_PROFILE_TOKEN {
+            return Err(Self::protocol_error("invalid QUICP profile token length"));
+        }
+        let params_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
+        Ok(Some(8 + token_len + params_len))
     }
 }
 
@@ -200,7 +242,7 @@ impl Session for NoSecuritySession {
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
-        (self.stage == Stage::Established).then(|| {
+        matches!(self.stage, Stage::AwaitingConfirm | Stage::Established).then(|| {
             Box::new(NoSecurityHandshakeData {
                 profile_token: self
                     .peer_token
@@ -215,11 +257,15 @@ impl Session for NoSecuritySession {
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
-        None
+        if self.side == Side::Client && self.peer_params.is_none() {
+            return None;
+        }
+        let keys = keys(self.header_keys.as_deref());
+        Some((keys.header.local, keys.packet.local))
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
-        None
+        Some(true)
     }
 
     fn is_handshaking(&self) -> bool {
@@ -227,11 +273,19 @@ impl Session for NoSecuritySession {
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+        if self
+            .incoming_message_len(buf)?
+            .is_some_and(|message_len| self.input.len() + buf.len() > message_len)
+        {
+            return Err(Self::protocol_error(
+                "unexpected QUICP plaintext handshake data",
+            ));
+        }
         self.input.extend_from_slice(buf);
         let message = match (self.side, self.stage) {
             (Side::Client, Stage::HelloSent) => self.read_message(SERVER_HELLO)?,
             (Side::Server, Stage::New) => self.read_message(CLIENT_HELLO)?,
-            (Side::Server, Stage::Established) => self.read_message(CLIENT_CONFIRM)?,
+            (Side::Server, Stage::AwaitingConfirm) => self.read_message(CLIENT_CONFIRM)?,
             _ => {
                 return Err(Self::protocol_error(
                     "unexpected QUICP plaintext handshake state",
@@ -246,8 +300,13 @@ impl Session for NoSecuritySession {
             (Side::Client, Stage::HelloSent) | (Side::Server, Stage::New) => {
                 self.peer_token = Some(token);
                 self.peer_params = Some(params);
+                if self.side == Side::Client
+                    && let Some(remembered) = &self.remembered_params
+                {
+                    *remembered.lock().unwrap_or_else(PoisonError::into_inner) = Some(params);
+                }
             }
-            (Side::Server, Stage::Established) => {}
+            (Side::Server, Stage::AwaitingConfirm) => self.stage = Stage::Established,
             _ => unreachable!("validated plaintext handshake state"),
         }
         Ok(self.stage == Stage::Established)
@@ -275,7 +334,7 @@ impl Session for NoSecuritySession {
             }
             (Side::Server, Stage::ServerKeysReady) => {
                 Self::message(SERVER_HELLO, self.expected_token(), &self.params, buf);
-                self.stage = Stage::Established;
+                self.stage = Stage::AwaitingConfirm;
                 Some(keys(self.header_keys.as_deref()))
             }
             _ => None,
@@ -306,6 +365,7 @@ impl Session for NoSecuritySession {
 pub(crate) struct NoSecurityClientConfig {
     profile_token: Vec<u8>,
     header_keys: Option<Arc<HeaderProtectionKeys>>,
+    remembered_params: Arc<Mutex<Option<TransportParameters>>>,
 }
 
 impl NoSecurityClientConfig {
@@ -317,6 +377,7 @@ impl NoSecurityClientConfig {
             profile_token: profile_token.to_vec(),
             header_keys: header_factory
                 .map(|factory| Arc::new(factory.build(HeaderProtectionSide::Client))),
+            remembered_params: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -333,6 +394,7 @@ impl ClientConfig for NoSecurityClientConfig {
             self.profile_token.clone(),
             params,
             self.header_keys.clone(),
+            Some(Arc::clone(&self.remembered_params)),
         )))
     }
 }
@@ -371,6 +433,7 @@ impl ServerConfig for NoSecurityServerConfig {
             Vec::new(),
             params,
             self.header_keys.clone(),
+            None,
         ))
     }
 }
@@ -418,5 +481,53 @@ mod tests {
         keys.header.remote.decrypt(0, &mut bytes);
         assert_eq!(bytes, [0x01, 0x02, 0x03, 0x04, 0x05]);
         assert_eq!(keys.packet.local.tag_len(), 0);
+    }
+
+    #[test]
+    fn server_stays_handshaking_until_client_confirmation() {
+        let params = TransportParameters::read(Side::Client, &mut Cursor::new(&[][..])).unwrap();
+        let mut client = NoSecuritySession::new(
+            Side::Client,
+            crate::wire::QUICP_V2_PROFILE.to_vec(),
+            &params,
+            None,
+            None,
+        );
+        let mut server = NoSecuritySession::new(Side::Server, Vec::new(), &params, None, None);
+        let mut client_hello = Vec::new();
+        client.write_handshake(&mut client_hello).unwrap();
+        assert!(!server.read_handshake(&client_hello).unwrap());
+
+        assert!(server.write_handshake(&mut Vec::new()).is_some());
+        let mut server_hello = Vec::new();
+        server.write_handshake(&mut server_hello).unwrap();
+        assert!(server.is_handshaking());
+        assert!(server.handshake_data().is_some());
+
+        assert!(!client.read_handshake(&server_hello).unwrap());
+        let mut client_confirm = Vec::new();
+        client.write_handshake(&mut client_confirm).unwrap();
+        assert!(!client.is_handshaking());
+        assert!(server.is_handshaking());
+        assert!(server.read_handshake(&client_confirm).unwrap());
+        assert!(!server.is_handshaking());
+    }
+
+    #[test]
+    fn oversized_handshake_is_rejected_before_buffer_growth() {
+        let params = TransportParameters::read(Side::Client, &mut Cursor::new(&[][..])).unwrap();
+        let mut server = NoSecuritySession::new(Side::Server, Vec::new(), &params, None, None);
+        assert!(
+            server
+                .read_handshake(&vec![0; MAX_HANDSHAKE_MESSAGE + 1])
+                .is_err()
+        );
+        assert!(server.input.is_empty());
+
+        let mut oversized = MAGIC.to_vec();
+        oversized.extend_from_slice(&[CLIENT_HELLO, 1, 0, 0]);
+        oversized.extend_from_slice(&[0; 64]);
+        assert!(server.read_handshake(&oversized).is_err());
+        assert!(server.input.is_empty());
     }
 }

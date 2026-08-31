@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -16,7 +18,7 @@ pub const SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 
 
 pub fn client_config() -> Result<ClientConfig, quicp::ConfigError> {
     ClientConfig::insecure(
-        Multipath::single(PathCandidate::new("host", CLIENT.ip(), SERVER)?)?,
+        Multipath::single(PathCandidate::new(CLIENT.ip(), SERVER)?)?,
         CarrierConfig::default(),
     )
 }
@@ -38,14 +40,23 @@ pub fn pump(
     Ok(moved)
 }
 
-#[allow(dead_code)]
 pub fn drive_until(
     runtime: &HostRuntime,
     client_io: &HostDatagramSocket,
     server_io: &HostDatagramSocket,
-    mut done: impl FnMut() -> bool,
+    done: impl FnMut() -> bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for tick in 0..=4_000u64 {
+    drive_until_from(runtime, client_io, server_io, 0, done).map(|_| ())
+}
+
+pub fn drive_until_from(
+    runtime: &HostRuntime,
+    client_io: &HostDatagramSocket,
+    server_io: &HostDatagramSocket,
+    start_millis: u64,
+    mut done: impl FnMut() -> bool,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    for tick in start_millis..=start_millis.saturating_add(4_000) {
         pump(client_io, server_io)?;
         pump(server_io, client_io)?;
         runtime.drive(
@@ -55,13 +66,12 @@ pub fn drive_until(
         pump(client_io, server_io)?;
         pump(server_io, client_io)?;
         if done() {
-            return Ok(());
+            return Ok(tick);
         }
     }
     Err("host event loop did not complete within four seconds".into())
 }
 
-#[allow(dead_code)]
 pub async fn write_all(flow: &mut QuicpFlow, payload: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < payload.len() {
@@ -79,7 +89,10 @@ pub async fn write_all(flow: &mut QuicpFlow, payload: &[u8]) -> io::Result<()> {
     poll_fn(|cx| QuicpFlow::poll_flush(Pin::new(&mut *flow), cx)).await
 }
 
-#[allow(dead_code)]
+pub async fn shutdown(flow: &mut QuicpFlow) -> io::Result<()> {
+    poll_fn(|cx| QuicpFlow::poll_shutdown(Pin::new(&mut *flow), cx)).await
+}
+
 pub async fn read_exact(flow: &mut QuicpFlow, output: &mut [u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < output.len() {

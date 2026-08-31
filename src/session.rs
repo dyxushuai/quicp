@@ -1,112 +1,251 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
 
-use crate::config::MultipathMode;
-use crate::wire::{OpenStatus, WireError};
+use crate::wire::{QUICP_V2_PROFILE, WireError};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApplicationProfile {
-    SinglePath,
-    Multipath,
-}
+const REPLAY_TOKEN_VERSION: u8 = 1;
+const REPLAY_TOKEN_BODY_BYTES: usize = 1 + 8 + 8 + 8 + 16;
+const REPLAY_TOKEN_BYTES: usize = REPLAY_TOKEN_BODY_BYTES + 32;
+const REPLAY_TOKEN_DOMAIN: &[u8] = b"quicp/2 replay token\0";
+const REPLAY_TOKEN_AUTH_BYTES: usize = REPLAY_TOKEN_DOMAIN.len() + REPLAY_TOKEN_BODY_BYTES;
+const MAX_REPLAY_ATTEMPTS: usize = 65_536;
 
-impl ApplicationProfile {
+/// Server-issued admission token for one replay-safe early attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayToken([u8; REPLAY_TOKEN_BYTES]);
+
+impl ReplayToken {
+    #[cfg(feature = "ffi-c")]
+    pub(crate) const BYTE_LEN: usize = REPLAY_TOKEN_BYTES;
+
+    /// Imports one bounded token received from a trusted application store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the token has the exact QUICP/2 token length and version.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplayTokenError> {
+        let bytes: [u8; REPLAY_TOKEN_BYTES] =
+            bytes.try_into().map_err(|_| ReplayTokenError::Malformed)?;
+        if bytes[0] != REPLAY_TOKEN_VERSION {
+            return Err(ReplayTokenError::Malformed);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the stable opaque token bytes for persistence by the caller.
     #[must_use]
-    pub const fn profile_token(self) -> &'static [u8] {
-        match self {
-            Self::SinglePath => b"quicp/1",
-            Self::Multipath => b"quicp/1-mp",
-        }
-    }
-
-    /// Validates the negotiated profile token and transport state as one profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unknown profile token or any token/multipath mismatch.
-    pub fn validate(
-        self,
-        selected_profile_token: &[u8],
-        multipath_enabled: bool,
-    ) -> Result<(), SessionError> {
-        let selected = [Self::SinglePath, Self::Multipath]
-            .into_iter()
-            .find(|profile| profile.profile_token() == selected_profile_token)
-            .ok_or(SessionError::UnsupportedProfileToken)?;
-        if selected != self || multipath_enabled != matches!(self, Self::Multipath) {
-            return Err(SessionError::ProfileMismatch);
-        }
-        Ok(())
-    }
-
-    /// Validates profile and policy evidence.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error until peer admission, current policy, profile token, and multipath state
-    /// all agree.
-    fn admit_evidence(self, evidence: &HandshakeEvidence) -> Result<(), SessionError> {
-        if evidence.peer_admission == PeerAdmission::Unauthenticated {
-            return Err(SessionError::PeerUnauthenticated);
-        }
-        if !evidence.current_policy_authorized {
-            return Err(SessionError::PolicyRejected);
-        }
-        self.validate(&evidence.selected_profile_token, evidence.multipath_enabled)?;
-        Ok(())
-    }
-
-    /// Admits a fully established backend connection against the selected profile.
-    ///
-    /// The no-security profile admits an established handshake that carries a matching
-    /// profile token. The TLS adapter also requires a nonempty peer certificate chain.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless the negotiated profile token, multipath state, and current
-    /// authorization policy all agree. TLS sessions also fail without a peer identity.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn admit_connection(
-        self,
-        connection: &noq::Connection,
-        current_policy_authorized: bool,
-    ) -> Result<(), SessionError> {
-        let evidence = handshake_evidence(connection, current_policy_authorized)?;
-        self.admit_evidence(&evidence)
-    }
-
-    /// Admits whichever profile the established handshake actually negotiated.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when handshake data is missing, the token is unknown, or the
-    /// token does not match the negotiated multipath state.
-    pub(crate) fn admit_negotiated(
-        connection: &noq::Connection,
-        current_policy_authorized: bool,
-    ) -> Result<(), SessionError> {
-        let evidence = handshake_evidence(connection, current_policy_authorized)?;
-        let selected = [Self::SinglePath, Self::Multipath]
-            .into_iter()
-            .find(|profile| profile.profile_token() == evidence.selected_profile_token.as_slice())
-            .ok_or(SessionError::UnsupportedProfileToken)?;
-        selected.admit_evidence(&evidence)
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
-impl From<MultipathMode> for ApplicationProfile {
-    fn from(mode: MultipathMode) -> Self {
-        match mode {
-            MultipathMode::Off => Self::SinglePath,
-            MultipathMode::Failover => Self::Multipath,
+/// Process-local issuer and bounded replay cache for explicit replay-safe attempts.
+#[derive(Debug)]
+pub struct ReplayAdmission {
+    key: hmac::Key,
+    epoch: u64,
+    max_attempts: usize,
+    attempts: Mutex<HashMap<[u8; 24], u64>>,
+}
+
+impl ReplayAdmission {
+    /// Creates replay protection from a dedicated server secret and epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the secret is shorter than 32 bytes or the cache capacity is outside
+    /// `1..=65_536`.
+    pub fn new(secret: &[u8], epoch: u64, max_attempts: usize) -> Result<Self, ReplayTokenError> {
+        if secret.len() < 32 || !(1..=MAX_REPLAY_ATTEMPTS).contains(&max_attempts) {
+            return Err(ReplayTokenError::InvalidPolicy);
         }
+        Ok(Self {
+            key: hmac::Key::new(hmac::HMAC_SHA256, secret),
+            epoch,
+            max_attempts,
+            attempts: Mutex::new(HashMap::new()),
+        })
     }
+
+    /// Issues one expiring token bound to the current capability fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero/overflowing TTL or unavailable system randomness.
+    pub fn issue(
+        &self,
+        now_seconds: u64,
+        ttl_seconds: u64,
+        capability_fingerprint: u64,
+    ) -> Result<ReplayToken, ReplayTokenError> {
+        let mut identity = [0; 16];
+        SystemRandom::new()
+            .fill(&mut identity)
+            .map_err(|_| ReplayTokenError::Random)?;
+        let expiry = now_seconds
+            .checked_add(ttl_seconds)
+            .filter(|_| ttl_seconds != 0)
+            .ok_or(ReplayTokenError::InvalidPolicy)?;
+        let mut bytes = [0; REPLAY_TOKEN_BYTES];
+        bytes[0] = REPLAY_TOKEN_VERSION;
+        bytes[1..9].copy_from_slice(&self.epoch.to_be_bytes());
+        bytes[9..17].copy_from_slice(&expiry.to_be_bytes());
+        bytes[17..25].copy_from_slice(&capability_fingerprint.to_be_bytes());
+        bytes[25..REPLAY_TOKEN_BODY_BYTES].copy_from_slice(&identity);
+        let authenticated = replay_token_auth_data(&bytes[..REPLAY_TOKEN_BODY_BYTES])?;
+        let tag = hmac::sign(&self.key, &authenticated);
+        bytes[REPLAY_TOKEN_BODY_BYTES..].copy_from_slice(tag.as_ref());
+        Ok(ReplayToken(bytes))
+    }
+
+    /// Validates and consumes one exact `(token identity, nonce)` attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before cache mutation for malformed, expired, replayed, incompatible, or
+    /// over-capacity attempts.
+    pub fn admit(
+        &self,
+        token: &ReplayToken,
+        nonce: u64,
+        now_seconds: u64,
+        capability_fingerprint: u64,
+    ) -> Result<(), ReplayTokenError> {
+        let body = token
+            .0
+            .get(..REPLAY_TOKEN_BODY_BYTES)
+            .ok_or(ReplayTokenError::Malformed)?;
+        let tag = token
+            .0
+            .get(REPLAY_TOKEN_BODY_BYTES..)
+            .ok_or(ReplayTokenError::Malformed)?;
+        let authenticated = replay_token_auth_data(body)?;
+        hmac::verify(&self.key, &authenticated, tag).map_err(|_| ReplayTokenError::InvalidMac)?;
+        let epoch = read_token_u64(body, 1)?;
+        let expiry = read_token_u64(body, 9)?;
+        let capabilities = read_token_u64(body, 17)?;
+        if epoch != self.epoch {
+            return Err(ReplayTokenError::WrongEpoch);
+        }
+        if expiry < now_seconds {
+            return Err(ReplayTokenError::Expired);
+        }
+        if capabilities != capability_fingerprint {
+            return Err(ReplayTokenError::CapabilitiesChanged);
+        }
+        let mut attempt = [0; 24];
+        attempt[..16].copy_from_slice(&body[25..41]);
+        attempt[16..].copy_from_slice(&nonce.to_be_bytes());
+        let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+        if attempts
+            .get(&attempt)
+            .is_some_and(|expires| *expires >= now_seconds)
+        {
+            return Err(ReplayTokenError::Replayed);
+        }
+        if attempts.len() == self.max_attempts {
+            attempts.retain(|_, expires| *expires >= now_seconds);
+            if attempts.len() == self.max_attempts {
+                return Err(ReplayTokenError::Capacity);
+            }
+        }
+        attempts.insert(attempt, expiry);
+        Ok(())
+    }
+}
+
+fn replay_token_auth_data(body: &[u8]) -> Result<[u8; REPLAY_TOKEN_AUTH_BYTES], ReplayTokenError> {
+    if body.len() != REPLAY_TOKEN_BODY_BYTES {
+        return Err(ReplayTokenError::Malformed);
+    }
+    let mut authenticated = [0; REPLAY_TOKEN_AUTH_BYTES];
+    authenticated[..REPLAY_TOKEN_DOMAIN.len()].copy_from_slice(REPLAY_TOKEN_DOMAIN);
+    authenticated[REPLAY_TOKEN_DOMAIN.len()..].copy_from_slice(body);
+    Ok(authenticated)
+}
+
+fn read_token_u64(body: &[u8], offset: usize) -> Result<u64, ReplayTokenError> {
+    let bytes = body
+        .get(offset..offset + 8)
+        .ok_or(ReplayTokenError::Malformed)?;
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| ReplayTokenError::Malformed)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// Replay-safe early-admission token errors.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ReplayTokenError {
+    /// The connection has not negotiated the capabilities bound into a token.
+    #[error("replay token requires negotiated capabilities")]
+    CapabilitiesUnavailable,
+    /// The token length, version, or layout is invalid.
+    #[error("malformed replay token")]
+    Malformed,
+    /// The token authentication code is invalid.
+    #[error("invalid replay token MAC")]
+    InvalidMac,
+    /// The token was issued by another server epoch.
+    #[error("replay token server epoch changed")]
+    WrongEpoch,
+    /// The token is past its expiration time.
+    #[error("replay token expired")]
+    Expired,
+    /// Remembered transport capabilities no longer match.
+    #[error("replay token capabilities changed")]
+    CapabilitiesChanged,
+    /// This exact token and nonce pair was already admitted.
+    #[error("replay-safe attempt was already admitted")]
+    Replayed,
+    /// The process-local attempt cache is full.
+    #[error("replay-attempt cache is full")]
+    Capacity,
+    /// The replay policy has an invalid secret, TTL, or capacity.
+    #[error("invalid replay policy")]
+    InvalidPolicy,
+    /// The operating system random source failed.
+    #[error("replay token identity generation failed")]
+    Random,
+}
+
+#[must_use]
+pub(crate) const fn application_profile_token() -> &'static [u8] {
+    QUICP_V2_PROFILE
+}
+
+fn admit_evidence(evidence: &HandshakeEvidence) -> Result<(), SessionError> {
+    if evidence.peer_admission == PeerAdmission::Unauthenticated {
+        return Err(SessionError::PeerUnauthenticated);
+    }
+    if !evidence.current_policy_authorized {
+        return Err(SessionError::PolicyRejected);
+    }
+    if evidence.selected_profile_token != QUICP_V2_PROFILE {
+        return Err(SessionError::UnsupportedProfileToken);
+    }
+    Ok(())
+}
+
+/// Admits an established backend connection using the QUICP/2 application profile.
+///
+/// # Errors
+///
+/// Returns an error when handshake data is missing, the token is unknown, the peer is not
+/// admitted, or the current policy rejects it.
+pub(crate) fn admit_negotiated(
+    connection: &noq::Connection,
+    current_policy_authorized: bool,
+) -> Result<(), SessionError> {
+    let evidence = handshake_evidence(connection, current_policy_authorized)?;
+    admit_evidence(&evidence)
 }
 
 #[derive(Clone, Debug)]
 struct HandshakeEvidence {
     selected_profile_token: Vec<u8>,
-    multipath_enabled: bool,
     peer_admission: PeerAdmission,
     current_policy_authorized: bool,
 }
@@ -129,7 +268,6 @@ fn handshake_evidence(
     match handshake.downcast::<crate::no_security::NoSecurityHandshakeData>() {
         Ok(plain) => Ok(HandshakeEvidence {
             selected_profile_token: plain.profile_token,
-            multipath_enabled: connection.is_multipath_enabled(),
             peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
             current_policy_authorized,
         }),
@@ -164,7 +302,6 @@ fn tls_handshake_evidence(
     };
     Ok(HandshakeEvidence {
         selected_profile_token,
-        multipath_enabled: connection.is_multipath_enabled(),
         peer_admission,
         current_policy_authorized,
     })
@@ -177,64 +314,6 @@ fn tls_handshake_evidence(
     _current_policy_authorized: bool,
 ) -> Result<HandshakeEvidence, SessionError> {
     Err(SessionError::UnsupportedCrypto)
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ClientOpenGate {
-    state: OpenState,
-}
-
-impl ClientOpenGate {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            state: OpenState::AwaitingStatus,
-        }
-    }
-
-    #[must_use]
-    pub const fn may_forward_payload(self) -> bool {
-        matches!(self.state, OpenState::Ready)
-    }
-
-    /// Consumes the single server status byte for a flow.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unknown status or a second status transition.
-    pub fn accept_status(&mut self, value: u8) -> Result<OpenDisposition, SessionError> {
-        if self.state != OpenState::AwaitingStatus {
-            return Err(SessionError::InvalidState);
-        }
-        let status = match OpenStatus::decode(value) {
-            Ok(status) => status,
-            Err(error) => {
-                self.state = OpenState::Terminal;
-                return Err(error.into());
-            }
-        };
-        if status == OpenStatus::Ok {
-            self.state = OpenState::Ready;
-            Ok(OpenDisposition::Ready)
-        } else {
-            self.state = OpenState::Terminal;
-            Ok(OpenDisposition::Rejected(status))
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum OpenState {
-    #[default]
-    AwaitingStatus,
-    Ready,
-    Terminal,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenDisposition {
-    Ready,
-    Rejected(OpenStatus),
 }
 
 /// Stable QUICP application error codes sent when closing flows or connections.
@@ -288,12 +367,6 @@ pub enum SessionError {
     /// The selected security backend cannot provide the requested session.
     #[error("unsupported security backend session")]
     UnsupportedCrypto,
-    /// TLS authentication was requested without enabling its crate feature.
-    #[error("TLS authentication requires the `tls-rustls` feature")]
-    SecurityFeatureDisabled,
-    /// The negotiated profile token conflicts with the multipath state.
-    #[error("profile token and multipath state do not match")]
-    ProfileMismatch,
     /// A flow attempted an invalid session-state transition.
     #[error("invalid flow state transition")]
     InvalidState,
@@ -304,35 +377,109 @@ pub enum SessionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationProfile, HandshakeEvidence, PeerAdmission};
+    use super::{
+        ApplicationError, HandshakeEvidence, MAX_REPLAY_ATTEMPTS, PeerAdmission, ReplayAdmission,
+        ReplayToken, ReplayTokenError, SessionError, admit_evidence, application_profile_token,
+    };
 
     #[test]
     fn session_admission_requires_profile_and_policy_evidence() {
-        let profile = ApplicationProfile::SinglePath;
         for evidence in [
             HandshakeEvidence {
-                selected_profile_token: b"quicp/1".to_vec(),
-                multipath_enabled: false,
+                selected_profile_token: b"quicp/2".to_vec(),
                 peer_admission: PeerAdmission::Unauthenticated,
                 current_policy_authorized: true,
             },
             HandshakeEvidence {
-                selected_profile_token: b"quicp/1".to_vec(),
-                multipath_enabled: false,
+                selected_profile_token: b"quicp/2".to_vec(),
                 peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
                 current_policy_authorized: false,
             },
         ] {
-            assert!(profile.admit_evidence(&evidence).is_err());
+            assert!(admit_evidence(&evidence).is_err());
         }
 
-        profile
-            .admit_evidence(&HandshakeEvidence {
+        admit_evidence(&HandshakeEvidence {
+            selected_profile_token: b"quicp/2".to_vec(),
+            peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
+            current_policy_authorized: true,
+        })
+        .expect("explicit no-security admission");
+    }
+
+    #[test]
+    fn profile_requires_exact_token() {
+        assert_eq!(application_profile_token(), b"quicp/2");
+        assert!(matches!(
+            admit_evidence(&HandshakeEvidence {
                 selected_profile_token: b"quicp/1".to_vec(),
-                multipath_enabled: false,
                 peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
                 current_policy_authorized: true,
-            })
-            .expect("explicit no-security admission");
+            }),
+            Err(SessionError::UnsupportedProfileToken)
+        ));
+    }
+
+    #[test]
+    fn application_error_mapping_fails_unknown_codes_to_protocol_error() {
+        assert_eq!(
+            ApplicationError::from_peer_code(0x101),
+            ApplicationError::FlowAbort
+        );
+        assert_eq!(
+            ApplicationError::from_peer_code(0xdead),
+            ApplicationError::FlowProtocol
+        );
+    }
+
+    #[test]
+    fn replay_tokens_reject_replay_expiry_mac_epoch_and_capability_changes() {
+        let admission = ReplayAdmission::new(&[7; 32], 4, 2).unwrap();
+        let token = admission.issue(100, 10, 9).unwrap();
+        admission.admit(&token, 11, 100, 9).unwrap();
+        assert_eq!(
+            admission.admit(&token, 11, 100, 9),
+            Err(ReplayTokenError::Replayed)
+        );
+        assert_eq!(
+            admission.admit(&token, 12, 111, 9),
+            Err(ReplayTokenError::Expired)
+        );
+        assert_eq!(
+            admission.admit(&token, 12, 100, 10),
+            Err(ReplayTokenError::CapabilitiesChanged)
+        );
+        let other_epoch = ReplayAdmission::new(&[7; 32], 5, 2).unwrap();
+        assert_eq!(
+            other_epoch.admit(&token, 12, 100, 9),
+            Err(ReplayTokenError::WrongEpoch)
+        );
+        let mut corrupted = token.as_bytes().to_vec();
+        corrupted[10] ^= 1;
+        let corrupted = ReplayToken::from_bytes(&corrupted).unwrap();
+        assert_eq!(
+            admission.admit(&corrupted, 12, 100, 9),
+            Err(ReplayTokenError::InvalidMac)
+        );
+    }
+
+    #[test]
+    fn replay_cache_is_bounded_before_mutation() {
+        let admission = ReplayAdmission::new(&[7; 32], 4, 1).unwrap();
+        let first = admission.issue(100, 10, 9).unwrap();
+        let second = admission.issue(100, 10, 9).unwrap();
+        admission.admit(&first, 1, 100, 9).unwrap();
+        assert_eq!(
+            admission.admit(&second, 2, 100, 9),
+            Err(ReplayTokenError::Capacity)
+        );
+    }
+
+    #[test]
+    fn replay_cache_rejects_excessive_capacity_without_allocating() {
+        assert!(matches!(
+            ReplayAdmission::new(&[7; 32], 4, MAX_REPLAY_ATTEMPTS + 1),
+            Err(ReplayTokenError::InvalidPolicy)
+        ));
     }
 }

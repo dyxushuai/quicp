@@ -9,6 +9,7 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
@@ -63,12 +64,9 @@ impl HostDatagramSocket {
         if mtu == 0 {
             return Err(HostDatagramError::ZeroMtu);
         }
-        let byte_budget = packet_capacity
-            .checked_mul(mtu)
-            .ok_or(HostDatagramError::BudgetOverflow)?;
-        let ingress = PacketRing::with_preallocated(packet_capacity, byte_budget, mtu)
+        let ingress = PacketRing::new(packet_capacity, mtu)
             .map_err(|error| HostDatagramError::from_ring(&error))?;
-        let egress = PacketRing::with_preallocated(packet_capacity, byte_budget, mtu)
+        let egress = PacketRing::new(packet_capacity, mtu)
             .map_err(|error| HostDatagramError::from_ring(&error))?;
         Ok(Self {
             inner: Arc::new(HostDatagramInner {
@@ -83,8 +81,21 @@ impl HostDatagramSocket {
                 egress_producer: Mutex::new(()),
                 recv_waker: Mutex::new(None),
                 send_waker: Mutex::new(None),
+                unavailable: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Permanently marks this underlay path unavailable and wakes pending endpoint I/O.
+    pub fn mark_unavailable(&self) {
+        if self.inner.unavailable.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for waiter in [&self.inner.recv_waker, &self.inner.send_waker] {
+            if let Some(waker) = lock_recover(waiter).take() {
+                waker.wake();
+            }
+        }
     }
 
     /// Copies one host-owned datagram into the QUIC receive queue.
@@ -112,6 +123,9 @@ impl HostDatagramSocket {
         source: SocketAddr,
         packet: &[u8],
     ) -> Result<(), HostDatagramError> {
+        if self.inner.unavailable.load(Ordering::Acquire) {
+            return Err(HostDatagramError::Unavailable);
+        }
         if source != self.inner.peer {
             return Err(HostDatagramError::PeerMismatch {
                 expected: self.inner.peer,
@@ -141,6 +155,9 @@ impl HostDatagramSocket {
         &self,
         output: &mut [u8],
     ) -> Result<Option<usize>, HostDatagramError> {
+        if self.inner.unavailable.load(Ordering::Acquire) {
+            return Err(HostDatagramError::Unavailable);
+        }
         let _consumer = lock_recover(&self.inner.egress_consumer);
         let result = self
             .inner
@@ -153,18 +170,6 @@ impl HostDatagramSocket {
             waker.wake();
         }
         result
-    }
-
-    /// Returns the number of queued datagrams waiting for the host.
-    #[must_use]
-    pub fn egress_len(&self) -> usize {
-        self.inner.egress.len()
-    }
-
-    /// Returns the number of datagrams waiting for the QUIC endpoint.
-    #[must_use]
-    pub fn ingress_len(&self) -> usize {
-        self.inner.ingress.len()
     }
 
     #[must_use]
@@ -209,6 +214,9 @@ impl AsyncUdpSocket for HostDatagramSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        if self.inner.unavailable.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NetworkDown)));
+        }
         if bufs.is_empty() || meta.is_empty() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -222,6 +230,7 @@ impl AsyncUdpSocket for HostDatagramSocket {
                 Ok(Some(len)) => {
                     meta[0] = RecvMeta::default();
                     meta[0].addr = self.inner.peer;
+                    meta[0].dst_ip = Some(self.inner.local.ip());
                     meta[0].len = len;
                     meta[0].stride = len;
                     return Poll::Ready(Ok(1));
@@ -236,7 +245,11 @@ impl AsyncUdpSocket for HostDatagramSocket {
                 Ok(None) => {
                     register_waker(&self.inner.recv_waker, cx.waker());
                     if self.inner.ingress.is_empty() {
-                        return Poll::Pending;
+                        return if self.inner.unavailable.load(Ordering::Acquire) {
+                            Poll::Ready(Err(io::Error::from(io::ErrorKind::NetworkDown)))
+                        } else {
+                            Poll::Pending
+                        };
                     }
                 }
             }
@@ -268,6 +281,9 @@ impl UdpSender for HostDatagramSender {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.inner.unavailable.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NetworkDown)));
+        }
         if transmit.destination != this.inner.peer
             || transmit
                 .src_ip
@@ -292,21 +308,21 @@ impl UdpSender for HostDatagramSender {
         }
 
         let _producer = lock_recover(&this.inner.egress_producer);
-        if !this.inner.egress.can_fit(transmit.contents.len())
-            || !this.inner.egress.has_buffer_for(transmit.contents.len())
-        {
-            register_waker(&this.inner.send_waker, cx.waker());
-            if !this.inner.egress.can_fit(transmit.contents.len())
-                || !this.inner.egress.has_buffer_for(transmit.contents.len())
-            {
-                return Poll::Pending;
-            }
-        }
         match this.inner.egress.push_copy(transmit.contents) {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(RingError::Full(_)) => {
+            Err(RingError::Full) => {
                 register_waker(&this.inner.send_waker, cx.waker());
-                Poll::Pending
+                match this.inner.egress.push_copy(transmit.contents) {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(RingError::Full) => {
+                        if this.inner.unavailable.load(Ordering::Acquire) {
+                            Poll::Ready(Err(io::Error::from(io::ErrorKind::NetworkDown)))
+                        } else {
+                            Poll::Pending
+                        }
+                    }
+                    Err(error) => Poll::Ready(Err(io::Error::other(error.to_string()))),
+                }
             }
             Err(error) => Poll::Ready(Err(io::Error::other(error.to_string()))),
         }
@@ -330,12 +346,16 @@ struct HostDatagramInner {
     egress_producer: Mutex<()>,
     recv_waker: Mutex<Option<Waker>>,
     send_waker: Mutex<Option<Waker>>,
+    unavailable: AtomicBool,
 }
 
 /// Host-carrier construction, peer-validation, and bounded-queue errors.
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum HostDatagramError {
+    /// The host reported that this path can no longer carry packets.
+    #[error("host datagram path is unavailable")]
+    Unavailable,
     /// Queue capacity was zero.
     #[error("host datagram queue capacity must be nonzero")]
     ZeroCapacity,
@@ -377,7 +397,7 @@ pub enum HostDatagramError {
 impl HostDatagramError {
     fn from_ring(error: &RingError) -> Self {
         match error {
-            RingError::Full(_) => Self::QueueFull,
+            RingError::Full => Self::QueueFull,
             RingError::TooLarge { len, max } => Self::PacketOutsideMtu {
                 len: *len,
                 mtu: *max,
@@ -386,11 +406,9 @@ impl HostDatagramError {
                 required: *required,
                 capacity: *capacity,
             },
-            RingError::ZeroCapacity
-            | RingError::ZeroByteBudget
-            | RingError::ZeroSlotCapacity
-            | RingError::PoolBudgetExceeded { .. }
-            | RingError::PoolInitializationFailed => Self::BudgetOverflow,
+            RingError::ZeroCapacity | RingError::ZeroSlotCapacity | RingError::CapacityOverflow => {
+                Self::BudgetOverflow
+            }
         }
     }
 }

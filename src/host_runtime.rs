@@ -83,16 +83,10 @@ impl HostRuntime {
             task.poll()?;
             processed += 1;
         }
+        if processed == max_tasks.get() && !lock_recover(&self.inner.ready).is_empty() {
+            self.inner.notify_host();
+        }
         Ok(processed)
-    }
-
-    /// Returns whether at least one task is ready for another drive call.
-    ///
-    /// This is only a drain optimization. Every external I/O source must also wake the host event
-    /// loop; this snapshot must not be used as the event loop's only sleep condition.
-    #[must_use]
-    pub fn has_ready_work(&self) -> bool {
-        !lock_recover(&self.inner.ready).is_empty()
     }
 
     /// Returns the earliest live timer as elapsed time from runtime creation.
@@ -116,6 +110,16 @@ impl HostRuntime {
                 })
             })
             .min()
+    }
+
+    /// Returns whether shutdown has started or completed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.inner.stopped)
     }
 
     /// Cancels every spawned task and releases runtime-owned protocol state.
@@ -241,7 +245,7 @@ struct RuntimeInner {
     tasks: Mutex<Vec<Arc<Task>>>,
     timers: Mutex<Vec<Weak<TimerState>>>,
     driving: AtomicBool,
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
     wake_callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
@@ -258,7 +262,7 @@ impl RuntimeInner {
             tasks: Mutex::new(Vec::new()),
             timers: Mutex::new(Vec::new()),
             driving: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
             wake_callback,
         }
     }
@@ -289,6 +293,12 @@ impl RuntimeInner {
         };
         for timer in timers {
             timer.wake_if_due(now);
+        }
+    }
+
+    fn notify_host(&self) {
+        if let Some(callback) = self.wake_callback.as_ref() {
+            let _ = catch_unwind(AssertUnwindSafe(|| callback()));
         }
     }
 
@@ -360,8 +370,8 @@ impl Task {
         let was_empty = ready.is_empty();
         ready.push_back(self);
         drop(ready);
-        if was_empty && let Some(callback) = runtime.wake_callback.as_ref() {
-            let _ = catch_unwind(AssertUnwindSafe(|| callback()));
+        if was_empty {
+            runtime.notify_host();
         }
     }
 
@@ -480,4 +490,18 @@ fn drop_catching_panic(
     future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 ) -> Result<(), HostRuntimeError> {
     catch_unwind(AssertUnwindSafe(|| drop(future))).map_err(|_| HostRuntimeError::TaskPanicked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_signal_only_changes_on_shutdown() {
+        let runtime = HostRuntime::new();
+        let stopped = runtime.shutdown_signal();
+        assert!(!stopped.load(Ordering::Acquire));
+        runtime.shutdown().unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+    }
 }

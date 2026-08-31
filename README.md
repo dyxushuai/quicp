@@ -17,17 +17,16 @@ they do not replace the wire carrier or claim ISP-level FakeTCP camouflage.
 
 ## Implement the protocol
 
-Start with the [QUICP/1 protocol specification](docs/protocol.md). It is the normative reference
-for the FakeTCP envelope, QUICP datagram boundary, no-TLS handshake, profile tokens, exact
-`OPEN`/`STATUS` bytes, multipath failover, and independent-implementation checklist. This README
-focuses on using the Rust crate and platform SDKs.
+Start with the [QUICP/2 protocol specification](docs/protocol.md). It is the normative reference
+for DATAGRAM recovery, logical ACK/replay/FEC, replay-safe early data, the FakeTCP envelope, and
+the independent-implementation checklist. This README focuses on using the library and SDKs.
 
 > **Status:** `0.1.0` source release candidate. The crate remains unpublished (`publish = false`)
 > because the vendored `noq` patch must be released as a separately reviewable dependency before
 > crates.io distribution. `cargo package` intentionally omits path dependencies, so it is not a
 > valid QUICP release artifact; publish a repository source archive that retains `vendor/**` and
 > the project licenses instead.
-> Windows Tier 0 is implemented through the external WinDivert signed WFP/WDF provider. Native
+> Windows Tier 0 is implemented through the external WinDivert WFP/WDF provider. Native
 > packet admission still requires the Windows driver, Administrator privileges, and the black-box
 > evidence listed in [the Windows carrier guide](docs/windows.md); Wintun/TAP remains Tier 1.
 
@@ -41,10 +40,9 @@ cargo run --locked --example echo
 ```
 
 The example builds validated client/server configuration, opens a QUICP flow, and echoes bytes
-through fixed-peer `HostDatagramSocket` queues. For the lower-level handshake-only carrier seam,
-run `cargo run --locked --example host_loopback`. To embed QUICP, send each egress datagram
-through your underlay, pass received datagrams to `ingress_datagram_from`, and call
-`HostRuntime::drive` after I/O or timer readiness.
+through fixed-peer `HostDatagramSocket` queues. To embed QUICP, send each egress datagram through
+your underlay, pass received datagrams to `ingress_datagram_from`, and call `HostRuntime::drive`
+after I/O or timer readiness.
 
 ### Configure the path envelope
 
@@ -77,14 +75,16 @@ TOML duration fields use Serde's `{ secs = ..., nanos = ... }` shape.
 | You need | Enable | What it provides |
 | --- | --- | --- |
 | QUICP core and runtime-neutral Rust API | None | Host-driven carrier, connection, flow, and validated configuration |
-| Tokio and native raw `FakeTCP` | `runtime-tokio` | Tokio adapter and Unix/Windows packet carrier |
+| Tokio integration | `runtime-tokio` | Tokio I/O/runtime adapter; also enables native raw `FakeTCP` on Linux, macOS, and Windows |
 | Mutual TLS | `tls-rustls` | Optional rustls authentication and encryption |
 | smoltcp packet bridge | `platform-smoltcp` | Bounded packet processing for TUN/mobile adapters |
-| C packet-bridge ABI | `ffi-c` | Synchronous C ABI; implies `platform-smoltcp` |
-| Repository benchmarks | `internal-bench` | Internal benches only; never a backend selector |
+| C/Swift/Kotlin engine | `ffi-c` | Synchronous connection, flow, timer, and host-DATAGRAM ABI |
 
 The package defaults to an `rlib`; build a native C/Swift/Kotlin archive explicitly with
-`cargo rustc --crate-type staticlib --features ffi-c`.
+`cargo rustc --crate-type staticlib --features ffi-c` for no-TLS, or add `tls-rustls` to enable
+mutual TLS through the same C, Swift, and Kotlin engine.
+The no-TLS C archive retains `quicp_engine_create_tls` for one stable ABI, but that entry point
+returns `QUICP_STATUS_INVALID_ARGUMENT` without constructing an engine.
 
 Multipath failover is configured in the Rust API. Each path uses its own `FakeTCP` four-tuple;
 the QUICP session and flow state remain above those carrier paths.
@@ -92,24 +92,26 @@ the QUICP session and flow state remain above those carrier paths.
 The base build always includes the QUICP protocol and backend. Optional features add integrations
 and policies; they do not select a different QUICP implementation.
 
-`runtime-tokio` is confined to the Tokio adapter modules. The packet codec, configuration, flow
-contract, and host-carrier API remain runtime-neutral; Unix target gates are limited to kernel
-socket differences that Cargo features cannot express.
+`runtime-tokio` enables Tokio I/O/runtime integration on every supported target. Native raw
+`FakeTCP` APIs remain target-gated to Linux, macOS, and Windows; enabling Tokio on iOS, Android, or
+another Unix target does not compile a raw carrier. The packet codec, configuration, flow contract,
+and host-carrier API remain runtime-neutral. The vendored `noq` backend still uses Tokio
+synchronization and I/O traits internally, so disabling `runtime-tokio` removes the Tokio executor
+and network adapter but does not remove Tokio from the dependency graph.
 
 ## Supported integrations
 
 | Surface | Linux | macOS | iOS | Android | Windows |
 | --- | --- | --- | --- | --- | --- |
 | Host-driven Rust API | Yes | Yes | Yes | Yes | Yes |
-| Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | No | Yes, through WinDivert signed WFP/WDF provider; Administrator required |
+| Raw `FakeTCP` carrier | Yes, with `CAP_NET_RAW` or equivalent | Probe-only privileged IPv4 raw socket and scoped PF RST rule | No | No | Yes, through the pinned WinDivert 2.2.2-A x64 distribution; Administrator required |
 | smoltcp packet bridge | Yes | Yes | Yes | Yes | Yes (host-owned packet I/O) |
-| C packet-bridge ABI | Yes | Yes | Yes | Yes | Yes |
-| Swift/Kotlin wrappers | — | Packet bridge | Packet bridge | Packet bridge | — |
+| C connection/flow engine | Yes | Yes | Yes | Yes | Yes |
+| Swift/Kotlin wrappers | — | Engine | Engine | Engine | — |
 
-The C, Swift, and Kotlin surfaces intentionally expose packet bridging only. They do not create
-QUICP connections, open flows, manage multipath, or bypass Network Extension and `VpnService`
-permissions. The core does not own DNS, FakeIP allocation, or TUN setup; adapters can provide
-those pieces at their platform boundary.
+The C, Swift, and Kotlin surfaces drive real QUICP connections and flows over one or two
+host-owned underlay paths. They do not bypass Network Extension or `VpnService` permissions and
+do not own DNS, FakeIP allocation, TUN setup, or platform socket lifecycle.
 
 ### Carrier tiers
 
@@ -120,8 +122,9 @@ those pieces at their platform boundary.
   fallback and still needs a privileged runtime probe plus a narrowly scoped PF RST rule before
   production admission.
   Windows uses the WinDivert WFP/WDF packet-injection adapter; Winsock raw TCP is not an admitted
-  Tier 0 implementation. The adapter requires the matching signed `WinDivert.dll`/driver files
-  and Administrator privileges. A native Wintun/TAP handle adapter remains Tier 1 roadmap work.
+  Tier 0 implementation. The adapter requires the pinned `WinDivert.dll`, its matching signed
+  driver, a protected installation directory, and Administrator privileges. A native Wintun/TAP
+  handle adapter remains Tier 1 roadmap work.
 - **Tier 1 — TUN/TAP:** a virtual packet source/sink for smoltcp, tests, and transparent adapters.
   It is not a wire carrier unless the complete deployment attaches it to a verified physical packet
   path.
@@ -145,9 +148,12 @@ ABI ownership rules and the exact artifact status.
   authenticate a peer or encrypt application data.
 - `FakeTCP` shapes the carrier. Its cookie and cookie secret protect the carrier handshake, not
   the QUICP peer or application payload.
-- SYN data can carry only the backend handshake datagram. QUICP does not admit transport or
-  application 0-RTT through TCP Fast Open; OPEN requests, origin dialing, and payload wait for the
-  ordinary handshake and policy checks.
+- `Client::connect_replay_safe` admits bounded initial bytes only with a server-issued expiring
+  token issued after capability negotiation and a fresh attempt nonce. Transport-level 0-RTT
+  rejection falls back once to ordinary OPEN; token or replay rejection fails closed. The bounded
+  cache is process-local and does not claim cross-restart or cross-connection exactly-once effects.
+  With required multipath, accepted early delivery can precede backup validation, so a later backup
+  error is delivery-ambiguous.
 - Raw sockets cross an operating-system privilege boundary. Grant only the capability required by
   the process.
 
@@ -155,8 +161,8 @@ ABI ownership rules and the exact artifact status.
 
 - [Run the Rust examples](examples/README.md)
 - [Read the protocol and wire boundaries](docs/protocol.md)
-- [Configure plugins and extension points](docs/plugin-system.md)
-- [Build the Apple and Android packet bridges](sdk/README.md)
+- [Choose typed configuration and extension seams](#pick-optional-capabilities)
+- [Build the Apple and Android engines](sdk/README.md)
 - [Run the benchmark commands](benches/README.md)
 - [Follow the production acceptance checklist](docs/production-acceptance-checklist.md)
 - [Read the change log](CHANGELOG.md)

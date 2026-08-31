@@ -23,8 +23,12 @@ pub(super) const SEND_BATCH_SIZE: usize = 10;
 pub(super) const RECV_BATCH_SIZE: usize = 8;
 pub(super) const GRO_SEGMENTS: usize = 4;
 
-const PACKET_RING_FRAME_SIZE: usize = 128 * 1024;
-const PACKET_RING_FRAME_COUNT: usize = 64;
+const PACKET_RING_BLOCK_SIZE: usize = 128 * 1024;
+const PACKET_RING_BLOCK_COUNT: usize = 64;
+const PACKET_RING_FRAME_SIZE: usize = 2 * 1024;
+const PACKET_RING_FRAME_COUNT: usize =
+    PACKET_RING_BLOCK_SIZE / PACKET_RING_FRAME_SIZE * PACKET_RING_BLOCK_COUNT;
+const RAW_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 const PACKET_VERSION_OPTION: libc::c_int = 10;
 const PACKET_RX_RING_OPTION: libc::c_int = 5;
@@ -56,8 +60,8 @@ impl PacketRxRing {
         set_packet_option(socket, PACKET_VERSION_OPTION, &version)?;
         let copy_threshold: libc::c_int = 1;
         set_packet_option(socket, libc::PACKET_COPY_THRESH, &copy_threshold)?;
-        let block_size = PACKET_RING_FRAME_SIZE;
-        let block_count = PACKET_RING_FRAME_COUNT;
+        let block_size = PACKET_RING_BLOCK_SIZE;
+        let block_count = PACKET_RING_BLOCK_COUNT;
         let frame_size = PACKET_RING_FRAME_SIZE;
         let frame_count = PACKET_RING_FRAME_COUNT;
         let request = libc::tpacket_req {
@@ -299,6 +303,7 @@ impl RawPlatform {
             socket.attach_filter(&tuple_filter(tuple)?)?;
             (socket, None)
         };
+        socket.set_recv_buffer_size(RAW_SOCKET_BUFFER_BYTES)?;
         socket.set_nonblocking(true)?;
         let io = Arc::new(AsyncFd::new(socket)?);
         let (send_socket, send_mode) = if let Some(target) = packet_target {

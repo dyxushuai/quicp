@@ -3,7 +3,6 @@
 ## User-facing contract
 
 - [Protocol and release boundaries](protocol.md)
-- [Plugin and extension API](plugin-system.md)
 - [Production acceptance checklist](production-acceptance-checklist.md)
 - [Mobile SDK sources](../sdk/README.md)
 - [Rust examples](../examples/README.md)

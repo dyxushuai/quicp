@@ -198,9 +198,8 @@ public protocol interface does not change either way.
 
 ### Temporary backend candidates
 
-This section records why the prototype currently embeds a standard QUIC engine;
-it is an implementation choice to be removed from the no-security QUICP core,
-not a protocol requirement.
+This section records the prior-art constraints behind the private `noq` QUIC substrate. The
+substrate is an implementation detail and does not define the QUICP application wire format.
 
 Upstream Quinn established the smallest single-path baseline because Tinect
 already exercises its Tokio integration and Quinn directly exposes the required
@@ -256,11 +255,11 @@ the gateway still resolves and authorizes every concrete egress address independ
 
 | Category | Hidden adapter/seam | Local responsibility |
 | --- | --- | --- |
-| Fake IP | Optional transparent integration | One lookup per established flow, canonical hostname validation, no v1 reuse |
+| Fake IP | Optional transparent integration | One lookup per established flow, canonical hostname validation, no stale mapping reuse |
 | Platform I/O | Host carrier or optional TUN adapter | Packet I/O and cleanup; no protocol decisions |
 | Local TCP | `netstack-smoltcp` prototype adapter or admitted smoltcp adapter | Turn IP packets into async TCP flows; own all smoltcp state in one locality |
 | Async runtime | Tokio | Readiness, timers, bounded channels, task supervision, shutdown |
-| QUICP backend | Current `noq` adapter (temporary) | One long-lived session per gateway, bounded driver events, source/destination enforcement, one or two concurrent validated paths, at most one active flow per local flow; TLS is adapter-only |
+| QUICP backend | Private `noq` substrate | One long-lived session per gateway, bounded driver events, source/destination enforcement, and one or two concurrent validated paths; TLS is optional |
 | Gateway egress | Tokio TCP/DNS adapter | Revalidate ACL, resolve recovered authority, connect with timeout, proxy bytes |
 | Wire codec | Private functions | Bounded `OPEN` and status parsing; no general serialization framework |
 
@@ -269,91 +268,12 @@ adapters with smoltcp's in-memory device and an in-process `noq` endpoint. A
 second implementation is added only when a real platform or production-admission
 need appears.
 
-## Wire protocol v1
+## Implemented protocol boundary
 
-Use profile tokens `quicp/1` for the single-path profile and `quicp/1-mp` when
-multipath is required. After the selected security/policy gate and before flow
-acceptance, both endpoints enforce `quicp/1 => no multipath` and
-`quicp/1-mp => multipath`. Both use the same application bytes. A QUICP session
-carries no shared application control flow. Every flow attempt opens one
-client-initiated bidirectional QUICP flow and writes one bounded `OPEN`; a
-rejected early-open attempt may be replaced once, but at most one attempt is
-active. Accepted flows then carry raw ordered bytes.
-
-```text
-OPEN (client -> gateway, first bytes of flow)
-  host_length:u8 = 1..253
-  host:bytes[host_length]
-  port:u16
-  client byte stream begins only after STATUS(ok)
-
-STATUS (gateway -> client, first byte of reverse direction)
-  code:u8 = 0(ok) | 1(general) | 2(policy) | 3(resolve)
-          | 4(refused) | 5(timeout) | 6(capacity)
-  followed by server byte stream only when code = 0
-```
-
-The profile token is the version. `host` is a lowercase ASCII, IDNA2008-canonical,
-dot-separated DNS name with labels of `1..=63` bytes and no trailing dot. V1 has
-no literal-IP target form. Port zero, truncated input, and oversized or
-non-canonical names are stream protocol errors and use `FLOW_PROTOCOL = 0x100`
-rather than a status. Error details are logged locally rather than sent to an
-untrusted peer. No chunk framing follows `OPEN`: the QUICP flow itself supplies
-the reliable ordered byte stream, so another reliability or record layer would add
-code without leverage.
-
-Ordering and lifecycle invariants:
-
-1. The client writes `OPEN`, waits for `STATUS(ok)`, and only then drains local
-   application bytes into QUICP.
-2. The gateway parses and authorizes `OPEN` before resolving or dialing.
-3. The gateway writes `STATUS(ok)` only after the origin connection succeeds.
-4. Neither side delivers reverse-direction payload before `STATUS(ok)`.
-5. Local TCP FIN maps to QUICP flow finish; QUICP FIN maps to origin/local TCP
-   half-close. A locally detected generic abort performs TCP RST plus both flow
-   reset directions. A received `FLOW_PROTOCOL`, `FLOW_ABORT`, or `FLOW_REJECTED`
-   code is mirrored unchanged onto the other direction; an unknown code maps to
-   `FLOW_PROTOCOL`.
-6. QUICP session loss aborts all attached local flows. V1 does not pretend to
-   resume byte streams on a new connection because that would require a second
-   delivery acknowledgment and replay protocol above QUICP.
-7. All queues, socket buffers, flow counts, parsers, and early-data buffers are
-   bounded. Backpressure propagates from QUICP to smoltcp by stopping local reads,
-   which closes the local TCP receive window instead of dropping bytes.
-
-There is no separate unreliable datagram API in v1. Rebuilding reliable ordered
-delivery above an unreliable mode would duplicate the core flow machinery and
-create a larger, shallower module.
-
-## HOL statement, without overclaiming
-
-| Scope | Result |
-| --- | --- |
-| Separate QUICP sessions | No protocol ordering dependency; they can still contend for the same physical bottleneck. |
-| Different flows on one QUICP session | No byte-order HOL between flows. Loss on flow A does not require flow B to wait for A's missing offset. |
-| One QUICP flow | Ordered delivery remains; a missing range blocks later bytes on that flow. |
-| QUICP session resources | Congestion control, session flow control, CPU, and socket buffers are shared. This is shared-resource coupling, not byte-order HOL. |
-| Local and origin TCP legs | Each TCP flow retains normal TCP ordering/HOL. |
-
-V1 uses one QUICP session per gateway because it amortizes setup and gives the
-one-active-flow-per-local-flow mapping maximum leverage. That session has one
-path in `off` mode or two QUICP paths in `failover`; an independent session pool
-is deferred.
-
-## Early-open and replay boundary
-
-Transport 0-RTT is not admitted by the current QUICP profile. The TFO-style
-carrier may place the backend handshake datagram in a TCP-shaped SYN, but no
-application `OPEN`, target hostname, DNS action, origin dial, or payload is
-accepted before the ordinary QUICP handshake and policy gate complete. A future
-early-open profile needs a separately reviewed resumption and replay contract;
-the current API deliberately exposes no placeholder switch for it.
-
-Before ordinary connection admission, only bounded handshake processing on path
-0 is allowed. Additional paths, flow parsing, DNS, origin connects, writes, and
-other external effects remain unavailable. A future transport 0-RTT profile must
-define remembered parameters, identity binding, replay behavior, capacity, and
-fallback as one reviewed contract rather than reusing the carrier cookie.
+The earlier stream-mapped design explored by this research was replaced before release. The
+normative DATAGRAM-first wire grammar, ordered-flow recovery, multipath, and replay-safe early-data
+rules are defined in [`docs/protocol.md`](../protocol.md) and ADR 0003. This research document is
+not an alternate wire specification.
 
 ## Errors and failure locality
 
@@ -389,8 +309,8 @@ fallback as one reviewed contract rather than reusing the carrier cookie.
 - No unbounded MPSC channel is allowed in the production path. This keeps
   `netstack-smoltcp` 0.2.4 prototype-only and requires the documented `noq`
   driver-channel patch.
-- One `OPEN` header and one status byte are the only application-protocol overhead
-  per flow. Stream payload has no per-chunk envelope.
+- `OPEN` and `STATUS` use the reliable control stream. Application bytes use source records over
+  DATAGRAM or `STREAM_DATA` reliable fallback; `docs/protocol.md` defines their exact overhead.
 - Expect extra copies and CPU versus kernel TCP because TUN, smoltcp, and the
   current backend all touch bytes. Optimize only after profiling; the first
   admission benchmark must

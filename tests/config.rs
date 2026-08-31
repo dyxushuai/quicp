@@ -4,20 +4,16 @@ use std::path::PathBuf;
 use quicp::load_config;
 use quicp::{
     CarrierConfig, ClientConfig, ClientTls, Config, ConfigError, CongestionControl,
-    MAX_FLOW_BUFFER_BYTES, MssMode, MtuConfig, Multipath, MultipathMode, PathCandidate, PmtuMode,
-    QuicpTransportConfig, ServerConfig, ServerTls, SynDataPolicy,
+    MAX_FLOW_BUFFER_BYTES, MAX_RECOVERY_MEMORY_BUDGET_BYTES, MssMode, MtuConfig, Multipath,
+    MultipathMode, PathCandidate, PmtuMode, QuicpTransportConfig, RecoveryConfig, RecoveryMode,
+    ServerConfig, ServerTls,
 };
 #[cfg(unix)]
 use quicp::{FourTuple, SynDataMode};
 
 const CLIENT_PREFIX: &str = r#"
 role = "client"
-
-[tls]
-server_name = "gateway.example.com"
-ca_cert = "/etc/quicp/ca.pem"
-client_cert = "/etc/quicp/client.pem"
-client_key = "/etc/quicp/client.key"
+allow_insecure = true
 
 [multipath]
 mode = "failover"
@@ -28,20 +24,18 @@ fn secure_tempdir() -> tempfile::TempDir {
     tempfile::tempdir_in(home).expect("trusted temporary directory")
 }
 
-fn candidate(name: &str, local: Ipv4Addr, remote: Ipv4Addr, port: u16) -> PathCandidate {
-    PathCandidate::new(name, IpAddr::V4(local), SocketAddr::from((remote, port))).unwrap()
+fn candidate(local: Ipv4Addr, remote: Ipv4Addr, port: u16) -> PathCandidate {
+    PathCandidate::new(IpAddr::V4(local), SocketAddr::from((remote, port))).unwrap()
 }
 
 #[test]
 fn programmatic_configuration_uses_the_same_validation_rules() {
     let primary = candidate(
-        "primary",
         Ipv4Addr::new(192, 0, 2, 10),
         Ipv4Addr::new(203, 0, 113, 10),
         4433,
     );
     let backup = candidate(
-        "backup",
         Ipv4Addr::new(192, 0, 2, 11),
         Ipv4Addr::new(203, 0, 113, 10),
         4433,
@@ -63,15 +57,6 @@ fn programmatic_configuration_uses_the_same_validation_rules() {
 
     assert!(matches!(
         PathCandidate::new(
-            "",
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
-        ),
-        Err(ConfigError::UnusableCandidateAddress { .. })
-    ));
-    assert!(matches!(
-        PathCandidate::new(
-            "mixed",
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::from((Ipv6Addr::LOCALHOST, 4433)),
         ),
@@ -79,7 +64,6 @@ fn programmatic_configuration_uses_the_same_validation_rules() {
     ));
     assert!(matches!(
         PathCandidate::new(
-            "zero-port",
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         ),
@@ -87,7 +71,6 @@ fn programmatic_configuration_uses_the_same_validation_rules() {
     ));
     assert!(matches!(
         PathCandidate::new(
-            "unspecified",
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
         ),
@@ -95,10 +78,9 @@ fn programmatic_configuration_uses_the_same_validation_rules() {
     ));
     assert!(matches!(
         Multipath::failover(primary.clone(), primary),
-        Err(ConfigError::DuplicateCandidateName(_))
+        Err(ConfigError::DuplicateCandidateTuple { .. })
     ));
     let tuple_duplicate = candidate(
-        "different-name",
         Ipv4Addr::new(192, 0, 2, 10),
         Ipv4Addr::new(203, 0, 113, 10),
         4433,
@@ -106,7 +88,6 @@ fn programmatic_configuration_uses_the_same_validation_rules() {
     assert!(matches!(
         Multipath::failover(
             candidate(
-                "primary",
                 Ipv4Addr::new(192, 0, 2, 10),
                 Ipv4Addr::new(203, 0, 113, 10),
                 4433,
@@ -124,7 +105,6 @@ fn programmatic_configuration_uses_the_same_validation_rules() {
 #[test]
 fn transport_policy_exposes_explicit_mtu_units_and_validation() {
     let primary = candidate(
-        "primary",
         Ipv4Addr::new(192, 0, 2, 10),
         Ipv4Addr::new(203, 0, 113, 10),
         4433,
@@ -157,7 +137,7 @@ fn transport_policy_exposes_explicit_mtu_units_and_validation() {
         ..QuicpTransportConfig::default()
     };
     assert!(matches!(
-        client.with_transport(invalid),
+        client.clone().with_transport(invalid),
         Err(ConfigError::InvalidOuterMtu(1200))
     ));
 
@@ -166,9 +146,32 @@ fn transport_policy_exposes_explicit_mtu_units_and_validation() {
         ..QuicpTransportConfig::default()
     };
     assert!(matches!(
-        configured.with_transport(oversized_flow_buffer),
+        configured.clone().with_transport(oversized_flow_buffer),
         Err(ConfigError::InvalidTransportBuffer {
             name: "flow_write_buffer_bytes",
+            ..
+        })
+    ));
+
+    let zero_recovery_budget = QuicpTransportConfig {
+        recovery_memory_budget_bytes: 0,
+        ..QuicpTransportConfig::default()
+    };
+    assert!(matches!(
+        configured.with_transport(zero_recovery_budget),
+        Err(ConfigError::ZeroTransportValue(
+            "recovery_memory_budget_bytes"
+        ))
+    ));
+
+    let oversized_recovery_budget = QuicpTransportConfig {
+        recovery_memory_budget_bytes: MAX_RECOVERY_MEMORY_BUDGET_BYTES + 1,
+        ..QuicpTransportConfig::default()
+    };
+    assert!(matches!(
+        client.with_transport(oversized_recovery_budget),
+        Err(ConfigError::InvalidTransportBuffer {
+            name: "recovery_memory_budget_bytes",
             ..
         })
     ));
@@ -185,7 +188,6 @@ allow_insecure = true
 mode = "off"
 
 [[multipath.candidates]]
-name = "primary"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 
@@ -223,11 +225,7 @@ fn tls_and_carrier_programmatic_constructors_validate_paths() {
         Err(ConfigError::TlsPathNotAbsolute(_))
     ));
     assert!(matches!(
-        CarrierConfig::new(
-            SynDataPolicy::Cookie,
-            "relative.secret",
-            CongestionControl::Cubic,
-        ),
+        CarrierConfig::new("relative.secret"),
         Err(ConfigError::CookieSecretPathNotAbsolute(_))
     ));
 
@@ -240,7 +238,6 @@ fn tls_and_carrier_programmatic_constructors_validate_paths() {
     .unwrap();
     let server_tls = ServerTls::new(absolute.clone(), absolute.clone(), absolute).unwrap();
     let primary = candidate(
-        "primary",
         Ipv4Addr::new(192, 0, 2, 10),
         Ipv4Addr::new(203, 0, 113, 10),
         4433,
@@ -249,16 +246,22 @@ fn tls_and_carrier_programmatic_constructors_validate_paths() {
         client_tls,
         Multipath::single(primary).unwrap(),
         CarrierConfig::default(),
-    )
-    .unwrap();
+    );
     let server = ServerConfig::with_tls(
         vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4433))],
         server_tls,
         CarrierConfig::default(),
-    )
-    .unwrap();
-    assert!(!client.allow_insecure());
-    assert!(!server.allow_insecure());
+    );
+    #[cfg(feature = "tls-rustls")]
+    {
+        assert!(!client.unwrap().allow_insecure());
+        assert!(!server.unwrap().allow_insecure());
+    }
+    #[cfg(not(feature = "tls-rustls"))]
+    {
+        assert!(matches!(client, Err(ConfigError::TlsFeatureDisabled)));
+        assert!(matches!(server, Err(ConfigError::TlsFeatureDisabled)));
+    }
 }
 
 #[test]
@@ -267,12 +270,10 @@ fn parses_failover_client_with_exactly_two_paths() {
         "{CLIENT_PREFIX}{}",
         r#"
 [[multipath.candidates]]
-name = "wifi"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 
 [[multipath.candidates]]
-name = "cellular"
 local_ip = "192.0.2.11"
 server_addr = "203.0.113.10:4433"
 "#
@@ -312,7 +313,6 @@ allow_insecure = true
 mode = "off"
 
 [[multipath.candidates]]
-name = "primary"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 "#;
@@ -326,7 +326,6 @@ fn rejects_wrong_candidate_count_for_mode() {
         "{CLIENT_PREFIX}{}",
         r#"
 [[multipath.candidates]]
-name = "wifi"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 "#
@@ -343,17 +342,15 @@ server_addr = "203.0.113.10:4433"
 }
 
 #[test]
-fn rejects_duplicate_candidate_names_and_tuples() {
+fn rejects_duplicate_candidate_tuples() {
     let input = format!(
         "{CLIENT_PREFIX}{}",
         r#"
 [[multipath.candidates]]
-name = "same"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 
 [[multipath.candidates]]
-name = "same"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 "#
@@ -361,7 +358,7 @@ server_addr = "203.0.113.10:4433"
 
     assert!(matches!(
         Config::parse(&input),
-        Err(ConfigError::DuplicateCandidateName(name)) if name == "same"
+        Err(ConfigError::DuplicateCandidateTuple { .. })
     ));
 }
 
@@ -370,11 +367,7 @@ fn parses_server_listen_allowlist() {
     let input = r#"
 role = "server"
 listen_addrs = ["0.0.0.0:4433", "[::]:4433"]
-
-[tls]
-server_cert = "/etc/quicp/server.pem"
-server_key = "/etc/quicp/server.key"
-client_ca = "/etc/quicp/client-ca.pem"
+allow_insecure = true
 "#;
 
     let config = Config::parse(input).expect("valid server config");
@@ -394,6 +387,8 @@ allow_insecure = true
 
 [carrier]
 packet_socket = true
+
+[transport]
 congestion_control = "new-reno"
 "#,
     )
@@ -402,13 +397,13 @@ congestion_control = "new-reno"
     assert!(server.tls().is_none());
     assert!(server.carrier().packet_socket());
     assert_eq!(
-        server.carrier().congestion_control(),
+        server.transport().congestion_control,
         CongestionControl::NewReno
     );
 }
 
 #[test]
-fn carrier_defaults_to_cubic_congestion_control() {
+fn transport_defaults_to_cubic_congestion_control() {
     let config = Config::parse(
         r#"
 role = "server"
@@ -421,10 +416,60 @@ allow_insecure = true
         config
             .server()
             .expect("server")
-            .carrier()
-            .congestion_control(),
+            .transport()
+            .congestion_control,
         CongestionControl::Cubic
     );
+    assert_eq!(
+        config.server().expect("server").transport().recovery.mode,
+        RecoveryMode::Adaptive
+    );
+}
+
+#[test]
+fn parses_and_validates_recovery_policy() {
+    let config = Config::parse(
+        r#"
+role = "server"
+listen_addrs = ["127.0.0.1:4433"]
+allow_insecure = true
+
+[transport.recovery]
+mode = "reliable-only"
+max_repair_span = 32
+decoder_window = 512
+max_ack_ranges = 8
+replay_buffer_bytes = 65536
+reassembly_buffer_bytes = 65536
+pre_open_symbols = 8
+work_budget = 64
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.server().unwrap().transport().recovery.mode,
+        RecoveryMode::ReliableOnly
+    );
+
+    let invalid = QuicpTransportConfig {
+        recovery: RecoveryConfig {
+            max_repair_span: 257,
+            ..RecoveryConfig::default()
+        },
+        ..QuicpTransportConfig::default()
+    };
+    let server = ServerConfig::insecure(
+        vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4433))],
+        CarrierConfig::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        server.with_transport(invalid),
+        Err(ConfigError::InvalidRecoveryLimit {
+            name: "max_repair_span",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -456,7 +501,6 @@ client_key = "/etc/quicp/client.key"
 mode = "off"
 
 [[multipath.candidates]]
-name = "primary"
 local_ip = "192.0.2.10"
 server_addr = "203.0.113.10:4433"
 "#;
@@ -497,11 +541,7 @@ fn loads_an_owner_checked_config_snapshot() {
         r#"
 role = "server"
 listen_addrs = ["127.0.0.1:4433"]
-
-[tls]
-server_cert = "/etc/quicp/server.pem"
-server_key = "/etc/quicp/server.key"
-client_ca = "/etc/quicp/client-ca.pem"
+allow_insecure = true
 "#,
     )
     .expect("config");
@@ -545,19 +585,18 @@ fn carrier_cookie_secret_is_owner_checked() {
     std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
         .expect("secret permissions");
 
-    let carrier =
-        CarrierConfig::new(SynDataPolicy::Cookie, secret_path, CongestionControl::Cubic).unwrap();
+    let carrier = CarrierConfig::new(secret_path).unwrap();
     let secret = carrier.load_cookie_secret().expect("cookie secret");
     let tuple = FourTuple::new(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000)),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
     );
     assert!(matches!(
-        carrier.syn_data_mode(&secret, tuple, 1),
+        carrier.syn_cookie_mode(&secret, tuple, 1),
         SynDataMode::Cookie(_)
     ));
     assert_eq!(
-        carrier.syn_data_mode(&secret, tuple, 1),
-        carrier.syn_data_mode(&secret, tuple.reverse(), 1)
+        carrier.syn_cookie_mode(&secret, tuple, 1),
+        carrier.syn_cookie_mode(&secret, tuple.reverse(), 1)
     );
 }

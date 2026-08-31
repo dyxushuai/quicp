@@ -4,49 +4,22 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
-autotests = false
-autoexamples = false
-autobenches = false
 description = "A QUIC-based TCP alternative over a FakeTCP carrier"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/dyxushuai/quicp"
 documentation = "https://github.com/dyxushuai/quicp#documentation"
-include = [
-    "Cargo.lock",
-    "Cargo.toml",
-    "README.md",
-    "CONTEXT.md",
-    "CHANGELOG.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE",
-    ".github/**",
-    "benches/**",
-    "deny.toml",
-    "docs/**",
-    "examples/**",
-    "include/**",
-    "sdk/README.md",
-    "sdk/android/CMakeLists.txt",
-    "sdk/android/examples/**",
-    "sdk/android/src/**",
-    "sdk/apple/Examples/**",
-    "sdk/apple/Package.swift",
-    "sdk/apple/Sources/**",
-    "sdk/apple/Tests/**",
-    "sdk/apple/build-xcframework.sh",
-    "sdk/apple/CQuicp/**",
-    "src/**",
-    "tests/**",
-]
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
 
+# Rust 1.88 cannot load proc-macro metadata stripped by current Apple toolchains.
+[profile.release.build-override]
+strip = "none"
+
 [features]
-ffi-c = ["platform-smoltcp"]
-platform-smoltcp = ["dep:managed", "dep:smoltcp"]
+ffi-c = []
+platform-smoltcp = ["dep:smoltcp"]
 runtime-tokio = [
     "dep:libc",
     "dep:socket2",
@@ -54,9 +27,6 @@ runtime-tokio = [
     "noq/runtime-tokio",
 ]
 tls-rustls = ["noq/rustls-ring"]
-# Repository-only raw benchmark/test access. The stable facade uses HostDatagramSocket/HostRuntime
-# and never exposes backend types; this is not a backend-selection feature.
-internal-bench = []
 
 [package.metadata.docs.rs]
 features = ["runtime-tokio", "tls-rustls", "platform-smoltcp", "ffi-c"]
@@ -64,8 +34,7 @@ features = ["runtime-tokio", "tls-rustls", "platform-smoltcp", "ffi-c"]
 [dependencies]
 crc32c = "0.6"
 futures-core = "0.3"
-managed = { version = "0.8.0", default-features = false, features = ["std"], optional = true }
-# Temporary QUIC backend for the prototype; it is not the QUICP wire contract.
+# Pinned QUIC substrate; QUICP framing and recovery remain in this crate.
 noq = { version = "=1.1.1", default-features = false, features = ["ring"] }
 # The backend's crypto seam exposes transport parameters through this protocol crate.
 noq-proto = { version = "=1.1.1", default-features = false, features = ["ring"] }
@@ -73,13 +42,12 @@ bytes = { version = "1", default-features = false, features = ["std"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
-smoltcp = { version = "0.12.0", default-features = false, optional = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-raw", "async"] }
-subtle = { version = "2.6.1", default-features = false }
+smoltcp = { version = "0.12.0", default-features = false, optional = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "async"] }
 thiserror = { version = "2.0", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", optional = true, features = ["io-util", "macros", "net", "rt", "time"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = { version = "0.2", optional = true }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
@@ -88,7 +56,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
@@ -100,7 +71,7 @@ tempfile = "3.20"
 [[bench]]
 name = "loopback"
 harness = false
-required-features = ["runtime-tokio", "internal-bench"]
+required-features = ["runtime-tokio"]
 
 [[bench]]
 name = "carrier_encode"
@@ -111,45 +82,20 @@ name = "carrier_decode"
 harness = false
 
 [[example]]
-name = "header_protection"
-
-[[example]]
-name = "echo"
-
-[[example]]
-name = "host_loopback"
-
-[[example]]
-name = "multipath"
-
-[[example]]
-name = "queqiao_plugin"
-
-[[example]]
 name = "smoltcp_bridge"
 required-features = ["platform-smoltcp"]
-
-[[example]]
-name = "zero_rtt"
 
 [[example]]
 name = "socks5_tunnel"
 required-features = ["runtime-tokio"]
 
 [[test]]
-name = "config"
-
-[[test]]
-name = "faketcp"
-
-[[test]]
 name = "flow"
+required-features = ["runtime-tokio"]
 
 [[test]]
-name = "host_carrier"
-
-[[test]]
-name = "host_runtime"
+name = "ffi"
+required-features = ["ffi-c"]
 
 [[test]]
 name = "platform"
@@ -160,23 +106,12 @@ name = "smolstack"
 required-features = ["platform-smoltcp"]
 
 [[test]]
-name = "public_api"
-
-[[test]]
 name = "raw_faketcp_multipath"
-
-[[test]]
-name = "windows_windivert"
-required-features = ["runtime-tokio", "internal-bench"]
-
-[[test]]
-name = "session"
-
-[[test]]
-name = "wire"
+required-features = ["runtime-tokio"]
 
 [lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]
 all = "deny"

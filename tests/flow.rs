@@ -1,10 +1,7 @@
-#[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-#[cfg(feature = "runtime-tokio")]
 use quicp::flow::relay_bidirectional;
 
-#[cfg(feature = "runtime-tokio")]
 #[tokio::test]
 async fn relay_preserves_bounded_bidirectional_flow() {
     let (mut left_app, mut left_flow) = duplex(32);

@@ -1,5 +1,7 @@
 # QUICP examples
 
+These examples implement the [normative QUICP/2 protocol](../docs/protocol.md).
+
 Use the example that matches the layer you are integrating:
 
 The real ISP-facing carrier example is `socks5_tunnel.rs` on Linux. The host, smoltcp, Apple, and
@@ -9,12 +11,10 @@ interface.
 | Scenario | Entry point | Run or inspect |
 | --- | --- | --- |
 | Runtime-neutral QUICP echo flow | `echo.rs` | `cargo run --locked --example echo` |
-| Host carrier and bounded event loop | `host_loopback.rs` | `cargo run --locked --example host_loopback` |
 | SOCKS5 client/server tunnel | `socks5_tunnel.rs` | `cargo build --locked --example socks5_tunnel --features runtime-tokio` |
-| Primary/backup multipath policy | `multipath.rs` | `cargo run --locked --example multipath` |
-| Queqiao plugin and congestion policy | `queqiao_plugin.rs` | `cargo run --locked --example queqiao_plugin` |
+| Primary/backup flow failover | `multipath.rs` | `cargo run --locked --example multipath` |
 | Custom QUICP header protection | `header_protection.rs` | `cargo run --locked --example header_protection` |
-| SYN data / TFO first-packet boundary | `zero_rtt.rs` | `cargo run --locked --example zero_rtt` |
+| Replay-safe application 0-RTT | `zero_rtt.rs` | `cargo run --locked --example zero_rtt` |
 | smoltcp/TUN packet seam | `smoltcp_bridge.rs` | `cargo run --locked --example smoltcp_bridge --features platform-smoltcp` |
 | iOS/macOS Network Extension | `sdk/apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift` | Swift package and host entitlements required |
 | Android `VpnService` | `sdk/android/examples/io/quicp/QuicpVpnServiceExample.kt` | Android app, TUN permission, and JNI archive required |
@@ -35,14 +35,13 @@ interface.
   ```
   The cookie file must be shared by both roles and have owner-only permissions. This is a tunnel
   example, not a VPN, DNS service, or SOCKS5 authentication implementation.
-- `multipath.rs` validates the two-candidate policy. The portable fixed-peer host facade does not
-  silently emulate multipath; a raw Linux carrier or a platform adapter must bind one carrier
-  socket per candidate.
-- `zero_rtt.rs` demonstrates only cookie-protected SYN data carrying the backend handshake. QUICP
-  does not admit application 0-RTT, OPEN, DNS, origin dialing, or payload before normal admission.
+- `multipath.rs` binds two independent host-owned carriers, establishes one flow, marks the primary
+  path unavailable, and completes the same flow through the backup.
+- `zero_rtt.rs` issues a MAC-protected token on an established connection, reconnects through the
+  explicit replay-safe API, and verifies bounded initial bytes are delivered once.
 - `smoltcp_bridge.rs` demonstrates the packet ownership seam, not TUN creation. The platform owns
   TUN, FakeIP/DNS policy, underlay routing, permissions, and the event loop.
-- The Apple and Android examples are packet-bridge integration skeletons. They do not grant raw
+- The Apple and Android examples are host-underlay integration skeletons. They do not grant raw
   socket access or claim to be complete VPN implementations.
 
 The core does not own DNS, FakeIP allocation, Network Extension/VpnService permissions, or TUN

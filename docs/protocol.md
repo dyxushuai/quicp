@@ -1,714 +1,255 @@
-# QUICP/1: a custom multiplexed transport over a datagram-preserving FakeTCP carrier
+# QUICP/2: datagram-first recovery over FakeTCP
 
-Status: portable core profile (platform carrier adapters are deployment-gated)
+Status: normative protocol implemented by this repository.
 
-This is the normative implementation document for the current `QUICP/1` profile. The repository
-README is an integration overview; implementers should start with this document, then use the
-reference source map and conformance checklist below. A change to any wire value, profile token,
-or state transition requires a new profile token or protocol version.
+QUICP/2 is a TCP-like ordered-flow protocol carried by QUIC DATAGRAM and reliable control streams.
+It is not wire-compatible with QUICP/1. The exact profile token is `quicp/2`; no alternate
+multipath token exists. FakeTCP preserves datagram boundaries and never retransmits or orders data.
 
-## 1. Scope
+The words MUST, MUST NOT, SHOULD, and MAY are normative.
 
-QUICP is a private, QUIC-inspired multiplexed transport. It is not the IETF QUIC wire protocol,
-does not promise QUIC interoperability, and does not require TLS. Its baseline carries QUICP
-packets through TCP-shaped IP packets so an underlay that treats UDP as a separate, low-priority
-class sees a normal-looking TCP flow. The transport core does not require TUN, FakeIP, DNS, or a
-VPN; those are optional platform integrations. The carrier is not a TCP stream:
+## 1. Integer and frame encoding
 
-```text
-host-owned input -> QUICP packet -> carrier packet
+All integers use network byte order. `vint` is the canonical QUIC variable integer: the high two
+bits select a width of 1, 2, 4, or 8 bytes and the remaining 6, 14, 30, or 62 bits hold the value.
+An encoder MUST use the shortest width. A decoder MUST reject non-canonical, truncated, overflowing,
+or trailing input before mutating connection or flow state.
 
-optional transparent integration:
-application/TUN -> smoltcp -> QUICP packet -> raw IPv4/IPv6 TCP packet
-```
-
-## 0. Carrier tiers and deployment goal
-
-The primary deployment goal is a **Tier 0 wire FakeTCP carrier**: the ISP-facing interface MUST
-emit and receive TCP-shaped IP packets carrying QUICP datagrams. Tier 0 is the only profile that may
-claim ISP-level FakeTCP camouflage. It requires exact packet injection, tuple filtering, source-path
-selection, and narrowly scoped kernel-RST suppression; a platform that cannot prove those properties
-MUST reject the profile rather than silently fall back to UDP or an ordered TCP stream.
-
-Tier 1 TUN/TAP and Tier 2 Apple/Android packet bridges are integration layers, not replacements for
-the wire carrier. They provide virtual packet ingress/egress for smoltcp, transparent adapters, or a
-remote Tier 0 gateway. Their packets are not ISP-visible FakeTCP unless the complete deployment has a
-separately verified physical packet path.
-
-The protocol core is shared across tiers; packet I/O, privileges, RST suppression, and batching are
-platform-specific. Linux and macOS have explicit Unix raw IPv4 adapters. Windows uses the
-WinDivert signed WFP/WDF packet adapter. Linux `AF_PACKET`/`TPACKET_V2` is an optional performance
-path, not a different wire protocol; macOS remains probe-only until packet capture and narrowly
-scoped RST-suppression evidence is complete. Other targets fail closed instead of inheriting a
-different platform implementation.
-
-There is no UDP header inside the TCP packet and no ordered FakeTCP byte stream around QUICP. Every
-carrier payload is exactly one QUICP datagram (which may contain coalesced QUIC packets). A missing
-carrier sequence number does not block a later datagram; QUICP owns packet numbers, loss recovery,
-congestion control, stream ordering, and retransmission. Putting QUICP in a reliable FakeTCP stream
-would recreate transport head-of-line blocking and is explicitly forbidden.
-
-The QUICP core defaults to no encryption. An authenticated security adapter may be selected above
-the packet engine, but the no-security profile is the performance and protocol baseline. The
-current adapter is mutual TLS; PSK is not implemented or admitted. Rust callers may additionally
-install a `QuicpHeaderProtection` factory through
-`TransportOptions`; this protects only the backend QUICP packet-header bits and leaves the
-FakeTCP/IP headers and QUICP payload unchanged. It is not an authenticity boundary. The current
-`noq`/rustls integration is a temporary backend adapter and must not be mistaken for the QUICP
-wire contract.
-
-This is an evasion-oriented transport experiment, not a claim of indistinguishability or of
-guaranteed ISP acceptance. A deployment must test real NATs, middleboxes, reset injection, packet
-capture, and the target ISP before enabling it.
-
-## 1.1 Normative language and implementation boundary
-
-The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative. A conforming
-implementation has three independently testable layers:
-
-| Layer | Contract | Owner of loss and ordering |
-| --- | --- | --- |
-| QUICP packet engine | QUIC v1 packet grammar, packet-number spaces, flow control, recovery, and streams; the current reference backend is vendored `noq` | QUICP/QUIC engine |
-| FakeTCP carrier | One raw IPv4/IPv6 TCP-shaped packet per QUICP datagram; no byte-stream reassembly | QUICP packet engine, not the carrier |
-| Flow protocol | Client-initiated bidirectional stream with `OPEN` followed by one-byte `STATUS` | Each independent QUICP stream |
-
-The carrier MUST NOT buffer, reorder, retransmit, or wait for a missing carrier sequence number.
-The QUICP packet engine MUST treat each carrier payload as an independent datagram and perform its
-own duplicate detection, loss recovery, and stream ordering. An implementation that inserts the
-packet engine into a reliable FakeTCP byte stream is not `QUICP/1`.
-
-The reference source map is deliberately small:
-
-- `src/faketcp.rs` defines the portable raw-carrier fields, checksums, flags, options, and
-  sequence rules; `src/faketcp/unix.rs` contains the Unix/Tokio socket adapter.
-- `src/no_security.rs` defines the no-TLS `QPCS` handshake and plaintext packet-key behavior.
-- `src/session.rs` defines profile-token admission and application error codes.
-- `src/wire.rs` defines the `OPEN` request and `STATUS` values.
-- `src/multipath.rs` defines the bounded primary/backup path policy.
-
-The QUIC packet grammar and transport-parameter varints follow the QUIC v1 base documents
-([RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html) and
-[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)) as implemented by `vendor/noq-proto`.
-QUICP changes the security handshake, profile admission, carrier, and flow contract; it does not
-claim interoperability with a general-purpose QUIC endpoint.
-
-## 1.2 Version and profile selection
-
-The profile token is an exact byte string and is selected before application flows are accepted:
-
-| Token | Security negotiation | Multipath | Application 0-RTT |
-| --- | --- | --- | --- |
-| `quicp/1` | no-TLS `QPCS` or TLS 1.3 ALPN | disabled | MUST NOT be accepted |
-| `quicp/1-mp` | no-TLS `QPCS` or TLS 1.3 ALPN | primary plus one backup | MUST NOT be accepted |
-
-The client selects one token. The server may advertise both in TLS, but it MUST reject a token and
-transport-parameter combination that does not match its selected mode. Unknown tokens are a
-protocol error; they are not silently downgraded to `quicp/1`.
-
-For no-TLS, the QUICP handshake bytes carried in QUIC CRYPTO frames are:
+Reliable control-stream frames are:
 
 ```text
-offset  size  field
-0       4     magic = ASCII "QPCS"
-4       1     kind: 1 CLIENT_HELLO, 2 SERVER_HELLO, 3 CLIENT_CONFIRM
-5       1     profile_token_length, 1..=32
-6       2     transport_parameters_length, unsigned big-endian
-8       N     profile token bytes
-8+N     M     QUIC transport-parameter bytes
+type:u8 | length:vint | payload:length bytes
 ```
 
-The message length is exactly `8 + N + M`; trailing bytes are a protocol error. The state machine
-is `CLIENT_HELLO -> SERVER_HELLO -> CLIENT_CONFIRM`. A client MUST NOT open a flow before it has
-received and validated `SERVER_HELLO`; a server MUST NOT admit a flow before it has validated
-`CLIENT_CONFIRM`. The no-TLS profile has no AEAD tag, no payload encryption, and no early-data
-keys. A custom header protector, when both peers configure the same one, changes only backend
-header bits and is not a standardized interoperability profile.
+| Type | Name | Payload |
+| ---: | --- | --- |
+| `0x01` | `CAPABILITIES` | `flags:vint, max_symbol:u16, max_span:u16, decoder_window:u16, max_ack_ranges:u8` |
+| `0x02` | `OPEN` | `host_len:u8, canonical_host, port:u16` |
+| `0x03` | `STATUS` | `status:u8` |
+| `0x04` | `ACK` | `contiguous:vint, range_count:u8, (start:vint, end:vint)*` |
+| `0x05` | `MAX_OFFSET` | `maximum:vint` |
+| `0x06` | `FIN` | `final_offset:vint` |
+| `0x08` | `STREAM_DATA` | `offset:vint, flags:u8, bytes` |
+| `0x09` | `EARLY_OPEN` | `token_len:u8, token, nonce:u64, OPEN payload, initial bytes` |
 
-## 2. FakeTCP packet format
+Type `0x07` is reserved and MUST be rejected. Abortive flow termination uses QUIC `RESET_STREAM`
+with a QUICP application error code. Unknown frame types, nonzero reserved flags, duplicate
+`CAPABILITIES`, or a frame exceeding the negotiated control-frame limit are connection errors.
+Invalid flow offsets, credit, ACK, or FIN transitions reset only that flow.
 
-`FakeTcpPacket` emits a complete raw IPv4 or IPv6 packet with:
+`STATUS` is a closed one-byte set: `0x00` OK, `0x01` general failure, `0x02` policy denied,
+`0x03` resolution failure, `0x04` connection refused, `0x05` connection timeout, and `0x06`
+capacity exhausted. Other values are flow protocol errors.
 
-- TCP protocol number 6, valid IP and TCP checksums, and no fragmentation;
-- source/destination addresses and ports from one fixed four-tuple;
-- a stable per-path sequence space, ACK/window fields, and TCP flags;
-- SYN options for MSS, SACK-permitted, window scale, and an optional TFO-style cookie;
-- a payload containing exactly one QUICP datagram.
+## 2. Capabilities and bounds
 
-### 2.1 IP envelope
+`CAPABILITIES.flags` uses `0x01` for DATAGRAM, `0x02` for RLC repair, and `0x08` for replay-safe
+early data. Multipath is negotiated by QUIC transport parameters and is not repeated here. Other
+bits are invalid. Negotiated flags are the intersection of both peers' flags; each numeric limit is
+the minimum of the two advertised values. The resulting tuple is fixed for the connection, and a
+later incompatible tuple is a connection error. Adaptive mode requires DATAGRAM and RLC;
+reliable-only policy omits both and uses `STREAM_DATA`.
 
-The reference encoder emits no IP fragmentation and no IPv6 extension headers. All multi-byte
-fields are network byte order.
+| Limit | Protocol bound | Default |
+| --- | ---: | ---: |
+| source-symbol bytes | `64..=65527` | backend DATAGRAM ceiling minus the 17-byte repair header |
+| repair source span | `1..=256` | `64` |
+| decoder symbols | `512..=4096` | `512` |
+| ACK ranges per frame | `1..=32` | `16` |
+| replay bytes per flow | `1..=16 MiB` | `256 KiB` |
+| reassembly bytes per flow | `1..=16 MiB` | `256 KiB` |
+| recovery bytes per endpoint | `1..=1 GiB` local policy | `64 MiB` |
+| pre-OPEN symbols per connection | `0..=256` | `32` |
+| work quanta per DATAGRAM | `1..=4096` | `128` |
 
-| Field | IPv4 | IPv6 |
-| --- | --- | --- |
-| Version/header | `0x45` (20-byte header) | version 6 (40-byte header) |
-| Total/payload length | IPv4 total length equals the complete packet length | IPv6 payload length equals TCP header plus options plus payload |
-| Next protocol | `6` (TCP) | `6` (TCP) |
-| Fragmentation | flags `DF`, offset `0` | no extension-header fragmentation |
-| Lifetime | TTL `64` | hop limit `64` |
-| Address family | source and destination are IPv4 | source and destination are IPv6 |
+Ranges are half-open `[start,end)`, strictly increasing, non-overlapping, and above `contiguous`.
+All addition is checked in the 62-bit offset space. Declared counts never determine allocation;
+storage is preallocated or bounded by validated configuration.
+The endpoint-wide recovery budget is local and not negotiated. It accounts retained decoder,
+pre-OPEN, and flow-reassembly bytes across every connection created by that endpoint and releases
+credit as symbols expire, applications read, or flows close.
 
-Receivers MUST verify the IP length, protocol, address family, checksum (IPv4), and TCP checksum
-before inspecting QUICP bytes. A malformed packet is dropped without changing carrier or QUICP
-state.
+## 3. DATAGRAM encoding
 
-### 2.2 TCP-shaped envelope
-
-The 20-byte TCP base header is followed by zero or more options, padded to a 32-bit boundary, and
-then the QUICP datagram. The reference values are:
-
-| Field | `SYN` packet | ordinary packet |
-| --- | --- | --- |
-| source/destination port | fixed four-tuple | same four-tuple |
-| sequence | carrier send sequence | carrier send sequence |
-| acknowledgment | highest accepted carrier sequence plus consumed length | same monotonic ACK |
-| flags | client `SYN`, server `SYN|ACK` | `ACK|PSH` |
-| window | `65535` | `65535` |
-| urgent pointer | `0` | `0` |
-| checksum | TCP pseudo-header checksum | TCP pseudo-header checksum |
-
-`SYN` options are, in order, an MSS advertisement, SACK-permitted, window scale `7`, optional TCP
-Fast Open option kind `34` carrying the tuple-bound 16-byte cookie, and NOP padding. The default
-outer IP MTU is 1500 bytes, so automatic MSS is 1460 for IPv4 and 1440 for IPv6 (`outer MTU - IP
-header - TCP header`). `MtuConfig::mss` may select a validated fixed MSS; the value is a carrier
-hint only and never becomes QUICP stream flow control. Ordinary packets have no options in the
-reference encoder. A receiver MAY parse additional well-formed TCP options, but MUST ignore
-unknown options and MUST preserve the QUICP payload boundary.
-
-`MtuConfig` uses explicit units: `outer_ip_mtu` is the complete raw IP packet limit, while
-`initial_quic_payload`, `min_quic_payload`, `max_quic_payload`, and `pmtu_upper_bound` are QUICP
-datagram payload limits. Raw FakeTCP intersects the payload limit with the address-family header
-overhead and rejects an encoded packet that exceeds `outer_ip_mtu`; it never fragments a datagram.
-Host datagram carriers intersect their own adapter MTU. `PmtuMode::Auto` lets the carrier
-capability decide whether backend discovery runs, `Disabled` keeps the static ceiling, and
-`Required` rejects a carrier that may fragment.
-
-At the largest representable outer MTU (`65535` bytes), the raw payload ceiling is `65495` bytes
-for IPv4 and `65475` bytes for IPv6, before any backend-specific maximum. The sender MUST reject a
-larger datagram rather than fragment it. The carrier payload is opaque: it is not length-prefixed,
-encrypted, or wrapped in UDP.
-
-The first data packet is `SYN` (or server `SYN|ACK`) and may carry a QUICP datagram. Subsequent
-packets use `ACK|PSH`. The current carrier does not attempt to implement kernel TCP congestion
-control, stream reassembly, or MPTCP DSS. It only supplies TCP-shaped metadata and a per-path
-sequence bookkeeping; QUICP remains the authenticated protocol state machine and owns duplicate
-detection.
-
-The sender chooses a fresh random initial sequence (mixed with the tuple checksum) for every
-carrier state. `noq` may batch up to eight equal-MTU datagrams; the FakeTCP adapter expands those
-segments into independent TCP-shaped packets and, on Linux, submits the batch with `sendmmsg`
-when there is more than one packet; a single packet uses the bound socket's direct `send` path.
-The adapter retains its segment cursor across readiness polls. Sequence state is advanced when a
-segment is encoded, and the encoded batch remains owned until the OS accepts every packet. A
-changed four-tuple always creates a new carrier state; sequence state is never shared
-between paths. Sequence numbers wrap with TCP serial arithmetic; QUICP packet numbers and replay
-state remain independent of this carrier counter.
-
-For each direction, the carrier consumes one sequence number for `SYN` and one sequence number per
-payload byte for all packets. An ordinary packet therefore advances `seq` by `payload_length`; a
-SYN packet advances it by `1 + payload_length`. The receiver returns the monotonic serial-arithmetic
-ACK `seq + consumed`. These counters are local to a four-tuple and direction. They MUST NOT be
-used as QUICP packet numbers, replay windows, or application acknowledgments.
-
-## 3. Per-datagram payload
-
-The carrier adds no encryption, authentication tag, length prefix, or padding. The payload is the
-QUICP datagram itself; optional no-TLS header protection runs inside the backend packet codec and
-does not alter this framing:
+A source DATAGRAM is:
 
 ```text
-[QUICP datagram]
+0x20 | symbol_id:u32 | record_count:u8 |
+  (flow_id:vint | offset:vint | flags:u8 | length:vint | bytes:length)*
 ```
 
-### 3.1 QUICP datagram boundary
+Source flag `0x01` marks the record carrying the flow final offset. Other bits are invalid. Records
+MUST fit completely in one source symbol. A write may be split across symbols; delay-enabled writes
+may share a symbol. No-delay writes are emitted on the next bounded driver turn.
 
-The bytes above are the QUIC backend datagram. A datagram MAY contain one or more coalesced QUIC
-packets according to the QUIC v1 packet grammar; the FakeTCP carrier treats the entire datagram as
-one opaque payload and never splits or joins it. A receiver MUST pass the complete payload to its
-QUIC packet decoder and MUST NOT feed a partial carrier payload into the decoder.
-
-The reference transport profile uses these advertised limits and defaults:
-
-| Parameter | Value |
-| --- | ---: |
-| QUIC version | `1` |
-| maximum QUIC datagram payload | `65527` bytes, then bounded by `MtuConfig` and the carrier MTU |
-| connection send/receive window | `8 MiB` |
-| stream receive window | `128 KiB` |
-| locally initiated bidirectional streams | `128` |
-| unidirectional streams | `0` |
-| QUIC DATAGRAM send/receive | disabled |
-| ack-eliciting threshold | `10` packets |
-| maximum ACK delay | `1 ms` |
-| connection idle timeout | `60 s` |
-| path keep-alive interval | `5 s` |
-| path idle timeout | `15 s` |
-| per-flow write buffer | `32 KiB` (maximum `16 MiB`) |
-| pending-handshake buffer | `32 KiB` (maximum `1 MiB`) |
-
-The default raw-carrier envelope is therefore 1460 bytes of QUICP payload for an IPv4 path and
-1440 bytes for an IPv6 path at a 1500-byte outer MTU. Host and smoltcp adapters use their complete
-datagram/IP MTU as the adapter limit; they do not apply a fake TCP MSS conversion.
-
-These values are encoded with the standard QUIC transport-parameter varints. An implementation MAY
-choose lower local resource budgets, but it MUST advertise the resulting limits and MUST apply
-backpressure rather than silently drop stream bytes. It MUST NOT treat a transport parameter as a
-FakeTCP sequence number or as an application-flow status.
-
-The no-security profile intentionally has no payload confidentiality or authentication. An
-optional security adapter may add those properties above the packet engine. Header protection is
-an extensibility hook, not payload encryption or authentication. The carrier still
-returns packets immediately when an earlier sequence is absent. It does not reject packets from an
-unauthenticated TCP sequence number: QUICP packet numbers own duplicate and replay handling. The
-TCP checksum only detects accidental corruption; it is not an authenticity boundary.
-
-`FakeTcpCarrier` also exposes caller-buffer `encode_*_into` methods. The Unix raw sender reuses a
-growable batch buffer; the Windows WinDivert sender reuses one packet buffer per sender; Linux
-batches up to 10 encoded packets, removing per-packet user-space allocation;
-the kernel send remains an ordinary socket copy and is not claimed as zero-copy. Its
-`decode_datagram_borrowed` path validates the packet and returns a borrow of the caller's input;
-the Linux receiver drains bounded raw packets from the packet ring when `packet_socket = true`
-and decodes directly from each mapped frame (or uses `recvmmsg` and one reusable scratch buffer
-when the ring is unavailable), coalesces up to four equal-size decoded payloads into one backend
-receive segment, and copies only valid QUICP payloads into backend receive buffers.
-
-`crc32c` selects its hardware implementation when available. No handwritten `unsafe` SIMD checksum
-path is enabled while the crate forbids unsafe code; a benchmark must prove a remaining
-checksum/copy hotspot before adding a platform-specific implementation.
-
-The SYN cookie is an HMAC-SHA-256 truncation bound to the four-tuple and a rotating epoch. It is a
-stateless SYN admission check, not a QUICP security key or a replacement for an optional security
-adapter.
-
-## 4. SYN data and fallback
-
-SYN data is a TFO-style carrier optimization. It is enabled only with a valid tuple-bound cookie.
-The raw adapter places the first backend handshake datagram in the SYN; it does not admit an
-application `OPEN` before the QUICP handshake. This removes a separate carrier setup round trip but
-is not QUIC or QUICP transport 0-RTT. Origin DNS, dialing, and application bytes remain blocked
-until ordinary QUICP admission completes.
-
-Cookie rejection, a middlebox that drops SYN data, or a disabled policy must fall back to an empty
-SYN/ordinary first QUICP packet in a future adapter revision. The application must never resend
-origin bytes merely because SYN data was lost. The current raw adapter is admitted only with
-`syn_data = "cookie"`; `disabled` is retained for packet/carrier tests and for a future explicit
-SYN-probe handshake.
-
-The repository includes a Linux-only raw-carrier comparison:
+A repair DATAGRAM is:
 
 ```text
-cargo bench --bench loopback --features runtime-tokio,internal-bench -- --quiet
+0x21 | repair_id:u32 | first_symbol_id:u32 | span:u16 |
+symbol_size:u16 | seed:u32 | coded_bytes:symbol_size
 ```
 
-The benchmark defaults to `QuicpFlow` no-delay mode. Set `QUICP_NODELAY=false` to measure the
-bounded write buffer; the TCP control remains `TCP_NODELAY` enabled in both runs.
+`span` is `1..=256`. Source identifiers use wrapping 32-bit serial arithmetic; a repair window MUST
+not cross an ambiguity distance of `2^31`. `symbol_size` is the largest encoded source in the
+window; shorter sources are zero-padded. Decoded trailing zero padding is removed using each source
+record's canonical encoded lengths.
 
-It measures a complete no-TLS `QuicpFlow` over `FakeTcpSocket` against one ordinary kernel TCP
-stream at the same application payload boundary. Both timers cover client transmission and server
-reception after the respective connection and QUICP flow are established. The raw carrier requires
-`CAP_NET_RAW`; non-Linux hosts skip this bench rather than report an in-memory codec result.
-Each payload runs five interleaved QUICP/TCP samples and reports nearest-rank median, p95, and p99
-nanoseconds per payload plus median Gbps. CPU, RSS, allocator, retransmission, and drop counters
-remain host-level release evidence and are not fabricated by this process.
-The checked-in Linux loopback profile enables `carrier.packet_socket = true`, so the measured
-QUICP path uses the filtered AF_PACKET fast path; set it to `false` when comparing the IP-raw
-adapter itself.
-Linux loopback runs must suppress only the benchmark tuple's kernel-generated TCP RSTs; use a
-temporary raw-table rule and remove it immediately after the run:
+Malformed source or repair DATAGRAMs are dropped and counted before decoder mutation. A valid frame
+that exceeds a negotiated shared-resource bound closes the connection.
 
-```sh
-sudo iptables -t raw -I OUTPUT -p tcp --sport 40000:40999 --dport 44000:44999 --tcp-flags RST RST -j DROP
-sudo iptables -t raw -I OUTPUT -p tcp --sport 44000:44999 --dport 40000:40999 --tcp-flags RST RST -j DROP
-trap 'sudo iptables -t raw -D OUTPUT -p tcp --sport 40000:40999 --dport 44000:44999 --tcp-flags RST RST -j DROP; sudo iptables -t raw -D OUTPUT -p tcp --sport 44000:44999 --dport 40000:40999 --tcp-flags RST RST -j DROP' EXIT
-cargo bench --bench loopback --features runtime-tokio,internal-bench -- --quiet
-```
+## 4. Coding arithmetic
 
-Do not replace these rules with a global RST drop in a shared host or deployment.
-The allocation-only carrier checks are separate and use the same payload sizes:
-`cargo bench --bench carrier_encode` and `cargo bench --bench carrier_decode`; their
-`*_payload_gbps` columns are codec-only payload rates, not wire throughput.
+Coding uses GF(256), primitive polynomial `x^8 + x^4 + x^3 + x^2 + 1` (`0x11d`) and generator
+`0x02`. Addition is XOR. Multiplication and inversion follow polynomial reduction by `0x11d`.
 
-The raw comparison intentionally excludes TUN, FakeIP, and smoltcp, but includes the selected raw
-FakeTCP adapter path (including its packet-ring receive path). The TCP control is part of the same
-`loopback` benchmark, so it shares the process, payload boundary, connection state, and timer
-definition. TUN/FakeIP remains an optional integration profile and must not be mixed into the raw
-protocol comparison.
+For source ordinal `i` in a repair window, coefficient generation starts from
+`x = seed ^ (repair_id * 0x9e3779b9) ^ (symbol_id(first + i) * 0x85ebca6b)`, with multiplication
+modulo `2^32`. Mix `x` with `x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15;
+x *= 0x846ca68b; x ^= x >> 16`, again modulo `2^32`, and use its low byte, replacing zero with one.
+Repair bytes are the XOR of each
+zero-padded source multiplied by its coefficient. Elimination selects the lowest source identifier
+as pivot and normalizes the pivot to one. The exact vectors in `tests/vectors/quicp2.txt` are
+normative.
 
-## 5. QUICP security profiles
+The decoder retains at most the negotiated window and row count. Each received DATAGRAM gets the
+configured work quanta multiplied by the negotiated symbol-byte ceiling; exhausting that fixed
+local budget rejects the repair without state mutation. An underdetermined matrix stays pending;
+it never fabricates data.
 
-Security is optional and outside the QUICP packet engine. The default `none` profile adds no
-encryption or authentication, so its packets are suitable for transport-only benchmarking. The
-optional `tls` profile uses mutual TLS 1.3 and is the only authenticated profile currently
-implemented. PSK is not a selectable profile. Security profile negotiation uses
-the QUICP profile token; ALPN is only an adapter encoding when the TLS backend is selected.
+## 5. Reliability and flow state
 
-The current `noq` integration exposes the no-TLS baseline plus the optional `tls` adapter. The
-no-TLS path still uses the backend state machine, but its packet bytes carry no backend encryption:
+Each flow keeps one reliable bidirectional stream. The opener sends `CAPABILITIES`, then `OPEN`; the
+peer replies with identical negotiated capabilities and `STATUS`. Payload is not exposed before
+`STATUS OK`.
 
-Omit the `[tls]` table and set `allow_insecure = true` in a client/server config to select this
-explicitly unauthenticated profile; adding the table
-selects the existing mutual-TLS adapter.
+The sender retains accepted bytes until a logical `ACK` covers them. A replay keeps the original
+flow offset and uses a new source symbol identifier. The receiver accepts identical overlapping
+bytes while retaining only uncovered ranges, rejects contradictory overlap, and exposes only the
+contiguous prefix. `FIN` carries the final
+offset; EOF is visible only when all lower bytes are contiguous. `MAX_OFFSET` may increase but never
+decrease. Residual gaps are selectively replayed, then sent as `STREAM_DATA` after repeated recovery
+failure. QUIC packet ACKs continue to own RTT, congestion, pacing, packet loss, and path validation.
 
-| QUICP profile | Profile token | Multipath transport | Transport 0-RTT |
-| --- | --- | --- | --- |
-| single path | `quicp/1` | disabled | not admitted |
-| failover | `quicp/1-mp` | negotiated, at most two paths | not admitted |
+Adaptive repair is sender-local policy, not wire negotiation. It emits no repair without new
+outbound loss. When loss is observed, the bounded repair budget combines outbound packet loss and
+transmission deltas with logical byte delivery, consecutive loss turns, and prior replay cost. The
+budget never exceeds the outstanding source count or negotiated repair span. A remaining gap is
+replayed once and then moved to reliable `STREAM_DATA`; reliable-only mode skips DATAGRAM entirely.
+Snapshots expose loss, maximum current path RTT, queued DATAGRAMs, and retained coding-window bytes
+alongside delivery counters without adding callbacks to the hot path.
 
-The endpoint rejects a profile-token/transport mismatch before accepting an application flow.
-Neither the no-security baseline nor the optional TLS adapter exposes application early data.
+One directional coding window spans all validated paths. `noq` chooses the packet path. FakeTCP
+sequence state remains independent per four-tuple and is never used as a QUICP ACK or symbol ID.
 
-### 5.1 Application flow wire format
+## 6. Replay-safe early data
 
-After connection admission, the client opens one QUIC bidirectional stream per application flow.
-Unidirectional streams and QUIC DATAGRAM frames are not part of the `QUICP/1` flow profile. The
-stream bytes are:
+Ordinary OPEN and writes are not replay-safe. `EARLY_OPEN` is allowed only through the explicit
+replay-safe API and contains bounded initial bytes. Its token is a server-issued MAC over profile,
+capabilities, server epoch, expiry, and token identity using a secret distinct from the FakeTCP
+cookie. The server admits a `(token identity, nonce)` once in a bounded process-local cache and
+rejects bad MAC, expiry, capability mismatch, duplicate nonce, or cache exhaustion before invoking
+the origin. Transport-level 0-RTT unavailability or rejection falls back once to ordinary 1-RTT
+OPEN; token or replay rejection fails closed and does not retry the origin action. QUICP does not
+claim cross-process, cross-restart, or cross-connection exactly-once effects. When multipath is
+required, an accepted early action can reach the server before post-handshake backup-path
+validation; a later client error is therefore delivery-ambiguous.
+
+TLS and no-security implement the same flow contract. No-security is unencrypted and
+unauthenticated; a valid bearer token does not authenticate the client. Header protection, FEC,
+checksums, and FakeTCP cookies are not authenticity boundaries.
+
+The no-security backend handshake carried by QUIC CRYPTO frames is exactly:
 
 ```text
-client -> server: OPEN = host_length:u8 || host:host_length bytes || port:u16be
-server -> client: STATUS = status:u8
-both directions: application bytes, only after STATUS == 0x00
+magic:"QPCS" | kind:u8 | profile_len:u8 | params_len:u16 | profile | QUIC transport parameters
 ```
 
-`host` MUST be lowercase ASCII DNS text with at least two labels, no trailing dot, no IP literal,
-and each label in `[a-z0-9-]` with a maximum length of 63 bytes. The complete hostname is at most
-253 bytes; the one-byte wire length therefore caps an `OPEN` request at 255 host bytes. `port` MUST
-be nonzero. The receiver reads exactly one length byte, then exactly `host_length + 2` bytes; any
-invalid value is a flow protocol error and MUST reset the stream with application error `0x100`.
+`kind` is `1` CLIENT_HELLO, `2` SERVER_HELLO, or `3` CLIENT_CONFIRM. `profile_len` is `1..=32`,
+`params_len` is network byte order, and the complete message length is `8 + profile_len +
+params_len`; trailing bytes are invalid. The state order is CLIENT_HELLO, SERVER_HELLO,
+CLIENT_CONFIRM. Every message carries the exact `quicp/2` profile. The TLS profile uses TLS 1.3
+with ALPN `quicp/2`; it does not change QUICP/2 flow or DATAGRAM framing.
 
-The server sends exactly one status byte. It MUST send `0x00` before forwarding or accepting
-application bytes. A nonzero status is terminal and the server MUST finish the stream without
-exposing application payload. The assigned status values are:
-
-| Byte | Name | Meaning |
-| --- | --- | --- |
-| `0x00` | `OK` | destination flow is ready |
-| `0x01` | `GENERAL_FAILURE` | unspecified destination failure |
-| `0x02` | `POLICY_DENIED` | current policy rejected the destination |
-| `0x03` | `RESOLUTION_FAILURE` | destination name could not be resolved |
-| `0x04` | `CONNECTION_REFUSED` | origin refused the connection |
-| `0x05` | `CONNECTION_TIMEOUT` | origin connection timed out |
-| `0x06` | `CAPACITY_EXHAUSTED` | a bounded flow or connection limit was reached |
-
-Values `0x07..=0xff` are unknown and MUST be treated as `FLOW_PROTOCOL` rather than mapped to a
-success or a retryable status. The stable stream/connection application error codes are QUIC
-varints: `0x100` `FLOW_PROTOCOL`, `0x101` `FLOW_ABORT`, `0x102` `FLOW_REJECTED`, `0x103`
-`MULTIPATH_REQUIRED`, and `0x104` `MULTIPATH_CHURN`. Unknown peer error codes map to
-`FLOW_PROTOCOL` for diagnostics.
-
-For the reference vector `OPEN("www.example.com", 443)`, the bytes are:
+A replay token is exactly 73 bytes:
 
 ```text
-0f 77 77 77 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d 01 bb
+version:u8=1 | epoch:u64 | expiry_seconds:u64 | capability_fingerprint:u64 |
+identity:16 bytes | tag:32 bytes
 ```
 
-The corresponding success status is `00`; a policy denial is `02`. These bytes are independent of
-TLS, FakeTCP, multipath, and the host language.
+`tag` is HMAC-SHA-256 over ASCII `quicp/2 replay token`, one zero byte, and the preceding 41-byte
+token body. The HMAC key is a dedicated server secret of at least 32 bytes. A server MUST NOT issue
+a token before an ordinary flow has completed capability negotiation. The fingerprint binds that
+negotiated snapshot; it is not a replacement for capability negotiation.
 
-## 6. Multipath over FakeTCP
+## 7. Error and resource scope
 
-One QUICP session owns one session-ID namespace and may own up to two validated paths. Each QUICP
-path maps to an independent FakeTCP four-tuple and independent carrier state:
+- malformed DATAGRAMs that cannot enter shared state: drop and count;
+- invalid per-flow offset, ACK, credit, or FIN: reset that flow;
+- invalid capabilities, duplicate negotiation, or shared-resource abuse: close the connection;
+- local replay/egress pressure: return pending, never discard accepted reliable bytes;
+- driver failure: close the connection and release all bounded state.
 
-```text
-QUICP session ID: C
-  path 0: (local-ip-0, ephemeral-port-0) -> (server-ip-0, port)
-  path 1: (local-ip-1, ephemeral-port-1) -> (server-ip-1, port)
-```
+Implementations MUST reject peer-controlled lengths, counts, offsets, ranges, symbols, tokens, and
+limits before allocation or state mutation.
 
-QUICP path IDs, packet-number spaces, validation, and recovery remain above the carrier. A failed
-path does not reset flows while another path in the same QUICP session is usable. The scheduler
-uses the backup path for failover, not byte striping. This implementation does not claim to be
-MPTCP: it does not emit MPTCP capability/DSS options or ask the kernel to join TCP subflows.
+## 8. FakeTCP carrier envelope
 
-Path admission is bounded: explicit configured candidates only, two concurrent paths, eight path
-IDs over a connection lifetime, one validation at a time, bounded event queues, and fail-closed
-behavior when path events lag or contradict the expected role/status.
-Dynamic path discovery and automatic reopen after `Discarded` are not part of this profile. A
-discarded path is not silently replaced; a future replacement adapter must add its own path-ID,
-late-event, and churn-rate admission evidence.
+The Tier 0 carrier emits complete IPv4 or IPv6 packets with IP protocol `6`, valid IP/TCP
+checksums, no fragmentation, addresses and ports from one fixed four-tuple, and one complete QUIC
+datagram as the TCP payload. The carrier never splits, joins, retransmits, reorders, encrypts, or
+length-prefixes the payload.
 
-The interoperable path roles are fixed:
+IPv4 uses a 20-byte `0x45` header, `DF`, fragment offset zero, TTL 64, and a total length matching
+the complete packet. IPv6 uses a 40-byte base header, no extension headers, hop limit 64, and a
+payload length matching TCP header, options, and payload. Receivers validate address family,
+length, protocol, IP checksum where applicable, and TCP pseudo-header checksum before exposing the
+payload. Malformed input is dropped without carrier or QUICP state mutation.
 
-| Path ID | Role | Required tuple | Failure behavior |
-| ---: | --- | --- | --- |
-| `0` | primary | first configured four-tuple | keep using while usable; mark degraded on failure |
-| `1` | backup | second configured four-tuple | validate before use; carry the same session/flow bytes after primary failure |
+The first client packet uses `SYN`; the first server packet uses `SYN|ACK`; later packets use
+`ACK|PSH`. The 20-byte TCP base header has window 65535 and urgent pointer zero. SYN options are an
+MSS advertisement, SACK permitted, window scale 7, an optional TCP Fast Open option kind 34 with a
+tuple-bound 16-byte cookie, and NOP padding to a 32-bit boundary. Ordinary packets have no options.
+Unknown well-formed options are ignored.
 
-The scheduler MUST NOT stripe one ordered flow across paths in this profile. Each path has its own
-carrier sequence space, QUIC packet-number space, congestion controller, RTT/loss state, and socket
-owner. A path becomes usable only after local validation and the expected remote `Available` status;
-late, repeated, or contradictory path events fail the session closed. A changed four-tuple is a
-new carrier path, not a continuation of the old carrier state.
+Each four-tuple owns independent randomized sequence state. SYN consumes one sequence number and
+every payload byte consumes one. Ordinary payload therefore advances by its byte length; SYN data
+advances by one plus its byte length. Sequence arithmetic wraps as TCP serial arithmetic. These
+values are camouflage metadata only and MUST NOT be used as QUIC packet numbers, QUICP symbol IDs,
+logical ACKs, replay state, congestion state, or MPTCP DSS mappings.
 
-## 7. smoltcp and runtime adapters
+`outer_ip_mtu` limits the complete raw IP packet. Automatic MSS is `outer_ip_mtu - IP header - TCP
+header`, producing 1460 for IPv4 and 1440 for IPv6 at MTU 1500. The QUIC payload ceiling is the
+intersection of the configured QUIC payload, adapter MTU, and carrier envelope. A sender rejects an
+oversized datagram instead of fragmenting it.
 
-`smolstack::RingDevice` is an optional IP-medium smoltcp 0.12 device for transparent packet
-integrations. TUN/packet tasks exchange complete IP
-packets through two bounded lock-free SPSC rings. Packets move into and out of the queue without a
-second payload copy; byte and slot budgets reject overflow instead of silently dropping packets.
-Each ring has exactly one logical producer and one logical consumer. The platform bridge serializes
-concurrent host calls per direction, while the single-owner smoltcp interface is polled by one task
-with a bounded packet budget so a busy TUN cannot starve QUICP. A bridge also rejects a second active
-smoltcp owner. Parallel host callbacks therefore do not concurrently poll smoltcp or violate the
-SPSC storage contract.
+The optional SYN cookie is a truncated HMAC-SHA-256 over the four-tuple and rotating epoch. It is a
+stateless carrier-admission value, not peer identity or a QUICP security key. SYN data may carry
+the first backend handshake datagram. Replay-safe `EARLY_OPEN` still requires Section 6 admission;
+loss or rejection of SYN data MUST NOT cause duplicate application delivery.
 
-The default calibration is 1,500-byte MTU, 32 packets per poll, and 32 KiB per smoltcp TCP socket
-direction. The QUIC backend uses a 128 KiB per-stream receive window under an 8 MiB connection
-cap; these budgets are separate. It requests an ACK every ten ack-eliciting packets with a 1 ms
-maximum delay to reduce carrier packets on high-throughput paths. Any adapter that adds mirror
-ring buffers must include them in admission accounting. Segmentation metadata is consumed only
-inside the adapter; the FakeTCP wire always contains one QUICP datagram per TCP-shaped packet.
+## 9. Carrier tiers and platform boundary
 
-The current native raw adapters implement the temporary backend's `noq::AsyncUdpSocket` with Tokio.
-Unix uses `AsyncFd`; Windows uses a WinDivert receive thread and the dynamically loaded network-layer
-API.
-The default uses an `IPPROTO_TCP` raw IPv4 socket for filtered receive and a separate
-`IPPROTO_TCP` raw socket without `IP_HDRINCL` for transmit; Linux supplies the IPv4 header while
-the carrier owns the TCP-shaped segment. Setting `carrier.packet_socket = true` switches both
-directions to filtered `AF_PACKET` `SOCK_DGRAM` sockets. That opt-in mode resolves the longest
-matching IPv4 route and a currently resolved ARP neighbor at bind time; it fails closed when
-either is unavailable. The receive socket applies the same tuple filter before the reusable
-buffer, avoiding the IP/TCP raw receive path. When the kernel supports `TPACKET_V2`, the receive
-side uses a bounded 8 MiB `PACKET_RX_RING` (64 128-KiB frames) to remove the `recvmmsg` syscall
-from the hot path; it falls back to `recvmmsg` if ring setup is unavailable. The ring is an
-opt-in consequence of `packet_socket = true`, so the default IP-raw path keeps its original
-memory profile. It is not the default because it bypasses the IP output/input paths and does not
-provide a portable route or neighbor abstraction. Both Unix modes require `CAP_NET_RAW` (or an
-equivalent privileged service), and must run with kernel TCP RST generation suppressed for the
-selected destination/port. Windows uses the signed WinDivert provider and requires Administrator
-privileges; its current adapter is IPv4-only. A typical Unix deployment needs a narrowly scoped
-nftables/iptables rule and a rollback rule; never disable TCP RST globally. Other targets have no
-admitted raw carrier adapter and must fail closed.
+- Tier 0 injects and receives real TCP-shaped IP packets on the ISP-facing path and suppresses only
+  the selected tuple's kernel RST. It is the only tier that claims ISP-level FakeTCP camouflage.
+- Tier 1 supplies complete packets through TUN/TAP and may use smoltcp. It is an integration seam,
+  not a verified ISP-facing carrier by itself.
+- Tier 2 uses Apple Network Extension or Android `VpnService` packet APIs. Platform permission,
+  socket protection, routes, and lifecycle remain host responsibilities.
 
-Tokio is an optional crate feature (`runtime-tokio`) and is disabled by default. The repository-only
-`internal-bench` feature exposes `transport::build_*_endpoint_with_socket` for raw benchmarks and
-tests; those builders accept the sole vendored backend's `noq::Runtime` and `noq::AsyncUdpSocket`.
-The stable facade keeps
-those types private and uses `HostRuntime`/`HostDatagramSocket` for another runtime or platform
-event loop. A packet-only adapter uses `platform::PlatformPacketBridge`
-and `smoltstack::poll_bounded`; no second built-in runtime feature is maintained until a
-production adapter needs it.
+All tiers preserve complete datagrams. An unsupported tier fails closed; an implementation MUST
+NOT silently substitute UDP or an ordered TCP byte stream. DNS, FakeIP allocation, VPN policy,
+TUN creation, raw-socket privilege, and mobile entitlements are outside the QUICP protocol.
 
-For host-driven runtimes, `HostRuntime` supplies bounded timer/task progress and
-`HostDatagramSocket` supplies one fixed-peer, preallocated datagram path. The host copies underlay
-datagrams into `ingress_datagram_from` (which checks the observed peer), drains
-`poll_egress_datagram_into`, and calls `HostRuntime::drive` after I/O or at `next_timer`. The socket
-is a carrier seam, not a mobile FakeTCP implementation: the built-in host facade admits
-single-path only; a multipath adapter must provide one independently routed socket per candidate
-through the lower-level `from_socket` seam. Network Extension/VpnService adapters still need a
-platform-appropriate underlay before they can be admitted. Rust integrations can use
-`Client::from_host_socket` or `Server::from_host_socket` (and their
-`_with_options` variants); those constructors create no OS socket or executor. The lower-level
-`from_socket` and endpoint builders remain backend-adapter seams for custom multipath and raw/TUN
-benchmarks and are not the portable facade. A FakeTCP client reports
-`Connection::backup_ready() == true` only after its configured backup candidate has completed
-validation, the expected peer status has been observed, and remains locally open; a single-path or
-server connection reports `false`.
-`Connection::path_health()` exposes the client-side bounded path state (`Ready`, `Degraded`, or
-`Failed`); server-side connections return `None` until the server retains an explicit path-role
-configuration. Path-event lag or contradictory path state closes the client connection rather than
-silently continuing with an unreliable view.
+## 10. Independent implementation checklist
 
-The single smoltcp owner uses the short-borrow `smolstack::poll_tcp_read` and
-`smolstack::poll_tcp_write` helpers between `Interface` polls. `flow::QuicpFlow` is the QUICP
-bidirectional flow; the Tokio-only `flow::relay_bidirectional` adapter can relay Tokio byte streams
-without an intermediate application queue. `QuicpFlow` uses bounded read-ahead and a bounded write
-buffer; the write-buffer limit is `flow_write_buffer_bytes` (32 KiB by default). Its
-TCP_NODELAY-like `nodelay` mode is enabled by default and writes through to the QUICP backend;
-disabling it permits batching until `poll_flush` or `poll_shutdown`.
+An implementation claiming QUICP/2 interoperability must:
 
-## 8. Platform adapters and mobile FFI
-
-The portable Rust core owns QUICP, `FakeTcpPacket`, `FakeTcpCarrier`, flow policy, and bounded
-carrier queues. smoltcp and `platform::PlatformPacketBridge` are optional packet adapters for
-transparent integrations. Platform code owns packet ingress/egress, privileges, lifecycle, and
-any route/DNS activation. The seam is complete IP packets, not an OS socket handle:
-
-```text
-platform packet source -> core.ingress_ip(packet)
-platform packet sink   <- core.poll_egress_ip(packet)
-```
-
-The `ffi-c` feature exports the current packet-bridge subset as a synchronous, nonblocking C ABI.
-It uses an opaque, single-owner pointer and batches ingress and egress to avoid a global handle
-registry and per-packet foreign calls. Swift and Kotlin must serialize calls for one bridge on
-their own executor. The eventual engine surface adds timer progress only when the engine owns
-enough protocol state to make that operation real:
-
-```text
-quicp_abi_version() -> version
-quicp_bridge_create(out_bridge) -> status
-quicp_bridge_process_batch(bridge, inputs, outputs, result) -> status
-quicp_bridge_close(inout_bridge) -> status
-```
-
-The caller owns all packet descriptors and buffers. One batch may contain at most 64 packets.
-Input buffers are borrowed only until the call returns; output buffers are written in place.
-`inputs_consumed` and `outputs_written` make partial progress explicit. The bridge never invokes a
-foreign callback or blocks. The current bridge still copies accepted ingress into its bounded Rust
-packet pool because protocol processing is deferred; the ABI itself does not allocate a foreign
-buffer. A future synchronous engine may consume a batch directly, but it must not retain an
-unleased caller pointer. A language-specific wrapper may expose Swift `async` or Kotlin coroutines,
-but no Rust `Future`, Tokio handle, `Vec`, callback, or platform descriptor crosses the ABI. Rust
-panics must not cross the ABI; every call returns an explicit status and progress counts. The C ABI
-remains a separate, audited unsafe wrapper; all pointer validation and panic containment stay in
-that module.
-
-The internal smoltcp egress queue now uses a fixed-size preallocated packet pool when its MTU and
-byte budget admit it, removing the normal per-packet allocation. The safe ingress seam now offers
-both owned `Vec<u8>` transfer and borrowed-slice copying into its preallocated pool; the carrier
-also has a synchronous borrowed decode path. The FFI adapter still decides whether deferred packet
-processing needs a copy or an explicit lease, so this pool must not be described as end-to-end
-zero-copy.
-
-The status contract is deliberately small: `OK`, `WOULD_BLOCK`, `BUFFER_TOO_SMALL`,
-`INVALID_ARGUMENT`, `NOT_READY`, and `CLOSED`. A batch returns `OK` when it makes progress, even if
-the bounded ingress queue accepts only a prefix. `BUFFER_TOO_SMALL` leaves the next egress packet
-queued and writes its required length into the first unwritten output descriptor. `WOULD_BLOCK`
-means the call made no progress. Close consumes the opaque pointer and clears the caller's owner
-variable; a second close through that cleared variable returns `CLOSED`. Structural pointer,
-count, and fixed descriptor/bridge/result overlap errors return before touching the caller's result
-or output lengths; once those fixed ranges are valid, packet-range and semantic errors clear the
-result and output lengths before returning `INVALID_ARGUMENT`.
-
-| Platform integration | Packet source/sink | Example/adapter status |
-| --- | --- | --- |
-| Linux | TUN plus raw IPv4 socket | optional example/integration |
-| macOS | `NEPacketTunnelProvider` packet loop; raw socket only for a privileged probe | optional skeleton |
-| iOS | `NEPacketTunnelProvider.packetFlow` | optional skeleton; entitlement required |
-| Android | `VpnService` established TUN file descriptor | optional skeleton; no raw-underlay grant |
-| Windows | Host-driven core and packet bridge; WinDivert signed WFP/WDF packet injection for Tier 0; Wintun/TAP for Tier 1 | Tier 0 adapter implemented; provider and packet evidence required |
-
-`VpnService` and `NEPacketTunnelProvider` provide the virtual IP packet stream, but they do not
-magically grant arbitrary raw TCP injection on the physical underlay. Mobile admission therefore
-requires a separately verified carrier adapter or a platform-appropriate fallback. Windows
-host-driven and packet-bridge integrations are in the current build matrix. Its Tier 0 carrier
-uses the signed WinDivert WFP/WDF packet-injection path rather than assuming `SOCK_RAW` can send
-arbitrary TCP packets. A native Wintun/TAP handle adapter remains a separate roadmap item.
-
-## 9. Configuration and trust boundaries
-
-`CarrierConfig` is shared by client and server:
-
-```toml
-[carrier]
-syn_data = "cookie" # or "disabled" for carrier tests/future SYN-probe mode
-cookie_secret_file = "/etc/quicp/carrier-cookie.secret"
-congestion_control = "cubic" # "new-reno" or "bbr3" are also available
-```
-
-`congestion_control` selects the transport controller for each QUICP connection/path. It changes
-local pacing and congestion-window behavior only; it does not change the wire format, FakeTCP
-sequence state, or application-flow ordering. The stable public profiles are `cubic`, `new-reno`,
-and `bbr3`. Rust callers may override the profile with `TransportOptions::with_congestion_controller_factory`
-when using the host-socket or Linux FakeTCP builders. The factory is synchronous and owns only
-congestion state; packet recovery, authentication, and carrier sequencing remain owned by QUICP.
-The current C ABI does not expose congestion configuration or callbacks; a future native
-configuration ABI should select the built-in enum and never accept a foreign callback.
-
-Rust callers may use `TransportOptions::with_header_protection_factory` for the no-TLS profile.
-The factory supplies directional header protectors and is intentionally not accepted with the TLS
-profile, whose QUIC header protection is bound to its negotiated keys. A custom protector must be
-deterministic for both peers and must not be treated as payload confidentiality or authentication;
-use TLS or an authenticated packet adapter when those properties are required.
-
-The Rust-only [`PluginRegistry`](plugin-system.md) applies bounded configuration plugins in
-registration order. The included `QueqiaoPlugin` is a shared-path congestion policy inspired by
-Queqiao's endpoint-pair model; it is not Queqiao protocol interoperability, FEC, SOCKS5, or
-enrollment. Its optional erasure floor is measured against the current shared window. The runnable
-host, header-protection, and plugin probes live under `examples/`; the
-Network Extension and VpnService packet-loop skeletons live under `sdk/*/Examples`.
-
-The cookie secret must be an absolute, regular, non-symlink file with trusted parents and owner-only
-permissions. It is never accepted inline in TOML or logged. Unix `FakeTCP` endpoint builders load
-this file during construction and derive the tuple-bound SYN cookie for the current 60-second
-epoch; callers provide only the path tuples. A missing, unreadable, or disabled cookie policy
-fails endpoint construction rather than silently falling back to an unprotected raw profile.
-Windows host-driven and native-carrier configurations use a `%PROGRAMDATA%\\quicp` default path;
-owner-only cookie/private-file loading verifies the current owner and write-capable ACL entries.
-The WinDivert carrier additionally requires the matching signed provider files and Administrator
-privileges; see [the Windows carrier guide](windows.md).
-
-The QUICP transport core accepts a caller-provided canonical hostname or socket target and does
-not allocate FakeIP or operate a DNS server. A transparent VPN or TUN example may use FakeIP as a
-local lookup key, send the canonical hostname inside the admitted QUICP flow, and let the server
-authorize the concrete resolved address before dialing it. Unknown or stale FakeIP state, DNS
-split-routing drift, failed authentication, route ambiguity, and capacity exhaustion must fail
-closed in that optional integration. Its FakeDNS/TUN and system-resolver lifecycle must be
-verified separately from the raw carrier.
-
-When an optional transparent integration uses the FakeIP journal, it must open it component by
-component and reject symlinked parent directories and final paths; callers must provide a
-canonical, link-free journal path. Persistence currently fails closed as unsupported on non-Unix
-platforms until a native no-reparse secure-open implementation is available.
-
-## 10. Optional FakeIP/TUN integration safety
-
-FakeIP, FakeDNS, TUN, and route activation are not part of the QUICP transport core. A transparent
-VPN or TUN example that composes them creates an independent trust boundary and must:
-
-- install the owner-tagged TUN route in a dedicated routing table that contains no default,
-  unicast, VPN, or inherited override route; a destination rule must not be allowed to fall through
-  to a normal underlay route;
-- keep a durable owner-tagged destination `blackhole` rule across graceful stop, crash, and restart.
-  Removing the live TUN route is allowed only after the blackhole is present, so a cached FakeIP
-  cannot escape to the underlay while the process is down;
-- publish FakeDNS only after QUICP admission and every configured failover path required by the
-  profile are ready. If readiness is lost before publication, stop new flows and leave FakeDNS
-  inactive;
-- configure `systemd-resolved` only on the QUICP link with route-only `~.` and enumerate every
-  non-QUICP link and Manager entry (including ifindex 0) before activation. Any more-specific
-  routing/search domain, or any parallel global `~.`, is a fail-closed admission error;
-- subscribe to link and Manager domain changes at runtime. A VPN, DHCP, or NetworkManager update
-  that introduces a competing domain stops new flows and reverts the QUICP resolver state before
-  accepting more FakeIP traffic.
-
-The server's wildcard raw socket must apply the configured destination-address/port allowlist and
-packet-info filter before QUICP parsing. A packet addressed to an unowned local address is dropped
-without exposing a QUICP session or carrier error.
-
-## 11. Interoperability and release gates
-
-This rewrite intentionally makes no wire/API compatibility promise with the previous UDP proxy.
-Before production admission, run:
-
-1. unit and property tests for checksums, malformed headers, duplicate and out-of-order delivery,
-   SYN-cookie rotation, and direct QUICP payload delivery;
-2. Linux raw-socket integration tests with packet capture, RST suppression, NAT rebinding, MTU
-   boundaries, loss/reordering, and both path tuples;
-3. Windows WinDivert integration tests with signed-driver startup, external-interface packet
-   capture, RST suppression, tuple filtering, shutdown cleanup, and both path tuples;
-4. QUICP profile tests for no-security operation, the optional TLS adapter, early-open rejection,
-   profile-token mismatch, and multipath failover; PSK remains `N/A/not admitted`;
-5. memory and CPU benchmarks at the configured flow/path limits, including the checksum and copy
-   paths used on the target CPU;
-6. license, dependency, capability, and rollback review for the privileged raw-socket service.
-
-Until those gates pass, ship the ordinary UDP adapter or single-path profile as a separate,
-explicit deployment choice. Do not silently fall back from a failed FakeTCP admission check to an
-unrelated underlay.
-
-## 12. Independent implementation checklist
-
-An implementation written without this repository should be able to complete the following in
-order:
-
-1. Encode and decode the IP/TCP envelope, including IPv4/IPv6 and TCP pseudo-header checksums.
-2. Round-trip a caller-provided QUIC datagram through one `SYN`/`SYN|ACK` and ordinary `ACK|PSH`
-   carrier packet, then verify that a missing carrier sequence does not block a later datagram.
-3. Implement QUIC v1 packet parsing and recovery, then the exact no-TLS `QPCS` handshake or the
-   TLS 1.3 ALPN profile. Reject early data in both cases.
-4. Negotiate one profile token and enforce its multipath state before accepting a stream.
-5. Open a client bidirectional stream, exchange the exact `OPEN`/`STATUS` bytes, and keep all
-   application bytes behind `STATUS(OK)`.
-6. Add path 1 only as a separately validated four-tuple; fail over the same session without
-   resetting flow bytes, and reject path churn outside the two-path budget.
-
-The smallest useful interop capture contains one no-TLS single-path handshake, one successful
-`OPEN("www.example.com", 443)`, one policy-denied `OPEN`, one malformed status, one reordered
-carrier pair, and one primary-to-backup failover. Record raw packets and decoded QUIC/flow events;
-throughput or a loopback-only result is not protocol interoperability evidence.
-
-When this checklist cannot be satisfied using the current QUIC backend or security adapter, the
-implementation MUST report the unsupported profile instead of silently selecting another token or
-wrapping QUICP in a reliable TCP stream.
+1. select only `quicp/2` and reproduce the committed wire vectors;
+2. implement every peer-controlled bound before allocation or state mutation;
+3. keep the reliable stream as control/fallback while source data normally uses DATAGRAM;
+4. preserve ordered, duplicate-free flow reads under loss, reorder, repair, replay, and fallback;
+5. keep FakeTCP state independent for every four-tuple and preserve datagram boundaries;
+6. reject replay-safe attempts before application side effects when token admission fails;
+7. document whether replay admission is process-local or distributed and never claim exactly once;
+8. pass clean, loss, burst, duplicate, malformed, resource-limit, multipath, and early-data tests.

@@ -1,9 +1,12 @@
-#![doc = r#"
+#![doc = r"
 # QUICP
 
 QUICP is a QUIC-based TCP alternative carried in TCP-shaped `FakeTCP` packets. It preserves
 independent QUIC flows instead of recreating one reliable TCP byte stream. `FakeTCP` is an
 underlay format, not a TCP connection and not a security boundary.
+
+The [normative QUICP/2 protocol specification](https://github.com/dyxushuai/quicp/blob/main/docs/protocol.md)
+defines the wire format, recovery rules, and resource limits.
 
 The stable integration path is host-driven and runtime-neutral: the caller owns datagram I/O,
 advances [`HostRuntime`], and constructs endpoints through [`Client::from_host_socket`] and
@@ -20,7 +23,7 @@ use quicp::{
 let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19_000);
 let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19_001);
 let client_config = ClientConfig::insecure(
-    Multipath::single(PathCandidate::new("primary", client_addr.ip(), server_addr)?)?,
+    Multipath::single(PathCandidate::new(client_addr.ip(), server_addr)?)?,
     CarrierConfig::default(),
 )?
 .with_transport(QuicpTransportConfig {
@@ -48,11 +51,11 @@ let _accept = server.accept();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-See `examples/echo.rs` for the complete flow and `examples/host_loopback.rs` for the lower-level
-bounded pump/drive loop. [`config`] owns validated configuration; [`host_carrier`] and
-[`HostRuntime`] are the portable host seam; [`flow`] exposes established application flows.
-Optional [`congestion`], [`header_protection`], and [`plugin`] interfaces are Rust-only
-extensions. The repository README documents features, platform support, security boundaries,
+See `examples/echo.rs` for the complete bounded pump/drive flow. [`config`] owns validated
+configuration; [`host_carrier`] and [`HostRuntime`] are the portable host seam; [`flow`] exposes
+established application flows.
+Optional [`congestion`] and [`header_protection`] interfaces are Rust-only extensions. The
+repository README documents features, platform support, security boundaries,
 mobile SDKs, and the unpublished documentation workflow.
 
 ## Examples
@@ -60,12 +63,9 @@ mobile SDKs, and the unpublished documentation workflow.
 - `cargo run --example echo`: complete runtime-neutral flow and echo exchange.
 - `cargo build --example socks5_tunnel --features runtime-tokio`: Linux client/server SOCKS5
   `CONNECT` relay over raw `FakeTCP`; run the binary with the `client` or `server` role.
-- `cargo run --example multipath`: validated primary/backup policy for two independent carrier
-  paths.
-- `cargo run --example queqiao_plugin`: custom congestion/plugin registration.
+- `cargo run --example multipath`: same-flow delivery after primary carrier failure.
 - `cargo run --example header_protection`: caller-selected QUICP header protection hook.
-- `cargo run --example zero_rtt`: cookie SYN data; application 0-RTT is intentionally not
-  admitted.
+- `cargo run --example zero_rtt`: replay-safe early OPEN plus initial bytes and ordinary fallback.
 - `cargo run --example smoltcp_bridge --features platform-smoltcp`: bounded TUN/smoltcp packet
   ownership seam.
 - Apple and Android packet-loop skeletons live under `sdk/apple/Examples` and
@@ -79,9 +79,9 @@ and validated TLS settings. Header protection does not replace authentication or
 Carrier cookies and their secret validate the TCP-shaped underlay exchange; they do not identify
 the QUICP peer. Protect that secret as trust material.
 
-SYN data may carry only the backend handshake datagram. QUICP does not admit transport 0-RTT,
-OPEN requests, origin dialing, or application payload before ordinary handshake and policy
-admission.
+Application 0-RTT is available only through the explicit replay-safe API with a server-issued
+expiring token, fresh attempt nonce, compatible capabilities, and bounded process-local replay
+admission. Ordinary OPEN and writes remain blocked by handshake and policy admission.
 
 ## Stable API boundary
 
@@ -97,81 +97,53 @@ let _ = ClientConfig {
     carrier: CarrierConfig::default(),
 };
 ```
-"#]
-#![cfg_attr(
-    not(feature = "internal-bench"),
-    doc = r"
+"]
+#![doc = r"
 Backend and packet-detail modules are private in stable builds. The repository-only
-`internal-bench` feature opens them for raw benchmarks and tests; it is not a backend selector.
+benchmarks and tests use the same public facade as downstream integrations.
 
 ```compile_fail
 use quicp::transport::Client;
 ```
 
 ```compile_fail
-use quicp::faketcp::{FakeTcpPacket, FakeTcpSocket, TcpFlags, TcpOptions};
+use quicp::faketcp::FakeTcpSocket;
 ```
-"
-)]
+"]
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-extern crate alloc;
-#[cfg(test)]
-extern crate std;
-
 pub mod config;
 pub mod congestion;
-#[cfg(feature = "internal-bench")]
-#[allow(missing_docs)]
-pub mod faketcp;
-#[cfg(not(feature = "internal-bench"))]
-#[allow(dead_code)]
 mod faketcp;
+mod fec;
 #[cfg(feature = "ffi-c")]
 pub mod ffi;
 pub mod flow;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod header_protection;
 pub mod host_carrier;
 mod host_runtime;
-#[cfg(feature = "internal-bench")]
-#[allow(missing_docs)]
-pub mod multipath;
-#[cfg(not(feature = "internal-bench"))]
-#[allow(dead_code)]
 mod multipath;
 pub(crate) mod no_security;
 mod packet_ring;
 #[cfg(feature = "platform-smoltcp")]
 pub mod platform;
-pub mod plugin;
-pub mod queqiao;
-#[cfg(feature = "internal-bench")]
-#[allow(missing_docs)]
-pub mod session;
-#[cfg(not(feature = "internal-bench"))]
-#[allow(dead_code)]
+mod recovery;
 mod session;
 #[cfg(feature = "platform-smoltcp")]
 pub mod smolstack;
-#[cfg(feature = "internal-bench")]
-#[allow(missing_docs)]
-pub mod transport;
-#[cfg(not(feature = "internal-bench"))]
-#[allow(dead_code)]
 mod transport;
-#[cfg(feature = "internal-bench")]
-#[allow(missing_docs)]
-pub mod wire;
-#[cfg(not(feature = "internal-bench"))]
-#[allow(dead_code)]
 mod wire;
 
 pub use config::{
     CarrierConfig, ClientConfig, ClientTls, Config, ConfigError, CongestionControl,
-    MAX_FLOW_BUFFER_BYTES, MAX_PENDING_HANDSHAKE_BUFFER_BYTES, MAX_QUIC_PAYLOAD, MIN_QUIC_PAYLOAD,
-    MssMode, MtuConfig, Multipath, MultipathMode, PathCandidate, PmtuMode, QuicpTransportConfig,
-    ServerConfig, ServerTls, SynDataPolicy, load_config,
+    MAX_DECODER_WINDOW, MAX_FLOW_BUFFER_BYTES, MAX_PENDING_HANDSHAKE_BUFFER_BYTES,
+    MAX_QUIC_PAYLOAD, MAX_RECOVERY_MEMORY_BUDGET_BYTES, MAX_REPAIR_SPAN, MIN_QUIC_PAYLOAD, MssMode,
+    MtuConfig, Multipath, MultipathMode, PathCandidate, PmtuMode, QuicpTransportConfig,
+    RecoveryConfig, RecoveryMode, ServerConfig, ServerTls, load_config,
 };
 pub use congestion::{
     AckBatch, CongestionController, CongestionControllerFactory, CongestionEvent,
@@ -190,9 +162,9 @@ pub use host_runtime::{HostRuntime, HostRuntimeError};
 pub use multipath::PathHealth;
 #[cfg(feature = "platform-smoltcp")]
 pub use platform::{PlatformError, PlatformPacketBridge, PlatformPacketConfig};
-pub use plugin::{MAX_PLUGINS, PluginError, PluginRegistry, QuicpPlugin};
-pub use queqiao::{QueqiaoConfig, QueqiaoPlugin};
+pub use recovery::RecoverySnapshot;
 pub use session::{ApplicationError, SessionError};
+pub use session::{ReplayAdmission, ReplayToken, ReplayTokenError};
 pub use transport::{Client, Server};
 pub use transport::{Connection, ConnectionError, IncomingConnection, TransportError};
 pub use wire::{CanonicalHost, OpenRequest, OpenStatus, WireError};

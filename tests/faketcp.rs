@@ -1,7 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-#[cfg(feature = "internal-bench")]
-use quicp::faketcp::FakeTcpPacket;
 use quicp::{
     CarrierConfig, CarrierDirection, CarrierError, FakeTcpCarrier, FourTuple, SynDataMode,
 };
@@ -43,83 +41,6 @@ fn syn_data_is_a_tcp_packet_with_one_quicp_datagram() {
     let decoded = receiver.decode_datagram(&packet).expect("packet");
     assert_eq!(decoded.payload(), datagram);
     assert!(decoded.was_syn());
-}
-
-#[cfg(feature = "internal-bench")]
-#[test]
-fn configured_outer_mtu_controls_family_mss_and_packet_size() {
-    let ipv4 = tuple();
-    let mut ipv4_sender = FakeTcpCarrier::new_with_mtu(
-        ipv4,
-        CarrierDirection::ClientToServer,
-        SynDataMode::Cookie([7; 16]),
-        1460,
-        1500,
-    )
-    .unwrap();
-    let ipv4_packet = ipv4_sender.encode_syn(b"ipv4").unwrap();
-    assert_eq!(
-        FakeTcpPacket::decode(&ipv4_packet).unwrap().options().mss(),
-        Some(1460)
-    );
-
-    let ipv6 = FourTuple::new(
-        SocketAddr::from((Ipv6Addr::LOCALHOST, 40_000)),
-        SocketAddr::from((Ipv6Addr::LOCALHOST, 443)),
-    );
-    let mut ipv6_sender = FakeTcpCarrier::new_with_mtu(
-        ipv6,
-        CarrierDirection::ClientToServer,
-        SynDataMode::Cookie([7; 16]),
-        1440,
-        1500,
-    )
-    .unwrap();
-    let ipv6_packet = ipv6_sender.encode_syn(b"ipv6").unwrap();
-    assert_eq!(
-        FakeTcpPacket::decode(&ipv6_packet).unwrap().options().mss(),
-        Some(1440)
-    );
-
-    let mut bounded_sender = FakeTcpCarrier::new_with_mtu(
-        ipv4,
-        CarrierDirection::ClientToServer,
-        SynDataMode::Disabled,
-        1360,
-        1400,
-    )
-    .unwrap();
-    assert_eq!(
-        bounded_sender.encode_datagram(&vec![0; 1361]),
-        Err(CarrierError::PacketTooLarge)
-    );
-    assert!(matches!(
-        FakeTcpCarrier::new_with_mtu(
-            ipv4,
-            CarrierDirection::ClientToServer,
-            SynDataMode::Disabled,
-            1461,
-            1500,
-        ),
-        Err(CarrierError::InvalidMss {
-            mss: 1461,
-            maximum: 1460,
-        })
-    ));
-
-    let mut mtu_limited_receiver = FakeTcpCarrier::new_with_mtu(
-        ipv4.reverse(),
-        CarrierDirection::ServerToClient,
-        SynDataMode::Disabled,
-        960,
-        1000,
-    )
-    .unwrap();
-    let oversized_packet = ipv4_sender.encode_datagram(&vec![0; 1001]).unwrap();
-    assert_eq!(
-        mtu_limited_receiver.decode_datagram(&oversized_packet),
-        Err(CarrierError::PacketTooLarge)
-    );
 }
 
 #[test]
@@ -224,12 +145,12 @@ fn ipv6_packet_and_stateless_syn_cookie_round_trip() {
         SocketAddr::from((Ipv6Addr::LOCALHOST, 443)),
     );
     let config = CarrierConfig::default();
-    let client_mode = config.syn_data_mode(b"cookie-secret", tuple, 7);
-    let server_mode = config.syn_data_mode(b"cookie-secret", tuple.reverse(), 7);
+    let client_mode = config.syn_cookie_mode(b"cookie-secret", tuple, 7);
+    let server_mode = config.syn_cookie_mode(b"cookie-secret", tuple.reverse(), 7);
     assert_eq!(client_mode, server_mode);
     assert_ne!(
         client_mode,
-        config.syn_data_mode(b"cookie-secret", tuple, 8)
+        config.syn_cookie_mode(b"cookie-secret", tuple, 8)
     );
     let mut sender =
         FakeTcpCarrier::new(tuple, CarrierDirection::ClientToServer, client_mode).unwrap();
@@ -426,45 +347,6 @@ fn large_payload_checksum_round_trips_at_odd_and_maximum_lengths() {
 }
 
 #[test]
-#[cfg(feature = "internal-bench")]
-fn tcp_sequence_and_acknowledgment_cover_carrier_payloads() {
-    let tuple = tuple();
-    let mut sender = FakeTcpCarrier::new(
-        tuple,
-        CarrierDirection::ClientToServer,
-        SynDataMode::Disabled,
-    )
-    .expect("carrier");
-    let mut receiver = FakeTcpCarrier::new(
-        tuple.reverse(),
-        CarrierDirection::ServerToClient,
-        SynDataMode::Disabled,
-    )
-    .expect("carrier");
-
-    let first = sender.encode_datagram(b"first").expect("first packet");
-    let parsed = FakeTcpPacket::decode(&first).expect("first packet");
-    receiver.decode_datagram(&first).expect("first datagram");
-    let second = sender.encode_datagram(b"second").expect("second packet");
-    let parsed_second = FakeTcpPacket::decode(&second).expect("second packet");
-    assert_eq!(
-        parsed_second.sequence(),
-        parsed
-            .sequence()
-            .wrapping_add(u32::try_from(parsed.payload().len()).expect("payload length"))
-    );
-
-    let reply = receiver.encode_datagram(b"reply").expect("reply packet");
-    let parsed_reply = FakeTcpPacket::decode(&reply).expect("reply packet");
-    assert_eq!(
-        parsed_reply.acknowledgment(),
-        parsed
-            .sequence()
-            .wrapping_add(u32::try_from(parsed.payload().len()).expect("payload length"))
-    );
-}
-
-#[test]
 fn deterministic_payload_corpus_round_trips_ipv4_and_ipv6() {
     let tuples = [
         tuple(),
@@ -506,50 +388,6 @@ fn deterministic_payload_corpus_round_trips_ipv4_and_ipv6() {
                     .payload(),
                 payload
             );
-        }
-    }
-}
-
-#[test]
-#[cfg(feature = "internal-bench")]
-fn malformed_corpus_does_not_poison_carrier_state() {
-    let tuple = tuple();
-    let mut sender = FakeTcpCarrier::new(
-        tuple,
-        CarrierDirection::ClientToServer,
-        SynDataMode::Disabled,
-    )
-    .expect("carrier");
-    let packet = sender.encode_datagram(b"complete").expect("packet");
-
-    for length in 0..packet.len() {
-        let mut receiver = FakeTcpCarrier::new(
-            tuple.reverse(),
-            CarrierDirection::ServerToClient,
-            SynDataMode::Disabled,
-        )
-        .expect("carrier");
-        assert!(
-            receiver
-                .decode_datagram_borrowed(&packet[..length])
-                .is_err()
-        );
-        assert_eq!(
-            receiver
-                .decode_datagram_borrowed(&packet)
-                .unwrap()
-                .payload(),
-            b"complete"
-        );
-    }
-
-    let mut state = 0xbadc_0ffe_e0dd_f00du64;
-    for length in 0..256 {
-        let mut input = vec![0; length];
-        fill_pseudorandom(&mut input, &mut state);
-        if let Ok(packet) = FakeTcpPacket::decode(&input) {
-            let encoded = packet.encode().expect("decoded packet re-encodes");
-            assert_eq!(FakeTcpPacket::decode(&encoded).unwrap(), packet);
         }
     }
 }

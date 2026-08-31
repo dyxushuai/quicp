@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::future::poll_fn;
-use std::io;
+use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 #[cfg(feature = "tls-rustls")]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
-use noq::AsyncUdpSocket;
 #[cfg(feature = "tls-rustls")]
 use noq::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tls-rustls")]
@@ -21,45 +23,169 @@ use noq::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use noq::rustls::server::WebPkiClientVerifier;
 #[cfg(feature = "tls-rustls")]
 use noq::rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
+use noq::udp::{RecvMeta, Transmit};
+use noq::{AsyncUdpSocket, UdpSender};
 use thiserror::Error;
 
 use crate::config::{ClientConfig, ConfigError, MultipathMode, PmtuMode, ServerConfig};
 #[cfg(feature = "tls-rustls")]
 use crate::config::{TrustedFileMode, read_trusted_file};
 use crate::congestion::TransportOptions;
-use crate::faketcp::FourTuple;
 use crate::flow::backend_error_code;
 use crate::host_carrier::HostDatagramSocket;
 use crate::host_runtime::HostRuntime;
 use crate::multipath::{PathHealth, PathManager, PathRole};
 use crate::no_security::{NoSecurityClientConfig, NoSecurityServerConfig};
-use crate::session::{ApplicationError, ApplicationProfile};
+use crate::recovery::{ConnectionRecovery, RecoveryMemoryBudget, RecoverySnapshot};
+use crate::session::{ApplicationError, ReplayAdmission, ReplayToken, application_profile_token};
 use crate::{FlowError, OpenRequest, PendingFlow, QuicpFlow};
 
-// The feature selects the executor adapter; child modules select only the OS syscalls they need.
-#[cfg(feature = "runtime-tokio")]
+#[cfg(all(
+    feature = "runtime-tokio",
+    any(target_os = "linux", target_os = "macos", windows)
+))]
 #[path = "transport/tokio.rs"]
 mod tokio_adapter;
-#[cfg(all(test, feature = "runtime-tokio"))]
-pub(crate) use tokio_adapter::MultipathSocket;
-#[cfg(all(test, any(unix, windows), feature = "runtime-tokio"))]
-pub(crate) use tokio_adapter::{
-    SYN_COOKIE_EPOCH_SECONDS, configure_fake_tcp_paths, validate_fake_tcp_syn_data,
-};
 #[cfg(all(
-    any(unix, windows),
-    feature = "runtime-tokio",
-    feature = "internal-bench"
+    test,
+    any(target_os = "linux", target_os = "macos"),
+    feature = "runtime-tokio"
 ))]
-pub use tokio_adapter::{
-    build_fake_tcp_client_endpoint, build_fake_tcp_client_endpoint_with_options,
-    build_fake_tcp_server_endpoint, build_fake_tcp_server_endpoint_with_options,
-};
-
+pub(crate) use tokio_adapter::{SYN_COOKIE_EPOCH_SECONDS, configure_fake_tcp_paths};
 #[cfg(feature = "tls-rustls")]
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 const BACKUP_PATH_RETRY_LIMIT: u8 = 16;
 const BACKUP_PATH_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+#[derive(Debug)]
+pub(crate) struct MultipathSocket {
+    children: [Box<dyn AsyncUdpSocket>; 2],
+    routes: [(IpAddr, SocketAddr); 2],
+    next_recv: usize,
+}
+
+impl MultipathSocket {
+    pub(crate) fn new(
+        primary: (Box<dyn AsyncUdpSocket>, SocketAddr),
+        backup: (Box<dyn AsyncUdpSocket>, SocketAddr),
+    ) -> io::Result<Self> {
+        let routes = [
+            (primary.0.local_addr()?.ip(), primary.1),
+            (backup.0.local_addr()?.ip(), backup.1),
+        ];
+        if routes[0] == routes[1] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multipath routes must be unique",
+            ));
+        }
+        Ok(Self {
+            children: [primary.0, backup.0],
+            routes,
+            next_recv: 0,
+        })
+    }
+}
+
+impl AsyncUdpSocket for MultipathSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(MultipathSender {
+            children: [
+                self.children[0].create_sender(),
+                self.children[1].create_sender(),
+            ],
+            routes: self.routes,
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let mut path_error = None;
+        let mut unavailable = 0;
+        for offset in 0..2 {
+            let index = (self.next_recv + offset) % 2;
+            match self.children[index].poll_recv(cx, bufs, meta) {
+                Poll::Ready(Ok(received)) => {
+                    self.next_recv = (index + 1) % 2;
+                    return Poll::Ready(Ok(received));
+                }
+                Poll::Ready(Err(error)) if is_path_unavailable(&error) => {
+                    unavailable += 1;
+                    path_error.get_or_insert(error);
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if unavailable == self.children.len() {
+            Poll::Ready(Err(path_error.expect("all paths returned an error")))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.children[0].local_addr()
+    }
+
+    fn max_receive_segments(&self) -> NonZeroUsize {
+        self.children[0]
+            .max_receive_segments()
+            .max(self.children[1].max_receive_segments())
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.children[0].may_fragment() || self.children[1].may_fragment()
+    }
+}
+
+fn is_path_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+    )
+}
+
+#[derive(Debug)]
+struct MultipathSender {
+    children: [Pin<Box<dyn UdpSender>>; 2],
+    routes: [(IpAddr, SocketAddr); 2],
+}
+
+impl UdpSender for MultipathSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Some(index) = self.routes.iter().position(|(source, destination)| {
+            transmit.destination == *destination
+                && transmit.src_ip.is_none_or(|requested| requested == *source)
+        }) else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "no multipath socket is bound to {:?} -> {}",
+                    transmit.src_ip, transmit.destination
+                ),
+            )));
+        };
+        self.children[index].as_mut().poll_send(transmit, cx)
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        self.children[0]
+            .max_transmit_segments()
+            .min(self.children[1].max_transmit_segments())
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct BackupPath {
@@ -124,14 +250,21 @@ pub struct Client {
     server_addr: SocketAddr,
     server_name: String,
     runtime: Option<Arc<dyn noq::Runtime>>,
+    runtime_shutdown: Option<Arc<AtomicBool>>,
     backup_path: Option<BackupPath>,
-    primary_tuple: Option<FourTuple>,
     flow_buffer_bytes: usize,
     default_nodelay: bool,
+    recovery: crate::config::RecoveryConfig,
+    recovery_memory: Arc<RecoveryMemoryBudget>,
+    max_symbol_bytes: usize,
 }
 
 impl Client {
-    #[cfg(all(test, feature = "runtime-tokio"))]
+    #[cfg(all(
+        test,
+        feature = "runtime-tokio",
+        any(target_os = "linux", target_os = "macos", windows)
+    ))]
     fn from_endpoint(
         endpoint: noq::Endpoint,
         server_addr: SocketAddr,
@@ -141,11 +274,14 @@ impl Client {
             endpoint,
             server_addr,
             server_name,
-            None,
+            Some(Arc::new(noq::TokioRuntime)),
             None,
             None,
             crate::flow::RELAY_BUFFER_BYTES,
             true,
+            crate::config::RecoveryConfig::default(),
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
+            1200,
         )
     }
 
@@ -155,79 +291,35 @@ impl Client {
         server_addr: SocketAddr,
         server_name: String,
         runtime: Option<Arc<dyn noq::Runtime>>,
+        runtime_shutdown: Option<Arc<AtomicBool>>,
         backup_path: Option<BackupPath>,
-        primary_tuple: Option<FourTuple>,
         flow_buffer_bytes: usize,
         default_nodelay: bool,
+        recovery: crate::config::RecoveryConfig,
+        recovery_memory: Arc<RecoveryMemoryBudget>,
+        max_symbol_bytes: usize,
     ) -> Self {
         Self {
             endpoint,
             server_addr,
             server_name,
             runtime,
+            runtime_shutdown,
             backup_path,
-            primary_tuple,
             flow_buffer_bytes,
             default_nodelay,
+            recovery,
+            recovery_memory,
+            max_symbol_bytes,
         }
     }
 
-    /// Creates a client endpoint from a host-owned datagram carrier and runtime.
-    ///
-    /// This constructor is the portable seam for iOS, Android, and other host event loops. The
-    /// caller remains responsible for moving datagrams through `socket` and advancing `runtime`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when endpoint or optional TLS configuration cannot be built.
-    #[cfg(feature = "internal-bench")]
-    pub fn from_socket(
-        config: &ClientConfig,
-        socket: Box<dyn noq::AsyncUdpSocket>,
-        runtime: Arc<dyn noq::Runtime>,
-        server_addr: SocketAddr,
-        server_name: impl Into<String>,
-    ) -> Result<Self, TransportError> {
-        Self::from_socket_with_options_internal(
-            ValidatedClientConfig::new(config)?,
-            socket,
-            runtime,
-            server_addr,
-            server_name,
-            &TransportOptions::default(),
-            None,
-        )
-    }
-
-    /// Creates a client endpoint with runtime-neutral Rust extension options.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when endpoint construction or optional TLS configuration fails.
-    #[cfg(feature = "internal-bench")]
-    pub fn from_socket_with_options(
-        config: &ClientConfig,
-        socket: Box<dyn noq::AsyncUdpSocket>,
-        runtime: Arc<dyn noq::Runtime>,
-        server_addr: SocketAddr,
-        server_name: impl Into<String>,
-        options: &TransportOptions,
-    ) -> Result<Self, TransportError> {
-        Self::from_socket_with_options_internal(
-            ValidatedClientConfig::new(config)?,
-            socket,
-            runtime,
-            server_addr,
-            server_name,
-            options,
-            None,
-        )
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn from_socket_with_options_internal(
         config: ValidatedClientConfig<'_>,
         socket: Box<dyn noq::AsyncUdpSocket>,
         runtime: Arc<dyn noq::Runtime>,
+        runtime_shutdown: Option<Arc<AtomicBool>>,
         server_addr: SocketAddr,
         server_name: impl Into<String>,
         options: &TransportOptions,
@@ -241,7 +333,7 @@ impl Client {
             .into());
         }
         let runtime_for_client = Arc::clone(&runtime);
-        let endpoint = build_client_endpoint_with_validated_config(
+        let (endpoint, payload_ceiling) = build_client_endpoint_with_validated_config(
             config,
             socket,
             runtime,
@@ -253,13 +345,15 @@ impl Client {
             server_addr,
             server_name.into(),
             Some(runtime_for_client),
+            runtime_shutdown,
             configured_backup_path(&config),
-            Some(FourTuple::new(
-                SocketAddr::new(config.multipath.candidates[0].local_ip, 0),
-                server_addr,
-            )),
             config.transport().flow_write_buffer_bytes as usize,
             config.transport().default_nodelay,
+            config.transport().recovery,
+            Arc::new(RecoveryMemoryBudget::new(
+                config.transport().recovery_memory_budget_bytes,
+            )),
+            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
         ))
     }
 
@@ -292,6 +386,9 @@ impl Client {
         runtime: Arc<HostRuntime>,
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
+        if runtime.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "host runtime is closed").into());
+        }
         let config = ValidatedClientConfig::new(config)?;
         if config.multipath.mode != MultipathMode::Off {
             return Err(TransportError::UnsupportedMultipathCarrier);
@@ -314,13 +411,72 @@ impl Client {
         let server_name = config
             .tls()
             .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name().to_owned());
+        let runtime_shutdown = Some(runtime.shutdown_signal());
         Self::from_socket_with_options_internal(
             config,
             Box::new(socket),
             runtime,
+            runtime_shutdown,
             server_addr,
             server_name,
             options,
+            Some(adapter_mtu),
+        )
+    }
+
+    /// Creates a portable primary/backup client from two host-driven carriers.
+    ///
+    /// The socket order must match the configured path-candidate order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid path routes, MTUs, or endpoint configuration.
+    pub fn from_host_sockets(
+        config: &ClientConfig,
+        sockets: &[HostDatagramSocket; 2],
+        runtime: Arc<HostRuntime>,
+    ) -> Result<Self, TransportError> {
+        if runtime.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "host runtime is closed").into());
+        }
+        let config = ValidatedClientConfig::new(config)?;
+        if config.multipath.mode != MultipathMode::Failover {
+            return Err(TransportError::UnsupportedMultipathCarrier);
+        }
+        for (socket, candidate) in sockets.iter().zip(&config.multipath.candidates) {
+            if socket.local_addr().ip() != candidate.local_ip
+                || socket.peer_addr() != candidate.server_addr
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "host socket routes must match configured path candidates",
+                )
+                .into());
+            }
+        }
+        let adapter_mtu = sockets
+            .iter()
+            .map(HostDatagramSocket::mtu)
+            .min()
+            .and_then(|mtu| u16::try_from(mtu).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid host MTU"))?;
+        let server_addr = sockets[0].peer_addr();
+        let server_name = config
+            .tls()
+            .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name().to_owned());
+        let socket = MultipathSocket::new(
+            (Box::new(sockets[0].clone()), sockets[0].peer_addr()),
+            (Box::new(sockets[1].clone()), sockets[1].peer_addr()),
+        )?;
+        let runtime_shutdown = Some(runtime.shutdown_signal());
+        Self::from_socket_with_options_internal(
+            config,
+            Box::new(socket),
+            runtime,
+            runtime_shutdown,
+            server_addr,
+            server_name,
+            &TransportOptions::default(),
             Some(adapter_mtu),
         )
     }
@@ -338,12 +494,129 @@ impl Client {
         let backend = connecting
             .await
             .map_err(|error| ConnectionError::Handshake(Box::new(error)))?;
+        self.finish_connection(backend).await
+    }
+
+    /// Connects and opens one explicit replay-safe flow with bounded initial bytes.
+    ///
+    /// When transport 0-RTT is unavailable or rejected, the method waits for the handshake and
+    /// sends the same bytes once through an ordinary flow.
+    ///
+    /// With required multipath, an accepted early flow is exposed by the server before the client
+    /// can validate its backup path. A later backup-path error therefore means delivery is
+    /// ambiguous even though this method returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when connection setup, replay admission, flow setup, or initial delivery
+    /// fails.
+    pub async fn connect_replay_safe(
+        &self,
+        token: &ReplayToken,
+        nonce: u64,
+        request: OpenRequest,
+        initial: &[u8],
+        current_policy_authorized: bool,
+    ) -> Result<(Connection, QuicpFlow), ConnectionError> {
+        if initial.is_empty() || initial.len() > self.flow_buffer_bytes {
+            return Err(ConnectionError::ReplaySafeInput);
+        }
+        let connecting = self
+            .endpoint
+            .connect(self.server_addr, &self.server_name)
+            .map_err(|error| ConnectionError::Connect(Box::new(error)))?;
+        match connecting.into_0rtt() {
+            Ok((backend, accepted)) => {
+                let connection = self.prepare_connection(backend)?;
+                let early = connection
+                    .open_replay_safe(
+                        token,
+                        nonce,
+                        request.clone(),
+                        bytes::Bytes::copy_from_slice(initial),
+                        current_policy_authorized,
+                    )
+                    .await;
+                if accepted.await {
+                    let flow = early.map_err(ConnectionError::Flow)?;
+                    let connection = self.install_required_backup(connection).await?;
+                    return Ok((connection, flow));
+                }
+                let connection = self.install_required_backup(connection).await?;
+                let mut flow = connection
+                    .open_flow(request, current_policy_authorized)
+                    .await
+                    .map_err(ConnectionError::Flow)?;
+                flow.write_all_initial(initial)
+                    .await
+                    .map_err(ConnectionError::Flow)?;
+                Ok((connection, flow))
+            }
+            Err(connecting) => {
+                let backend = connecting
+                    .await
+                    .map_err(|error| ConnectionError::Handshake(Box::new(error)))?;
+                let connection = self.finish_connection(backend).await?;
+                let mut flow = connection
+                    .open_flow(request, current_policy_authorized)
+                    .await
+                    .map_err(ConnectionError::Flow)?;
+                flow.write_all_initial(initial)
+                    .await
+                    .map_err(ConnectionError::Flow)?;
+                Ok((connection, flow))
+            }
+        }
+    }
+
+    async fn finish_connection(
+        &self,
+        backend: noq::Connection,
+    ) -> Result<Connection, ConnectionError> {
+        let connection = self.prepare_connection(backend)?;
+        self.install_required_backup(connection).await
+    }
+
+    fn prepare_connection(&self, backend: noq::Connection) -> Result<Connection, ConnectionError> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            ConnectionError::Multipath(Box::new(io::Error::other(
+                "connection runtime is unavailable",
+            )))
+        })?;
+        let mode = self
+            .backup_path
+            .map_or(MultipathMode::Off, |_| MultipathMode::Failover);
+        let path_manager = build_client_path_manager(mode).map_err(|error| {
+            backend.close(
+                backend_error_code(ApplicationError::MultipathRequired),
+                b"invalid path state",
+            );
+            ConnectionError::Multipath(Box::new(error))
+        })?;
+        Ok(Connection::client(
+            backend,
+            None,
+            path_manager,
+            self.flow_buffer_bytes,
+            self.default_nodelay,
+            runtime,
+            self.runtime_shutdown.clone(),
+            self.recovery,
+            Arc::clone(&self.recovery_memory),
+            self.max_symbol_bytes,
+        ))
+    }
+
+    async fn install_required_backup(
+        &self,
+        mut connection: Connection,
+    ) -> Result<Connection, ConnectionError> {
         // Subscribe before opening the backup path; validation and the peer's status can be
         // reported back-to-back and the bounded stream must not lose either event.
-        let path_events = backend.path_events();
+        let path_events = connection.backend.path_events();
         let backup_path = if let Some(backup) = self.backup_path {
             let Some(runtime) = self.runtime.as_ref() else {
-                backend.close(
+                connection.backend.close(
                     backend_error_code(ApplicationError::MultipathRequired),
                     b"missing multipath runtime",
                 );
@@ -352,7 +625,7 @@ impl Client {
                 ))));
             };
             let path = match open_backup_path(
-                &backend,
+                &connection.backend,
                 noq::FourTuple::new(backup.remote, Some(backup.local_ip)),
                 runtime.as_ref(),
             )
@@ -360,7 +633,7 @@ impl Client {
             {
                 Ok(path) => path,
                 Err(error) => {
-                    backend.close(
+                    connection.backend.close(
                         backend_error_code(ApplicationError::MultipathRequired),
                         b"backup path unavailable",
                     );
@@ -371,59 +644,47 @@ impl Client {
         } else {
             None
         };
-        let path_manager =
-            build_client_path_manager(self.primary_tuple, self.backup_path, backup_path.as_ref())
+        if let Some(backup_path) = backup_path.as_ref() {
+            let Some(path_manager) = connection.path_manager.as_ref() else {
+                unreachable!("client connection retains a path manager");
+            };
+            let mut manager = lock_budget(path_manager);
+            manager
+                .begin_path(PathRole::Backup, backup_path.id())
+                .and_then(|()| manager.established(backup_path.id()))
                 .map_err(|error| {
-                backend.close(
-                    backend_error_code(ApplicationError::MultipathRequired),
-                    b"invalid path state",
-                );
-                ConnectionError::Multipath(Box::new(error))
-            })?;
+                    connection.backend.close(
+                        backend_error_code(ApplicationError::MultipathRequired),
+                        b"invalid path state",
+                    );
+                    ConnectionError::Multipath(Box::new(error))
+                })?;
+        }
         if let Some(runtime) = self.runtime.as_ref() {
             spawn_path_event_monitor(
                 runtime,
-                backend.weak_handle(),
-                Arc::clone(&path_manager),
-                runtime.now(),
+                connection.backend.weak_handle(),
+                Arc::clone(
+                    connection
+                        .path_manager
+                        .as_ref()
+                        .expect("client connection retains a path manager"),
+                ),
                 path_events,
             );
         }
-        Ok(Connection::client(
-            backend,
-            backup_path,
-            path_manager,
-            self.flow_buffer_bytes,
-            self.default_nodelay,
-        ))
+        connection.backup_path = backup_path;
+        Ok(connection)
     }
 }
 
 fn build_client_path_manager(
-    primary_tuple: Option<FourTuple>,
-    backup_config: Option<BackupPath>,
-    backup_path: Option<&noq::Path>,
+    mode: MultipathMode,
 ) -> Result<Arc<Mutex<PathManager>>, crate::multipath::PathError> {
-    let mode = backup_config.map_or(MultipathMode::Off, |_| MultipathMode::Failover);
     let mut manager = PathManager::new(mode);
-    manager.begin_path(PathRole::Primary, noq::PathId::ZERO, 0)?;
-    if let Some(tuple) = primary_tuple {
-        manager.bind_carrier_tuple(noq::PathId::ZERO, tuple)?;
-    }
+    manager.begin_path(PathRole::Primary, noq::PathId::ZERO)?;
     manager.established(noq::PathId::ZERO)?;
     manager.remote_status(noq::PathId::ZERO, noq::PathStatus::Available)?;
-    if let (Some(backup_config), Some(backup_path)) = (backup_config, backup_path) {
-        let id = backup_path.id();
-        manager.begin_path(PathRole::Backup, id, 0)?;
-        manager.bind_carrier_tuple(
-            id,
-            FourTuple::new(
-                SocketAddr::new(backup_config.local_ip, 0),
-                backup_config.remote,
-            ),
-        )?;
-        manager.established(id)?;
-    }
     Ok(Arc::new(Mutex::new(manager)))
 }
 
@@ -431,23 +692,17 @@ fn spawn_path_event_monitor(
     runtime: &Arc<dyn noq::Runtime>,
     weak_connection: noq::WeakConnectionHandle,
     manager: Arc<Mutex<PathManager>>,
-    epoch: std::time::Instant,
     mut events: noq::PathEvents,
 ) {
     let runtime = Arc::clone(runtime);
-    let runtime_for_task = Arc::clone(&runtime);
     runtime.spawn(Box::pin(async move {
         loop {
             let event = std::future::poll_fn(|cx| Pin::new(&mut events).poll_next(cx)).await;
             let Some(event) = event else {
                 return;
             };
-            let now_seconds = runtime_for_task
-                .now()
-                .saturating_duration_since(epoch)
-                .as_secs();
             let result = if let Ok(event) = event {
-                lock_budget(&manager).apply_noq_event(&event, now_seconds)
+                lock_budget(&manager).apply_noq_event(&event)
             } else {
                 lock_budget(&manager).event_lagged();
                 Err(crate::multipath::PathError::Unreliable)
@@ -493,30 +748,46 @@ pub struct Server {
     active_connections: Arc<ConnectionBudget>,
     flow_buffer_bytes: usize,
     default_nodelay: bool,
+    runtime: Arc<dyn noq::Runtime>,
+    runtime_shutdown: Option<Arc<AtomicBool>>,
+    recovery: crate::config::RecoveryConfig,
+    recovery_memory: Arc<RecoveryMemoryBudget>,
+    max_symbol_bytes: usize,
 }
 
 impl Server {
-    #[cfg(all(test, feature = "runtime-tokio"))]
+    #[cfg(all(
+        test,
+        feature = "runtime-tokio",
+        any(target_os = "linux", target_os = "macos", windows)
+    ))]
     fn from_endpoint(endpoint: noq::Endpoint) -> Self {
-        Self::from_endpoint_with_limits(endpoint, 128, 16, crate::flow::RELAY_BUFFER_BYTES, true)
-    }
-
-    fn from_endpoint_with_config(endpoint: noq::Endpoint, config: &ServerConfig) -> Self {
         Self::from_endpoint_with_limits(
             endpoint,
-            usize::from(config.transport().max_active_connections),
-            usize::from(config.transport().max_active_connections_per_peer),
-            config.transport().flow_write_buffer_bytes as usize,
-            config.transport().default_nodelay,
+            128,
+            16,
+            crate::flow::RELAY_BUFFER_BYTES,
+            true,
+            Arc::new(noq::TokioRuntime),
+            None,
+            crate::config::RecoveryConfig::default(),
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
+            1200,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_endpoint_with_limits(
         endpoint: noq::Endpoint,
         max_active_connections: usize,
         max_active_connections_per_peer: usize,
         flow_buffer_bytes: usize,
         default_nodelay: bool,
+        runtime: Arc<dyn noq::Runtime>,
+        runtime_shutdown: Option<Arc<AtomicBool>>,
+        recovery: crate::config::RecoveryConfig,
+        recovery_memory: Arc<RecoveryMemoryBudget>,
+        max_symbol_bytes: usize,
     ) -> Self {
         Self {
             endpoint,
@@ -526,68 +797,44 @@ impl Server {
             )),
             flow_buffer_bytes,
             default_nodelay,
+            runtime,
+            runtime_shutdown,
+            recovery,
+            recovery_memory,
+            max_symbol_bytes,
         }
-    }
-
-    /// Creates a server endpoint from a host-owned datagram carrier and runtime.
-    ///
-    /// The caller remains responsible for moving datagrams through `socket` and advancing
-    /// `runtime`; no OS socket or executor is created by this constructor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when endpoint or optional TLS configuration cannot be built.
-    #[cfg(feature = "internal-bench")]
-    pub fn from_socket(
-        config: &ServerConfig,
-        socket: Box<dyn noq::AsyncUdpSocket>,
-        runtime: Arc<dyn noq::Runtime>,
-    ) -> Result<Self, TransportError> {
-        Self::from_socket_with_options_internal(
-            ValidatedServerConfig::new(config)?,
-            socket,
-            runtime,
-            &TransportOptions::default(),
-            None,
-        )
-    }
-
-    /// Creates a server endpoint with runtime-neutral Rust extension options.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when endpoint construction or optional TLS configuration fails.
-    #[cfg(feature = "internal-bench")]
-    pub fn from_socket_with_options(
-        config: &ServerConfig,
-        socket: Box<dyn noq::AsyncUdpSocket>,
-        runtime: Arc<dyn noq::Runtime>,
-        options: &TransportOptions,
-    ) -> Result<Self, TransportError> {
-        Self::from_socket_with_options_internal(
-            ValidatedServerConfig::new(config)?,
-            socket,
-            runtime,
-            options,
-            None,
-        )
     }
 
     fn from_socket_with_options_internal(
         config: ValidatedServerConfig<'_>,
         socket: Box<dyn noq::AsyncUdpSocket>,
         runtime: Arc<dyn noq::Runtime>,
+        runtime_shutdown: Option<Arc<AtomicBool>>,
         options: &TransportOptions,
         adapter_mtu: Option<u16>,
     ) -> Result<Self, TransportError> {
-        let endpoint = build_server_endpoint_with_validated_config(
+        let runtime_for_server = Arc::clone(&runtime);
+        let (endpoint, payload_ceiling) = build_server_endpoint_with_validated_config(
             config,
             socket,
             runtime,
             options,
             adapter_mtu,
         )?;
-        Ok(Self::from_endpoint_with_config(endpoint, &config))
+        Ok(Self::from_endpoint_with_limits(
+            endpoint,
+            usize::from(config.transport().max_active_connections),
+            usize::from(config.transport().max_active_connections_per_peer),
+            config.transport().flow_write_buffer_bytes as usize,
+            config.transport().default_nodelay,
+            runtime_for_server,
+            runtime_shutdown,
+            config.transport().recovery,
+            Arc::new(RecoveryMemoryBudget::new(
+                config.transport().recovery_memory_budget_bytes,
+            )),
+            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
+        ))
     }
 
     /// Creates a portable server from the built-in host-driven carrier and runtime.
@@ -614,6 +861,9 @@ impl Server {
         runtime: Arc<HostRuntime>,
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
+        if runtime.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "host runtime is closed").into());
+        }
         let config = ValidatedServerConfig::new(config)?;
         let local_addr = socket.local_addr();
         if !listen_addr_admits(&config.listen_addrs, local_addr) {
@@ -628,11 +878,58 @@ impl Server {
         let adapter_mtu = u16::try_from(socket.mtu()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "host datagram MTU exceeds u16")
         })?;
+        let runtime_shutdown = Some(runtime.shutdown_signal());
         Self::from_socket_with_options_internal(
             config,
             Box::new(socket),
             runtime,
+            runtime_shutdown,
             options,
+            Some(adapter_mtu),
+        )
+    }
+
+    /// Creates a portable server over two host-driven path carriers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate routes, invalid MTUs, or addresses outside the listen
+    /// allowlist.
+    pub fn from_host_sockets(
+        config: &ServerConfig,
+        sockets: &[HostDatagramSocket; 2],
+        runtime: Arc<HostRuntime>,
+    ) -> Result<Self, TransportError> {
+        if runtime.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "host runtime is closed").into());
+        }
+        let config = ValidatedServerConfig::new(config)?;
+        for socket in sockets {
+            if !listen_addr_admits(&config.listen_addrs, socket.local_addr()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "host server path is outside the configured listen allowlist",
+                )
+                .into());
+            }
+        }
+        let adapter_mtu = sockets
+            .iter()
+            .map(HostDatagramSocket::mtu)
+            .min()
+            .and_then(|mtu| u16::try_from(mtu).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid host MTU"))?;
+        let socket = MultipathSocket::new(
+            (Box::new(sockets[0].clone()), sockets[0].peer_addr()),
+            (Box::new(sockets[1].clone()), sockets[1].peer_addr()),
+        )?;
+        let runtime_shutdown = Some(runtime.shutdown_signal());
+        Self::from_socket_with_options_internal(
+            config,
+            Box::new(socket),
+            runtime,
+            runtime_shutdown,
+            &TransportOptions::default(),
             Some(adapter_mtu),
         )
     }
@@ -652,6 +949,11 @@ impl Server {
                 active_connections: Arc::clone(&self.active_connections),
                 flow_buffer_bytes: self.flow_buffer_bytes,
                 default_nodelay: self.default_nodelay,
+                runtime: Arc::clone(&self.runtime),
+                runtime_shutdown: self.runtime_shutdown.clone(),
+                recovery: self.recovery,
+                recovery_memory: Arc::clone(&self.recovery_memory),
+                max_symbol_bytes: self.max_symbol_bytes,
             })
             .ok_or(ConnectionError::EndpointClosed)
     }
@@ -665,6 +967,11 @@ pub struct IncomingConnection {
     active_connections: Arc<ConnectionBudget>,
     flow_buffer_bytes: usize,
     default_nodelay: bool,
+    runtime: Arc<dyn noq::Runtime>,
+    runtime_shutdown: Option<Arc<AtomicBool>>,
+    recovery: crate::config::RecoveryConfig,
+    recovery_memory: Arc<RecoveryMemoryBudget>,
+    max_symbol_bytes: usize,
 }
 
 impl IncomingConnection {
@@ -680,6 +987,11 @@ impl IncomingConnection {
             active_connections,
             flow_buffer_bytes,
             default_nodelay,
+            runtime,
+            runtime_shutdown,
+            recovery,
+            recovery_memory,
+            max_symbol_bytes,
         } = self;
         let Some(permit) = active_connections.try_acquire(peer) else {
             incoming.refuse();
@@ -687,8 +999,63 @@ impl IncomingConnection {
         };
         incoming
             .await
-            .map(|backend| Connection::server(backend, permit, flow_buffer_bytes, default_nodelay))
+            .map(|backend| {
+                Connection::server(
+                    backend,
+                    permit,
+                    flow_buffer_bytes,
+                    default_nodelay,
+                    &runtime,
+                    runtime_shutdown,
+                    recovery,
+                    recovery_memory,
+                    max_symbol_bytes,
+                )
+            })
             .map_err(|error| ConnectionError::Handshake(Box::new(error)))
+    }
+
+    /// Accepts a connection before handshake completion for explicit replay-safe flow admission.
+    ///
+    /// Ordinary OPEN frames remain blocked until backend authentication completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint or active-connection budget rejects the attempt.
+    pub fn accept_replay_safe(self) -> Result<Connection, ConnectionError> {
+        let Self {
+            incoming,
+            peer,
+            active_connections,
+            flow_buffer_bytes,
+            default_nodelay,
+            runtime,
+            runtime_shutdown,
+            recovery,
+            recovery_memory,
+            max_symbol_bytes,
+        } = self;
+        let Some(permit) = active_connections.try_acquire(peer) else {
+            incoming.refuse();
+            return Err(ConnectionError::ResourceLimit);
+        };
+        let connecting = incoming
+            .accept()
+            .map_err(|error| ConnectionError::Handshake(Box::new(error)))?;
+        let (backend, _) = connecting
+            .into_0rtt()
+            .map_err(|_| ConnectionError::EarlyUnavailable)?;
+        Ok(Connection::server(
+            backend,
+            permit,
+            flow_buffer_bytes,
+            default_nodelay,
+            &runtime,
+            runtime_shutdown,
+            recovery,
+            recovery_memory,
+            max_symbol_bytes,
+        ))
     }
 }
 
@@ -701,16 +1068,31 @@ pub struct Connection {
     path_manager: Option<Arc<Mutex<PathManager>>>,
     flow_buffer_bytes: usize,
     default_nodelay: bool,
+    recovery: Arc<ConnectionRecovery>,
 }
 
 impl Connection {
+    #[allow(clippy::too_many_arguments)]
     fn client(
         backend: noq::Connection,
         backup_path: Option<noq::Path>,
         path_manager: Arc<Mutex<PathManager>>,
         flow_buffer_bytes: usize,
         default_nodelay: bool,
+        runtime: &Arc<dyn noq::Runtime>,
+        runtime_shutdown: Option<Arc<AtomicBool>>,
+        recovery_config: crate::config::RecoveryConfig,
+        recovery_memory: Arc<RecoveryMemoryBudget>,
+        max_symbol_bytes: usize,
     ) -> Self {
+        let recovery = ConnectionRecovery::start(
+            backend.clone(),
+            runtime,
+            runtime_shutdown,
+            recovery_memory,
+            recovery_config,
+            max_symbol_bytes,
+        );
         Self {
             backend,
             permit: None,
@@ -718,15 +1100,30 @@ impl Connection {
             path_manager: Some(path_manager),
             flow_buffer_bytes,
             default_nodelay,
+            recovery,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn server(
         backend: noq::Connection,
         permit: Arc<ConnectionPermit>,
         flow_buffer_bytes: usize,
         default_nodelay: bool,
+        runtime: &Arc<dyn noq::Runtime>,
+        runtime_shutdown: Option<Arc<AtomicBool>>,
+        recovery_config: crate::config::RecoveryConfig,
+        recovery_memory: Arc<RecoveryMemoryBudget>,
+        max_symbol_bytes: usize,
     ) -> Self {
+        let recovery = ConnectionRecovery::start(
+            backend.clone(),
+            runtime,
+            runtime_shutdown,
+            recovery_memory,
+            recovery_config,
+            max_symbol_bytes,
+        );
         Self {
             backend,
             permit: Some(permit),
@@ -734,6 +1131,7 @@ impl Connection {
             path_manager: None,
             flow_buffer_bytes,
             default_nodelay,
+            recovery,
         }
     }
 }
@@ -743,6 +1141,12 @@ impl Connection {
     #[must_use]
     pub fn stable_id(&self) -> usize {
         self.backend.stable_id()
+    }
+
+    /// Returns whether the backend has entered a terminal closed state.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.backend.close_reason().is_some()
     }
 
     /// Returns whether the configured client backup path is validated and usable.
@@ -766,9 +1170,18 @@ impl Connection {
     /// client's path-role configuration.
     #[must_use]
     pub fn path_health(&self) -> Option<PathHealth> {
+        if self.backend.close_reason().is_some() {
+            return self.path_manager.as_ref().map(|_| PathHealth::Failed);
+        }
         self.path_manager
             .as_ref()
             .map(|manager| lock_budget(manager).health())
+    }
+
+    /// Returns a lock-free snapshot of QUICP/2 recovery counters.
+    #[must_use]
+    pub fn recovery_snapshot(&self) -> RecoverySnapshot {
+        self.recovery.snapshot()
     }
 
     /// Opens one application flow.
@@ -788,6 +1201,7 @@ impl Connection {
             self.permit.clone(),
             self.flow_buffer_bytes,
             self.default_nodelay,
+            Arc::clone(&self.recovery),
         )
         .await
     }
@@ -807,6 +1221,99 @@ impl Connection {
             self.permit.clone(),
             self.flow_buffer_bytes,
             self.default_nodelay,
+            Arc::clone(&self.recovery),
+        )
+        .await
+    }
+
+    /// Issues a replay-safe token bound to this connection's negotiated QUICP/2 capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before capability negotiation, for an invalid TTL, or when system
+    /// randomness is unavailable.
+    pub fn issue_replay_token(
+        &self,
+        admission: &ReplayAdmission,
+        now_seconds: u64,
+        ttl_seconds: u64,
+    ) -> Result<ReplayToken, crate::ReplayTokenError> {
+        let capabilities = self
+            .recovery
+            .capability_fingerprint()
+            .ok_or(crate::ReplayTokenError::CapabilitiesUnavailable)?;
+        admission.issue(now_seconds, ttl_seconds, capabilities)
+    }
+
+    /// Opens a replay-safe flow and sends bounded initial bytes as early data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when replay-safe admission or flow setup fails.
+    pub async fn open_replay_safe(
+        &self,
+        token: &ReplayToken,
+        nonce: u64,
+        request: OpenRequest,
+        initial: bytes::Bytes,
+        current_policy_authorized: bool,
+    ) -> Result<QuicpFlow, FlowError> {
+        QuicpFlow::open_replay_safe_backend(
+            &self.backend,
+            token,
+            nonce,
+            request,
+            initial,
+            current_policy_authorized,
+            self.permit.clone(),
+            self.flow_buffer_bytes,
+            self.default_nodelay,
+            Arc::clone(&self.recovery),
+        )
+        .await
+    }
+
+    /// Accepts either one replay-safe early flow or its ordinary fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before application exposure when token, replay, policy, or framing
+    /// validation fails.
+    pub async fn accept_replay_safe_flow(
+        &self,
+        admission: &ReplayAdmission,
+        current_policy_authorized: bool,
+    ) -> Result<PendingFlow, FlowError> {
+        self.accept_replay_safe_flow_with_clock(
+            admission,
+            || {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+            },
+            current_policy_authorized,
+        )
+        .await
+    }
+
+    pub(crate) async fn accept_replay_safe_flow_with_clock<F>(
+        &self,
+        admission: &ReplayAdmission,
+        now_seconds: F,
+        current_policy_authorized: bool,
+    ) -> Result<PendingFlow, FlowError>
+    where
+        F: FnOnce() -> u64 + Send,
+    {
+        crate::flow::accept_replay_safe_backend(
+            &self.backend,
+            admission,
+            now_seconds,
+            current_policy_authorized,
+            self.permit.clone(),
+            self.flow_buffer_bytes,
+            self.default_nodelay,
+            Arc::clone(&self.recovery),
         )
         .await
     }
@@ -816,7 +1323,11 @@ impl Connection {
         self.backend.close(backend_error_code(error), reason);
     }
 
-    #[cfg(all(test, feature = "runtime-tokio"))]
+    #[cfg(all(
+        test,
+        feature = "runtime-tokio",
+        any(target_os = "linux", target_os = "macos", windows)
+    ))]
     fn backend(&self) -> &noq::Connection {
         &self.backend
     }
@@ -903,31 +1414,15 @@ pub enum ConnectionError {
     /// Required multipath setup or monitoring failed.
     #[error("QUICP multipath setup failed: {0}")]
     Multipath(#[source] Box<dyn std::error::Error + Send + Sync>),
-}
-
-/// Builds the current `noq` backend's TLS 1.3 profile.
-///
-/// TLS is an optional QUICP security layer, not part of the no-security protocol baseline. This
-/// builder belongs to the temporary TLS-backed adapter and is not the QUICP core interface.
-///
-/// # Errors
-///
-/// Returns an error for unsafe files, malformed PEM, invalid certificates or keys, or an
-/// incompatible crypto provider.
-pub fn build_client_config(config: &ClientConfig) -> Result<noq::ClientConfig, TransportError> {
-    build_client_config_with_options(config, &TransportOptions::default())
-}
-
-/// Builds a client backend configuration with runtime-neutral Rust extension options.
-///
-/// # Errors
-///
-/// Returns an error when security configuration or optional TLS material is invalid.
-pub fn build_client_config_with_options(
-    config: &ClientConfig,
-    options: &TransportOptions,
-) -> Result<noq::ClientConfig, TransportError> {
-    build_client_config_with_options_and_payload(ValidatedClientConfig::new(config)?, options, None)
+    /// The backend cannot enter its early-data state.
+    #[error("QUICP early data is unavailable")]
+    EarlyUnavailable,
+    /// Replay-safe initial bytes are empty or exceed the configured flow buffer.
+    #[error("invalid replay-safe initial bytes")]
+    ReplaySafeInput,
+    /// Replay-safe flow setup or fallback failed.
+    #[error(transparent)]
+    Flow(#[from] FlowError),
 }
 
 fn build_client_config_with_options_and_payload(
@@ -939,7 +1434,7 @@ fn build_client_config_with_options_and_payload(
     if config.tls.is_some() && custom_header_protection.is_some() {
         return Err(TransportError::HeaderProtectionWithTls);
     }
-    let profile_token = ApplicationProfile::from(config.multipath.mode).profile_token();
+    let profile_token = application_profile_token();
     let mut transport = match config.tls.as_ref() {
         Some(tls) => {
             #[cfg(feature = "tls-rustls")]
@@ -956,8 +1451,7 @@ fn build_client_config_with_options_and_payload(
                 )
                 .map_err(tls_error)?;
                 crypto.alpn_protocols = vec![profile_token.to_vec()];
-                // Transport 0-RTT is not part of the admitted QUICP profile.
-                crypto.enable_early_data = false;
+                crypto.enable_early_data = true;
                 noq::ClientConfig::new(Arc::new(
                     QuicClientConfig::try_from(crypto).map_err(tls_error)?,
                 ))
@@ -965,7 +1459,7 @@ fn build_client_config_with_options_and_payload(
             #[cfg(not(feature = "tls-rustls"))]
             {
                 let _ = tls;
-                return Err(TransportError::TlsFeatureDisabled);
+                return Err(ConfigError::TlsFeatureDisabled.into());
             }
         }
         None => noq::ClientConfig::new(Arc::new(NoSecurityClientConfig::new(
@@ -981,29 +1475,6 @@ fn build_client_config_with_options_and_payload(
     );
     transport.transport_config(Arc::new(transport_config));
     Ok(transport)
-}
-
-/// Builds the current `noq` backend's TLS 1.3 mutual-authentication profile for both QUICP
-/// profile tokens.
-///
-/// # Errors
-///
-/// Returns an error for unsafe files, malformed PEM, invalid certificates or keys, or an
-/// incompatible crypto provider.
-pub fn build_server_config(config: &ServerConfig) -> Result<noq::ServerConfig, TransportError> {
-    build_server_config_with_options(config, &TransportOptions::default())
-}
-
-/// Builds a server backend configuration with runtime-neutral Rust extension options.
-///
-/// # Errors
-///
-/// Returns an error when security configuration or optional TLS material is invalid.
-pub fn build_server_config_with_options(
-    config: &ServerConfig,
-    options: &TransportOptions,
-) -> Result<noq::ServerConfig, TransportError> {
-    build_server_config_with_options_and_payload(ValidatedServerConfig::new(config)?, options, None)
 }
 
 fn build_server_config_with_options_and_payload(
@@ -1035,15 +1506,9 @@ fn build_server_config_with_options_and_payload(
                         load_private_key(&tls.server_key)?,
                     )
                     .map_err(tls_error)?;
-                crypto.alpn_protocols = [
-                    ApplicationProfile::SinglePath,
-                    ApplicationProfile::Multipath,
-                ]
-                .into_iter()
-                .map(|profile| profile.profile_token().to_vec())
-                .collect();
-                // Transport 0-RTT is not part of the admitted QUICP profile.
-                crypto.max_early_data_size = 0;
+                crypto.alpn_protocols = vec![application_profile_token().to_vec()];
+                // QUICP admits only explicit replay-safe application data during transport 0-RTT.
+                crypto.max_early_data_size = u32::MAX;
                 noq::ServerConfig::with_crypto(Arc::new(
                     QuicServerConfig::try_from(crypto).map_err(tls_error)?,
                 ))
@@ -1051,7 +1516,7 @@ fn build_server_config_with_options_and_payload(
             #[cfg(not(feature = "tls-rustls"))]
             {
                 let _ = tls;
-                return Err(TransportError::TlsFeatureDisabled);
+                return Err(ConfigError::TlsFeatureDisabled.into());
             }
         }
         None => noq::ServerConfig::with_crypto(Arc::new(NoSecurityServerConfig::new(
@@ -1075,127 +1540,35 @@ fn build_server_config_with_options_and_payload(
     Ok(transport)
 }
 
-/// Builds a client endpoint from a runtime-owned datagram socket.
-///
-/// The caller supplies both `noq` runtime traits, so Tokio or another runtime/event loop can
-/// provide the carrier without changing QUICP's protocol or application configuration.
-///
-/// # Errors
-///
-/// Returns an error when endpoint construction or the optional TLS-backed adapter configuration
-/// fails.
-pub fn build_client_endpoint_with_socket(
-    config: &ClientConfig,
-    socket: Box<dyn noq::AsyncUdpSocket>,
-    runtime: Arc<dyn noq::Runtime>,
-) -> Result<noq::Endpoint, TransportError> {
-    build_client_endpoint_with_socket_and_options(
-        config,
-        socket,
-        runtime,
-        &TransportOptions::default(),
-    )
-}
-
-/// Builds a client endpoint with runtime-neutral Rust extension options.
-///
-/// # Errors
-///
-/// Returns an error when endpoint construction or optional TLS configuration fails.
-pub fn build_client_endpoint_with_socket_and_options(
-    config: &ClientConfig,
-    socket: Box<dyn noq::AsyncUdpSocket>,
-    runtime: Arc<dyn noq::Runtime>,
-    options: &TransportOptions,
-) -> Result<noq::Endpoint, TransportError> {
-    build_client_endpoint_with_socket_and_options_and_mtu(config, socket, runtime, options, None)
-}
-
-fn build_client_endpoint_with_socket_and_options_and_mtu(
-    config: &ClientConfig,
-    socket: Box<dyn noq::AsyncUdpSocket>,
-    runtime: Arc<dyn noq::Runtime>,
-    options: &TransportOptions,
-    adapter_mtu: Option<u16>,
-) -> Result<noq::Endpoint, TransportError> {
-    build_client_endpoint_with_validated_config(
-        ValidatedClientConfig::new(config)?,
-        socket,
-        runtime,
-        options,
-        adapter_mtu,
-    )
-}
-
 fn build_client_endpoint_with_validated_config(
     config: ValidatedClientConfig<'_>,
     socket: Box<dyn noq::AsyncUdpSocket>,
     runtime: Arc<dyn noq::Runtime>,
     options: &TransportOptions,
     adapter_mtu: Option<u16>,
-) -> Result<noq::Endpoint, TransportError> {
-    let payload_ceiling = effective_payload_ceiling(&config, socket.as_ref(), adapter_mtu)?;
+) -> Result<(noq::Endpoint, u16), TransportError> {
+    let payload_ceiling =
+        effective_payload_ceiling_inner(&config.transport().mtu, socket.as_ref(), adapter_mtu)?;
+    let transport =
+        build_client_config_with_options_and_payload(config, options, Some(payload_ceiling))?;
+    build_client_endpoint(config, transport, socket, runtime, payload_ceiling)
+}
+
+fn build_client_endpoint(
+    config: ValidatedClientConfig<'_>,
+    transport: noq::ClientConfig,
+    socket: Box<dyn noq::AsyncUdpSocket>,
+    runtime: Arc<dyn noq::Runtime>,
+    payload_ceiling: u16,
+) -> Result<(noq::Endpoint, u16), TransportError> {
     let mut endpoint_config = noq::EndpointConfig::default();
     endpoint_config.grease_quic_bit(config.tls.is_some());
     endpoint_config
         .max_udp_payload_size(payload_ceiling)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let endpoint = noq::Endpoint::new_with_abstract_socket(endpoint_config, None, socket, runtime)?;
-    endpoint.set_default_client_config(build_client_config_with_options_and_payload(
-        config,
-        options,
-        Some(payload_ceiling),
-    )?);
-    Ok(endpoint)
-}
-
-/// Builds a server endpoint from a runtime-owned datagram socket.
-///
-/// # Errors
-///
-/// Returns an error when endpoint construction or the optional TLS-backed adapter configuration
-/// fails.
-pub fn build_server_endpoint_with_socket(
-    config: &ServerConfig,
-    socket: Box<dyn noq::AsyncUdpSocket>,
-    runtime: Arc<dyn noq::Runtime>,
-) -> Result<noq::Endpoint, TransportError> {
-    build_server_endpoint_with_socket_and_options(
-        config,
-        socket,
-        runtime,
-        &TransportOptions::default(),
-    )
-}
-
-/// Builds a server endpoint with runtime-neutral Rust extension options.
-///
-/// # Errors
-///
-/// Returns an error when endpoint construction or optional TLS configuration fails.
-pub fn build_server_endpoint_with_socket_and_options(
-    config: &ServerConfig,
-    socket: Box<dyn noq::AsyncUdpSocket>,
-    runtime: Arc<dyn noq::Runtime>,
-    options: &TransportOptions,
-) -> Result<noq::Endpoint, TransportError> {
-    build_server_endpoint_with_socket_and_options_and_mtu(config, socket, runtime, options, None)
-}
-
-fn build_server_endpoint_with_socket_and_options_and_mtu(
-    config: &ServerConfig,
-    socket: Box<dyn noq::AsyncUdpSocket>,
-    runtime: Arc<dyn noq::Runtime>,
-    options: &TransportOptions,
-    adapter_mtu: Option<u16>,
-) -> Result<noq::Endpoint, TransportError> {
-    build_server_endpoint_with_validated_config(
-        ValidatedServerConfig::new(config)?,
-        socket,
-        runtime,
-        options,
-        adapter_mtu,
-    )
+    endpoint.set_default_client_config(transport);
+    Ok((endpoint, payload_ceiling))
 }
 
 fn build_server_endpoint_with_validated_config(
@@ -1204,39 +1577,29 @@ fn build_server_endpoint_with_validated_config(
     runtime: Arc<dyn noq::Runtime>,
     options: &TransportOptions,
     adapter_mtu: Option<u16>,
-) -> Result<noq::Endpoint, TransportError> {
-    let payload_ceiling = effective_server_payload_ceiling(&config, socket.as_ref(), adapter_mtu)?;
+) -> Result<(noq::Endpoint, u16), TransportError> {
+    let payload_ceiling =
+        effective_payload_ceiling_inner(&config.transport().mtu, socket.as_ref(), adapter_mtu)?;
+    let transport =
+        build_server_config_with_options_and_payload(config, options, Some(payload_ceiling))?;
+    build_server_endpoint(config, transport, socket, runtime, payload_ceiling)
+}
+
+fn build_server_endpoint(
+    config: ValidatedServerConfig<'_>,
+    transport: noq::ServerConfig,
+    socket: Box<dyn noq::AsyncUdpSocket>,
+    runtime: Arc<dyn noq::Runtime>,
+    payload_ceiling: u16,
+) -> Result<(noq::Endpoint, u16), TransportError> {
     let mut endpoint_config = noq::EndpointConfig::default();
     endpoint_config.grease_quic_bit(config.tls.is_some());
     endpoint_config
         .max_udp_payload_size(payload_ceiling)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    Ok(noq::Endpoint::new_with_abstract_socket(
-        endpoint_config,
-        Some(build_server_config_with_options_and_payload(
-            config,
-            options,
-            Some(payload_ceiling),
-        )?),
-        socket,
-        runtime,
-    )?)
-}
-
-fn effective_payload_ceiling(
-    config: &ClientConfig,
-    socket: &dyn AsyncUdpSocket,
-    adapter_mtu: Option<u16>,
-) -> Result<u16, TransportError> {
-    effective_payload_ceiling_inner(&config.transport().mtu, socket, adapter_mtu)
-}
-
-fn effective_server_payload_ceiling(
-    config: &ServerConfig,
-    socket: &dyn AsyncUdpSocket,
-    adapter_mtu: Option<u16>,
-) -> Result<u16, TransportError> {
-    effective_payload_ceiling_inner(&config.transport().mtu, socket, adapter_mtu)
+    let endpoint =
+        noq::Endpoint::new_with_abstract_socket(endpoint_config, Some(transport), socket, runtime)?;
+    Ok((endpoint, payload_ceiling))
 }
 
 fn effective_payload_ceiling_inner(
@@ -1314,6 +1677,7 @@ fn tls_error(error: impl std::error::Error + Send + Sync + 'static) -> Transport
 
 /// Endpoint construction, configuration, security-adapter, and carrier errors.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TransportError {
     /// Operating-system or adapter I/O failed.
     #[error(transparent)]
@@ -1329,9 +1693,6 @@ pub enum TransportError {
     /// A certificate-chain file contained no certificates.
     #[error("certificate file is empty: {0}")]
     EmptyCertificateFile(PathBuf),
-    /// TLS settings were supplied without the `tls-rustls` feature.
-    #[error("TLS configuration requires the `tls-rustls` feature")]
-    TlsFeatureDisabled,
     /// Custom header protection was combined with TLS.
     #[error("custom QUICP header protection is only available in the no-TLS profile")]
     HeaderProtectionWithTls,
@@ -1340,12 +1701,16 @@ pub enum TransportError {
     UnsupportedMultipathCarrier,
 }
 
-#[cfg(all(test, feature = "runtime-tokio"))]
+#[cfg(all(
+    test,
+    feature = "runtime-tokio",
+    any(target_os = "linux", target_os = "macos", windows)
+))]
 mod tests {
     use std::io::{self, IoSliceMut};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::num::{NonZeroU16, NonZeroUsize};
-    #[cfg(any(unix, all(feature = "tls-rustls", unix)))]
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
     use std::sync::{
@@ -1363,24 +1728,92 @@ mod tests {
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[cfg(unix)]
+    use super::SYN_COOKIE_EPOCH_SECONDS;
     use super::{
         BackupPath, Client, ConnectionBudget, MultipathSocket, Server, TransportError,
-        build_client_config, build_client_endpoint_with_socket, build_server_config,
-        build_server_endpoint_with_socket, lock_budget,
+        ValidatedClientConfig, ValidatedServerConfig, lock_budget,
     };
-    #[cfg(unix)]
-    use super::{SYN_COOKIE_EPOCH_SECONDS, validate_fake_tcp_syn_data};
     use crate::config::{
         CarrierConfig, ClientConfig, ConfigError, Multipath, MultipathMode, PathCandidate,
         ServerConfig,
     };
-    #[cfg(any(not(feature = "tls-rustls"), all(feature = "tls-rustls", unix)))]
+    #[cfg(any(not(feature = "tls-rustls"), unix))]
     use crate::config::{ClientTls, ServerTls};
     #[cfg(unix)]
-    use crate::config::{CongestionControl, SynDataPolicy};
-    #[cfg(unix)]
-    use crate::faketcp::{FourTuple, SynDataMode};
+    use crate::faketcp::FourTuple;
     use crate::multipath::PathHealth;
+    use crate::session::ApplicationError;
+
+    fn build_client_config(config: &ClientConfig) -> Result<noq::ClientConfig, TransportError> {
+        super::build_client_config_with_options_and_payload(
+            ValidatedClientConfig::new(config)?,
+            &crate::TransportOptions::default(),
+            None,
+        )
+    }
+
+    fn build_server_config(config: &ServerConfig) -> Result<noq::ServerConfig, TransportError> {
+        super::build_server_config_with_options_and_payload(
+            ValidatedServerConfig::new(config)?,
+            &crate::TransportOptions::default(),
+            None,
+        )
+    }
+
+    #[cfg(all(feature = "tls-rustls", unix))]
+    fn build_early_rejecting_server_config(config: &ServerConfig) -> noq::ServerConfig {
+        let tls = config.tls.as_ref().unwrap();
+        let provider = Arc::new(noq::rustls::crypto::ring::default_provider());
+        let verifier = super::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(super::load_roots(&tls.client_ca).unwrap()),
+            Arc::clone(&provider),
+        )
+        .build()
+        .unwrap();
+        let mut crypto = noq::rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&noq::rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                super::load_certificates(&tls.server_cert).unwrap(),
+                super::load_private_key(&tls.server_key).unwrap(),
+            )
+            .unwrap();
+        crypto.alpn_protocols = vec![super::application_profile_token().to_vec()];
+        crypto.max_early_data_size = 0;
+        noq::ServerConfig::with_crypto(Arc::new(super::QuicServerConfig::try_from(crypto).unwrap()))
+    }
+
+    fn build_client_endpoint_with_socket(
+        config: &ClientConfig,
+        socket: Box<dyn noq::AsyncUdpSocket>,
+        runtime: Arc<dyn noq::Runtime>,
+    ) -> Result<noq::Endpoint, TransportError> {
+        super::build_client_endpoint_with_validated_config(
+            ValidatedClientConfig::new(config)?,
+            socket,
+            runtime,
+            &crate::TransportOptions::default(),
+            None,
+        )
+        .map(|(endpoint, _)| endpoint)
+    }
+
+    fn build_server_endpoint_with_socket(
+        config: &ServerConfig,
+        socket: Box<dyn noq::AsyncUdpSocket>,
+        runtime: Arc<dyn noq::Runtime>,
+    ) -> Result<noq::Endpoint, TransportError> {
+        super::build_server_endpoint_with_validated_config(
+            ValidatedServerConfig::new(config)?,
+            socket,
+            runtime,
+            &crate::TransportOptions::default(),
+            None,
+        )
+        .map(|(endpoint, _)| endpoint)
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1391,9 +1824,7 @@ mod tests {
         std::fs::write(&secret_path, b"transport test cookie secret").expect("secret");
         std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
             .expect("secret permissions");
-        let carrier =
-            CarrierConfig::new(SynDataPolicy::Cookie, secret_path, CongestionControl::Cubic)
-                .unwrap();
+        let carrier = CarrierConfig::new(secret_path).unwrap();
         let tuple = FourTuple::new(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000)),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 44_443)),
@@ -1407,9 +1838,41 @@ mod tests {
             / SYN_COOKIE_EPOCH_SECONDS;
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].0, tuple);
-        assert_eq!(paths[0].1, carrier.syn_data_mode(&secret, tuple, epoch));
+        assert_eq!(paths[0].1, carrier.syn_cookie_mode(&secret, tuple, epoch));
         assert_eq!(paths[0].2, crate::faketcp::DEFAULT_SYN_MSS);
         assert_eq!(paths[0].3, transport.mtu.outer_ip_mtu);
+    }
+
+    #[cfg(all(feature = "tls-rustls", unix))]
+    #[test]
+    fn raw_faketcp_validates_tls_material_before_binding() {
+        let directory = secure_tempdir();
+        let secret_path = directory.path().join("carrier-cookie.secret");
+        std::fs::write(&secret_path, b"transport test cookie secret").unwrap();
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let missing_tls_path = directory.path().join("missing.pem");
+        let tuple = FourTuple::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 44_443)),
+        );
+        let config = ClientConfig::with_tls(
+            ClientTls::new(
+                "server.example",
+                &missing_tls_path,
+                &missing_tls_path,
+                &missing_tls_path,
+            )
+            .unwrap(),
+            Multipath::single(PathCandidate::new(tuple.source.ip(), tuple.destination).unwrap())
+                .unwrap(),
+            CarrierConfig::new(secret_path).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Client::bind_fake_tcp(&config, &[tuple]),
+            Err(TransportError::Config(ConfigError::SecureOpen(_)))
+        ));
     }
 
     #[test]
@@ -1437,27 +1900,6 @@ mod tests {
         assert!(budget.try_acquire(peer).is_none());
         drop(clone);
         assert!(budget.try_acquire(peer).is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn raw_faketcp_rejects_disabled_syn_data_without_probe_fallback() {
-        let tuple = FourTuple::new(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000)),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 44_443)),
-        );
-        let error = validate_fake_tcp_syn_data(
-            SynDataPolicy::Disabled,
-            &[(
-                tuple,
-                SynDataMode::Disabled,
-                crate::faketcp::DEFAULT_SYN_MSS,
-                1500,
-            )],
-        )
-        .expect_err("raw carrier must not defer failure until first send");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[derive(Debug)]
@@ -1553,6 +1995,532 @@ mod tests {
         .expect("backup path did not become ready");
     }
 
+    async fn plaintext_pair(
+        recovery: crate::config::RecoveryConfig,
+    ) -> (super::Connection, super::Connection) {
+        plaintext_pair_with_budget(recovery, 64 * 1024 * 1024).await
+    }
+
+    async fn plaintext_pair_with_budget(
+        recovery: crate::config::RecoveryConfig,
+        recovery_memory_budget_bytes: u32,
+    ) -> (super::Connection, super::Connection) {
+        let client_config = ClientConfig {
+            tls: None,
+            allow_insecure: true,
+            multipath: Multipath {
+                mode: MultipathMode::Off,
+                candidates: vec![PathCandidate {
+                    local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
+                }],
+            },
+            carrier: CarrierConfig::default(),
+            transport: crate::config::QuicpTransportConfig::default(),
+        };
+        let mut server_config = ServerConfig {
+            listen_addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4433))],
+            tls: None,
+            allow_insecure: true,
+            carrier: CarrierConfig::default(),
+            transport: crate::config::QuicpTransportConfig::default(),
+        };
+        server_config.transport.recovery = recovery;
+        let server_endpoint = noq::Endpoint::server(
+            build_server_config(&server_config).unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let client_endpoint =
+            noq::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        client_endpoint.set_default_client_config(build_client_config(&client_config).unwrap());
+        let server = Server::from_endpoint_with_limits(
+            server_endpoint,
+            128,
+            16,
+            crate::flow::RELAY_BUFFER_BYTES,
+            true,
+            Arc::new(noq::TokioRuntime),
+            None,
+            recovery,
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(
+                recovery_memory_budget_bytes,
+            )),
+            1200,
+        );
+        let client = Client::from_endpoint(client_endpoint, server_addr, "quicp".to_owned());
+        let server_connection = async { server.accept().await.unwrap().handshake().await.unwrap() };
+        let (server_connection, client_connection) =
+            tokio::join!(server_connection, client.connect());
+        (server_connection, client_connection.unwrap())
+    }
+
+    #[tokio::test]
+    async fn reset_propagates_code_without_affecting_another_flow() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (server, client) = plaintext_pair(crate::config::RecoveryConfig::default()).await;
+
+            let client_a = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .open_flow(
+                            crate::wire::OpenRequest::new(
+                                crate::wire::CanonicalHost::parse("reset.example").unwrap(),
+                                NonZeroU16::new(443).unwrap(),
+                            ),
+                            true,
+                        )
+                        .await
+                        .unwrap()
+                })
+            };
+            let mut server_a = server
+                .accept_flow(true)
+                .await
+                .unwrap()
+                .accept()
+                .await
+                .unwrap();
+            let mut client_a = client_a.await.unwrap();
+
+            let client_b = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .open_flow(
+                            crate::wire::OpenRequest::new(
+                                crate::wire::CanonicalHost::parse("healthy.example").unwrap(),
+                                NonZeroU16::new(443).unwrap(),
+                            ),
+                            true,
+                        )
+                        .await
+                        .unwrap()
+                })
+            };
+            let mut server_b = server
+                .accept_flow(true)
+                .await
+                .unwrap()
+                .accept()
+                .await
+                .unwrap();
+            let mut client_b = client_b.await.unwrap();
+
+            client_a.reset(ApplicationError::FlowAbort).unwrap();
+            let error = server_a.read_u8().await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            assert!(error.to_string().contains("FlowAbort (257)"));
+            assert!(server_a.reset(ApplicationError::FlowAbort).is_err());
+
+            client_b.write_all(b"still alive").await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            server_b.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"still alive");
+        })
+        .await
+        .expect("reset isolation test timed out");
+    }
+
+    #[tokio::test]
+    async fn datagram_before_open_attaches_once_after_accept() {
+        let (server, client) = plaintext_pair(crate::config::RecoveryConfig::default()).await;
+        let request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("pre-open.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let client_flow = tokio::spawn(async move { client.open_flow(request, true).await });
+        let pending = server.accept_flow(true).await.unwrap();
+        let mut encoded = Vec::new();
+        crate::wire::encode_source(
+            7,
+            &[crate::wire::SourceRecord {
+                flow_id: pending.flow_id_for_test(),
+                offset: 0,
+                fin: false,
+                data: b"early",
+            }],
+            &mut encoded,
+        )
+        .unwrap();
+        let encoded = bytes::Bytes::from(encoded);
+        let encoded_range = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
+        server.recovery.receive_for_test(&encoded);
+        let retained = server.recovery.memory_used_for_test();
+        let decoder = server.recovery.decoder_state_for_test();
+        server.recovery.receive_for_test(&encoded);
+        assert_eq!(server.recovery_snapshot().source_received, 1);
+        assert_eq!(server.recovery.memory_used_for_test(), retained);
+        assert_eq!(server.recovery.decoder_state_for_test(), decoder);
+        assert!(
+            !encoded_range.contains(
+                &server
+                    .recovery
+                    .pre_open_data_pointer_for_test(pending.flow_id_for_test())
+                    .unwrap()
+            )
+        );
+        let mut following = Vec::new();
+        crate::wire::encode_source(
+            8,
+            &[crate::wire::SourceRecord {
+                flow_id: pending.flow_id_for_test(),
+                offset: 5,
+                fin: false,
+                data: b"next",
+            }],
+            &mut following,
+        )
+        .unwrap();
+        server
+            .recovery
+            .receive_for_test(&bytes::Bytes::from(following));
+        assert_eq!(server.recovery_snapshot().source_received, 2);
+        let mut server_flow = pending.accept().await.unwrap();
+        let client_flow = client_flow.await.unwrap().unwrap();
+        let mut received = [0; 9];
+        server_flow.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"earlynext");
+        drop((server_flow, client_flow));
+    }
+
+    #[tokio::test]
+    async fn one_flow_gap_does_not_block_another_on_shared_connection() {
+        let (server, client) = plaintext_pair(crate::config::RecoveryConfig::default()).await;
+        let open_a = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .open_flow(
+                        crate::wire::OpenRequest::new(
+                            crate::wire::CanonicalHost::parse("gap.example").unwrap(),
+                            NonZeroU16::new(443).unwrap(),
+                        ),
+                        true,
+                    )
+                    .await
+            })
+        };
+        let pending_a = server.accept_flow(true).await.unwrap();
+        let flow_a = pending_a.flow_id_for_test();
+        let mut server_a = pending_a.accept().await.unwrap();
+        let client_a = open_a.await.unwrap().unwrap();
+
+        let open_b = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .open_flow(
+                        crate::wire::OpenRequest::new(
+                            crate::wire::CanonicalHost::parse("ready.example").unwrap(),
+                            NonZeroU16::new(443).unwrap(),
+                        ),
+                        true,
+                    )
+                    .await
+            })
+        };
+        let pending_b = server.accept_flow(true).await.unwrap();
+        let flow_b = pending_b.flow_id_for_test();
+        let mut server_b = pending_b.accept().await.unwrap();
+        let client_b = open_b.await.unwrap().unwrap();
+
+        let inject = |symbol_id, flow_id, offset, data: &'static [u8], fin| {
+            let mut encoded = Vec::new();
+            crate::wire::encode_source(
+                symbol_id,
+                &[crate::wire::SourceRecord {
+                    flow_id,
+                    offset,
+                    fin,
+                    data,
+                }],
+                &mut encoded,
+            )
+            .unwrap();
+            server
+                .recovery
+                .receive_for_test(&bytes::Bytes::from(encoded));
+        };
+        inject(20, flow_a, 4, b"late", false);
+        inject(21, flow_b, 0, b"ready", false);
+
+        let mut ready = [0; 5];
+        server_b.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready");
+        let mut blocked = [0; 8];
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            crate::flow::QuicpFlow::poll_read(Pin::new(&mut server_a), &mut context, &mut blocked,),
+            Poll::Pending
+        ));
+
+        inject(22, flow_a, 0, b"head", false);
+        server_a.read_exact(&mut blocked).await.unwrap();
+        assert_eq!(&blocked, b"headlate");
+        inject(23, flow_a, 0, b"headlate", true);
+        let mut extra = [0; 1];
+        assert_eq!(server_a.read(&mut extra).await.unwrap(), 0);
+        assert_eq!(server.recovery_snapshot().source_received, 4);
+        drop((server_a, server_b, client_a, client_b));
+    }
+
+    #[tokio::test]
+    async fn disabled_pre_open_drops_before_decoder_mutation() {
+        let recovery = crate::config::RecoveryConfig {
+            pre_open_symbols: 0,
+            ..crate::config::RecoveryConfig::default()
+        };
+        let (server, client) = plaintext_pair(recovery).await;
+        let request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("pre-open-disabled.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let client_flow = tokio::spawn(async move { client.open_flow(request, true).await });
+        let pending = server.accept_flow(true).await.unwrap();
+        let mut encoded = Vec::new();
+        crate::wire::encode_source(
+            9,
+            &[crate::wire::SourceRecord {
+                flow_id: pending.flow_id_for_test(),
+                offset: 0,
+                fin: false,
+                data: b"drop",
+            }],
+            &mut encoded,
+        )
+        .unwrap();
+        let before = server.recovery.decoder_state_for_test();
+        server
+            .recovery
+            .receive_for_test(&bytes::Bytes::from(encoded));
+        assert_eq!(server.recovery.decoder_state_for_test(), before);
+        assert_eq!(server.recovery_snapshot().source_received, 0);
+        assert_eq!(server.recovery_snapshot().dropped, 1);
+        pending
+            .reject(crate::wire::OpenStatus::CapacityExhausted)
+            .await
+            .unwrap();
+        assert!(client_flow.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn overflowing_source_range_drops_before_decoder_mutation() {
+        let (server, _client) = plaintext_pair(crate::config::RecoveryConfig::default()).await;
+        let mut encoded = vec![crate::wire::SOURCE_DATAGRAM];
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&[1, 0]);
+        encoded.extend_from_slice(&u64::MAX.to_be_bytes());
+        encoded.extend_from_slice(&[0, 1, b'x']);
+        let before = server.recovery.decoder_state_for_test();
+
+        server
+            .recovery
+            .receive_for_test(&bytes::Bytes::from(encoded));
+
+        assert_eq!(server.recovery.decoder_state_for_test(), before);
+        assert_eq!(server.recovery_snapshot().source_received, 0);
+        assert_eq!(server.recovery_snapshot().dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn pre_open_and_decoder_share_the_endpoint_memory_budget() {
+        let (server, client) =
+            plaintext_pair_with_budget(crate::config::RecoveryConfig::default(), 5).await;
+        let request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("pre-open-budget.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let client_flow = tokio::spawn(async move { client.open_flow(request, true).await });
+        let pending = server.accept_flow(true).await.unwrap();
+        let mut encoded = Vec::new();
+        crate::wire::encode_source(
+            10,
+            &[crate::wire::SourceRecord {
+                flow_id: pending.flow_id_for_test(),
+                offset: 0,
+                fin: false,
+                data: b"early",
+            }],
+            &mut encoded,
+        )
+        .unwrap();
+        server
+            .recovery
+            .receive_for_test(&bytes::Bytes::from(encoded));
+        assert_eq!(server.recovery.decoder_state_for_test(), (0, 0));
+        assert_eq!(server.recovery.memory_used_for_test(), 0);
+        assert_eq!(server.recovery_snapshot().dropped, 1);
+        pending
+            .reject(crate::wire::OpenStatus::CapacityExhausted)
+            .await
+            .unwrap();
+        assert!(client_flow.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn early_open_budget_exhaustion_precedes_success_status() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (server, client) =
+                plaintext_pair_with_budget(crate::config::RecoveryConfig::default(), 5).await;
+            let prime = crate::wire::OpenRequest::new(
+                crate::wire::CanonicalHost::parse("early-budget-prime.example").unwrap(),
+                NonZeroU16::new(443).unwrap(),
+            );
+            let (server_prime, client_prime) = tokio::join!(
+                async {
+                    server
+                        .accept_flow(true)
+                        .await
+                        .unwrap()
+                        .accept()
+                        .await
+                        .unwrap()
+                },
+                client.open_flow(prime, true)
+            );
+            drop((server_prime, client_prime.unwrap()));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while server.recovery.registered_flow_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("prime flow did not stop");
+
+            let admission = crate::ReplayAdmission::new(&[0x6b; 32], 8, 16).unwrap();
+            let token = server.issue_replay_token(&admission, 100, 60).unwrap();
+            let request = crate::wire::OpenRequest::new(
+                crate::wire::CanonicalHost::parse("early-budget.example").unwrap(),
+                NonZeroU16::new(443).unwrap(),
+            );
+            let client_task = tokio::spawn(async move {
+                client
+                    .open_replay_safe(
+                        &token,
+                        1,
+                        request,
+                        bytes::Bytes::from_static(b"sixsix"),
+                        true,
+                    )
+                    .await
+            });
+            let server_result = server
+                .accept_replay_safe_flow_with_clock(&admission, || 101, true)
+                .await;
+            let Err(crate::flow::FlowError::Accept(error)) = server_result else {
+                panic!("early OPEN exceeded the shared budget: {server_result:?}");
+            };
+            assert!(matches!(
+                error.downcast_ref(),
+                Some(crate::recovery::RecoveryError::Capacity)
+            ));
+            assert_eq!(server.recovery.memory_used_for_test(), 0);
+            assert_eq!(server.recovery.registered_flow_count(), 0);
+            assert_eq!(server.recovery_snapshot().early_accepted, 0);
+            server.close(crate::ApplicationError::FlowAbort, b"budget exhausted");
+            assert!(client_task.await.unwrap().is_err());
+        })
+        .await
+        .expect("early budget rejection timed out");
+    }
+
+    #[tokio::test]
+    async fn active_source_charges_transport_payload_ceiling_until_read() {
+        let (server, client) =
+            plaintext_pair_with_budget(crate::config::RecoveryConfig::default(), 8192).await;
+        let request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("active-budget.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let client_flow = tokio::spawn(async move { client.open_flow(request, true).await });
+        let pending = server.accept_flow(true).await.unwrap();
+        let flow_id = pending.flow_id_for_test();
+        let mut server_flow = pending.accept().await.unwrap();
+        let client_flow = client_flow.await.unwrap().unwrap();
+        let source_ceiling = 1200 + crate::wire::REPAIR_DATAGRAM_HEADER_BYTES;
+        let mut encoded = Vec::with_capacity(source_ceiling);
+        crate::wire::encode_source(
+            11,
+            &[crate::wire::SourceRecord {
+                flow_id,
+                offset: 0,
+                fin: false,
+                data: b"padded",
+            }],
+            &mut encoded,
+        )
+        .unwrap();
+        assert_eq!(encoded.capacity(), source_ceiling);
+        let encoded_len = encoded.len();
+        server
+            .recovery
+            .receive_for_test(&bytes::Bytes::from(encoded));
+        let retained = server.recovery.memory_used_for_test();
+        let encoded_len = u64::try_from(encoded_len).unwrap();
+        let source_ceiling = u64::try_from(source_ceiling).unwrap();
+        assert_eq!(retained, encoded_len + source_ceiling);
+        let mut received = [0; 6];
+        server_flow.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"padded");
+        assert_eq!(server.recovery.memory_used_for_test(), retained);
+        let expected = retained - source_ceiling;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.recovery.memory_used_for_test() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source storage was not released after ACK");
+        assert_eq!(server.recovery_snapshot().dropped, 0);
+        drop((server_flow, client_flow));
+    }
+
+    #[tokio::test]
+    async fn decoder_row_capacity_closes_the_connection() {
+        let (server, _client) = plaintext_pair(crate::config::RecoveryConfig::default()).await;
+        for repair_id in 0..512u32 {
+            let mut encoded = Vec::new();
+            crate::wire::encode_repair(
+                crate::wire::RepairDatagram {
+                    repair_id,
+                    first_symbol_id: repair_id * 2,
+                    span: 2,
+                    symbol_size: 1,
+                    seed: 1,
+                    coded: &[1],
+                },
+                &mut encoded,
+            )
+            .unwrap();
+            server
+                .recovery
+                .receive_for_test(&bytes::Bytes::from(encoded));
+        }
+        assert_eq!(server.recovery.decoder_state_for_test().1, 512);
+        assert!(!server.is_closed());
+        let mut encoded = Vec::new();
+        crate::wire::encode_repair(
+            crate::wire::RepairDatagram {
+                repair_id: 512,
+                first_symbol_id: 1024,
+                span: 2,
+                symbol_size: 1,
+                seed: 1,
+                coded: &[1],
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        server
+            .recovery
+            .receive_for_test(&bytes::Bytes::from(encoded));
+        assert!(server.is_closed());
+    }
+
     #[cfg(all(feature = "tls-rustls", unix))]
     fn secure_tempdir() -> tempfile::TempDir {
         let home = std::env::var_os("HOME").expect("HOME is required for trusted temporary files");
@@ -1563,13 +2531,12 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn plaintext_flows_preserve_status_isolation_and_half_close() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let client = ClientConfig {
+            let mut client = ClientConfig {
                 tls: None,
                 allow_insecure: true,
                 multipath: Multipath {
                     mode: MultipathMode::Off,
                     candidates: vec![PathCandidate {
-                        name: "primary".to_owned(),
                         local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                         server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
                     }],
@@ -1577,13 +2544,17 @@ mod tests {
                 carrier: CarrierConfig::default(),
                 transport: crate::config::QuicpTransportConfig::default(),
             };
-            let server = ServerConfig {
+            let mut server = ServerConfig {
                 listen_addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4433))],
                 tls: None,
                 allow_insecure: true,
                 carrier: CarrierConfig::default(),
                 transport: crate::config::QuicpTransportConfig::default(),
             };
+            client.transport.recovery.max_ack_ranges = 32;
+            client.transport.recovery.max_repair_span = 64;
+            server.transport.recovery.max_ack_ranges = 8;
+            server.transport.recovery.max_repair_span = 32;
             let mut implicit_plaintext_client = client.clone();
             implicit_plaintext_client.allow_insecure = false;
             assert!(matches!(
@@ -1623,11 +2594,9 @@ mod tests {
             assert!(!server_connection.backup_ready());
             assert_eq!(client_connection.path_health(), Some(PathHealth::Ready));
             assert_eq!(server_connection.path_health(), None);
-            crate::session::ApplicationProfile::SinglePath
-                .admit_connection(client_connection.backend(), true)
+            crate::session::admit_negotiated(client_connection.backend(), true)
                 .expect("plaintext single-path admission");
-            crate::session::ApplicationProfile::SinglePath
-                .admit_connection(server_connection.backend(), true)
+            crate::session::admit_negotiated(server_connection.backend(), true)
                 .expect("plaintext server admission");
             let denied = client_connection
                 .open_flow(
@@ -1644,12 +2613,7 @@ mod tests {
                     crate::session::SessionError::PolicyRejected
                 ))
             ));
-            assert!(matches!(
-                crate::session::ApplicationProfile::Multipath
-                    .admit_connection(client_connection.backend(), true),
-                Err(crate::session::SessionError::ProfileMismatch)
-            ));
-            crate::session::ApplicationProfile::admit_negotiated(client_connection.backend(), true)
+            crate::session::admit_negotiated(client_connection.backend(), true)
                 .expect("negotiated plaintext profile");
             let blocked_request = crate::wire::OpenRequest::new(
                 crate::wire::CanonicalHost::parse("blocked.example").unwrap(),
@@ -1682,17 +2646,23 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            client_flow.write_all(b"request").await.unwrap();
+            let request = vec![0x5a; 192 * 1024];
+            client_flow.write_all(&request).await.unwrap();
             client_flow.shutdown().await.unwrap();
-            let mut request = Vec::new();
+            let mut received = Vec::new();
             tokio::time::timeout(
                 Duration::from_secs(2),
-                server_flow.read_to_end(&mut request),
+                server_flow.read_to_end(&mut received),
             )
             .await
             .expect("request half-close timed out")
             .unwrap();
-            assert_eq!(request, b"request");
+            assert_eq!(received, request);
+            let clean = client_connection.recovery_snapshot();
+            assert!(clean.source_sent > 0);
+            assert_eq!(clean.repair_sent, 0);
+            assert_eq!(clean.replayed, 0);
+            assert_eq!(clean.fallback, 0);
 
             server_flow.write_all(b"response").await.unwrap();
             server_flow.shutdown().await.unwrap();
@@ -1705,6 +2675,18 @@ mod tests {
             .expect("response half-close timed out")
             .unwrap();
             assert_eq!(response, b"response");
+
+            drop(client_flow);
+            drop(server_flow);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while client_connection.recovery.registered_flow_count() != 0
+                    || server_connection.recovery.registered_flow_count() != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropped flow routes were not released");
 
             assert!(!blocked_client.is_finished());
             blocked_pending
@@ -1723,12 +2705,180 @@ mod tests {
             ));
 
             drop(server_connection);
-            assert_eq!(lock_budget(&active_connections.state).active, 1);
-            drop(server_flow);
             assert_eq!(lock_budget(&active_connections.state).active, 0);
         })
         .await
         .expect("plaintext flow E2E timed out");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn plaintext_replay_safe_flow_delivers_initial_bytes_once() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let client_config = ClientConfig {
+                tls: None,
+                allow_insecure: true,
+                multipath: Multipath {
+                    mode: MultipathMode::Off,
+                    candidates: vec![PathCandidate {
+                        local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
+                    }],
+                },
+                carrier: CarrierConfig::default(),
+                transport: crate::config::QuicpTransportConfig::default(),
+            };
+            let server_config = ServerConfig {
+                listen_addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4433))],
+                tls: None,
+                allow_insecure: true,
+                carrier: CarrierConfig::default(),
+                transport: crate::config::QuicpTransportConfig::default(),
+            };
+            let server_endpoint = noq::Endpoint::server(
+                build_server_config(&server_config).unwrap(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server_endpoint.local_addr().unwrap();
+            let client_endpoint =
+                noq::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            client_endpoint.set_default_client_config(build_client_config(&client_config).unwrap());
+            let server = Server::from_endpoint(server_endpoint);
+            let client = Client::from_endpoint(client_endpoint, server_addr, "quicp".to_owned());
+            let admission = crate::ReplayAdmission::new(&[0x5a; 32], 7, 16).unwrap();
+
+            let server_connection =
+                async { server.accept().await.unwrap().handshake().await.unwrap() };
+            let (server_connection, client_connection) =
+                tokio::join!(server_connection, client.connect());
+            let client_connection = client_connection.unwrap();
+            assert_eq!(
+                server_connection.issue_replay_token(&admission, 100, 60),
+                Err(crate::ReplayTokenError::CapabilitiesUnavailable)
+            );
+            let prime = crate::wire::OpenRequest::new(
+                crate::wire::CanonicalHost::parse("prime.example").unwrap(),
+                NonZeroU16::new(443).unwrap(),
+            );
+            let server_prime = async {
+                server_connection
+                    .accept_flow(true)
+                    .await
+                    .unwrap()
+                    .accept()
+                    .await
+                    .unwrap()
+            };
+            let (server_prime, client_prime) =
+                tokio::join!(server_prime, client_connection.open_flow(prime, true));
+            drop((server_prime, client_prime.unwrap()));
+            let token = server_connection
+                .issue_replay_token(&admission, 100, 60)
+                .unwrap();
+            let capability_fingerprint =
+                server_connection.recovery.capability_fingerprint().unwrap();
+            let incompatible_token = admission
+                .issue(
+                    100,
+                    60,
+                    capability_fingerprint
+                        .checked_add(1)
+                        .expect("default capability fingerprint has headroom"),
+                )
+                .unwrap();
+            server_connection.close(crate::ApplicationError::FlowAbort, b"token issued");
+            client_connection.close(crate::ApplicationError::FlowAbort, b"token received");
+            drop(server_connection);
+            drop(client_connection);
+
+            let request = crate::wire::OpenRequest::new(
+                crate::wire::CanonicalHost::parse("early.example").unwrap(),
+                NonZeroU16::new(443).unwrap(),
+            );
+            let initial = b"replay-safe request";
+            let server_side = async {
+                let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+                let pending = connection
+                    .accept_replay_safe_flow_with_clock(&admission, || 101, true)
+                    .await
+                    .unwrap();
+                assert_eq!(pending.initial_data(), initial);
+                let flow = pending.accept().await.unwrap();
+                (connection, flow)
+            };
+            let client_side = client.connect_replay_safe(&token, 9, request.clone(), initial, true);
+            let ((server_connection, mut server_flow), client_result) =
+                tokio::join!(server_side, client_side);
+            let (client_connection, mut client_flow) = client_result.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), client_flow.flush())
+                .await
+                .expect("accepted early bytes are already flushed")
+                .unwrap();
+            let mut received = vec![0; initial.len()];
+            server_flow.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, initial);
+            assert_eq!(server_connection.recovery_snapshot().early_accepted, 1);
+            server_connection.close(crate::ApplicationError::FlowAbort, b"done");
+            client_connection.close(crate::ApplicationError::FlowAbort, b"done");
+            drop((
+                server_flow,
+                client_flow,
+                server_connection,
+                client_connection,
+            ));
+
+            let server_replay = async {
+                let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+                let result = connection
+                    .accept_replay_safe_flow_with_clock(&admission, || 102, true)
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(crate::flow::FlowError::Replay(
+                        crate::ReplayTokenError::Replayed
+                    ))
+                ));
+                assert_eq!(connection.recovery_snapshot().early_rejected, 1);
+                connection.close(crate::ApplicationError::FlowAbort, b"replay rejected");
+            };
+            let client_replay = client.connect_replay_safe(&token, 9, request, initial, true);
+            let ((), replay_result) = tokio::join!(server_replay, client_replay);
+            assert!(replay_result.is_err());
+
+            let mismatch_request = crate::wire::OpenRequest::new(
+                crate::wire::CanonicalHost::parse("capability-mismatch.example").unwrap(),
+                NonZeroU16::new(443).unwrap(),
+            );
+            let server_mismatch = async {
+                let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+                let result = connection
+                    .accept_replay_safe_flow_with_clock(&admission, || 102, true)
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(crate::flow::FlowError::Replay(
+                        crate::ReplayTokenError::CapabilitiesChanged
+                    ))
+                ));
+                let snapshot = connection.recovery_snapshot();
+                assert_eq!(snapshot.early_accepted, 0);
+                assert_eq!(snapshot.early_rejected, 1);
+                assert_eq!(connection.recovery.registered_flow_count(), 0);
+                connection.close(crate::ApplicationError::FlowAbort, b"capability mismatch");
+            };
+            let client_mismatch = client.connect_replay_safe(
+                &incompatible_token,
+                10,
+                mismatch_request,
+                b"must not reach the application",
+                true,
+            );
+            let ((), mismatch_result) = tokio::join!(server_mismatch, client_mismatch);
+            assert!(mismatch_result.is_err());
+        })
+        .await
+        .expect("replay-safe flow timed out");
     }
 
     #[tokio::test]
@@ -1741,7 +2891,6 @@ mod tests {
                 multipath: Multipath {
                     mode: MultipathMode::Off,
                     candidates: vec![PathCandidate {
-                        name: "primary".to_owned(),
                         local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                         server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
                     }],
@@ -1845,7 +2994,7 @@ mod tests {
     #[cfg(not(feature = "tls-rustls"))]
     #[test]
     fn rejects_tls_configuration_when_feature_is_disabled() {
-        let tls_path = std::path::PathBuf::from("unused.pem");
+        let tls_path = std::env::temp_dir().join("unused.pem");
         let client = ClientConfig {
             tls: Some(ClientTls {
                 server_name: "server.example".to_owned(),
@@ -1857,7 +3006,6 @@ mod tests {
             multipath: Multipath {
                 mode: MultipathMode::Off,
                 candidates: vec![PathCandidate {
-                    name: "primary".to_owned(),
                     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                     server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
                 }],
@@ -1879,11 +3027,11 @@ mod tests {
 
         assert!(matches!(
             build_client_config(&client),
-            Err(TransportError::TlsFeatureDisabled)
+            Err(TransportError::Config(ConfigError::TlsFeatureDisabled))
         ));
         assert!(matches!(
             build_server_config(&server),
-            Err(TransportError::TlsFeatureDisabled)
+            Err(TransportError::Config(ConfigError::TlsFeatureDisabled))
         ));
     }
 
@@ -1921,12 +3069,10 @@ mod tests {
                 mode: MultipathMode::Failover,
                 candidates: vec![
                     PathCandidate {
-                        name: "primary".to_owned(),
                         local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                         server_addr: server_primary_addr,
                     },
                     PathCandidate {
-                        name: "backup".to_owned(),
                         local_ip: client_backup_addr.ip(),
                         server_addr: server_backup_addr,
                     },
@@ -1984,13 +3130,16 @@ mod tests {
             server_primary_addr,
             "quicp".to_owned(),
             Some(Arc::clone(&runtime)),
+            None,
             Some(BackupPath {
                 remote: server_backup_addr,
                 local_ip: client_backup_addr.ip(),
             }),
-            None,
             crate::flow::RELAY_BUFFER_BYTES,
             true,
+            crate::config::RecoveryConfig::default(),
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
+            1200,
         );
 
         let server_connection = async {
@@ -2014,6 +3163,15 @@ mod tests {
             .expect("automatic backup path");
         assert_eq!(backup.status().unwrap(), PathStatus::Backup);
 
+        let server_recovery = crate::recovery::ConnectionRecovery::start(
+            server_connection.clone(),
+            &runtime,
+            None,
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
+            crate::config::RecoveryConfig::default(),
+            1200,
+        );
+
         let server_flow = async {
             crate::flow::accept_flow_backend(
                 &server_connection,
@@ -2021,6 +3179,7 @@ mod tests {
                 None,
                 crate::flow::RELAY_BUFFER_BYTES,
                 true,
+                Arc::clone(&server_recovery),
             )
             .await
             .unwrap()
@@ -2039,6 +3198,7 @@ mod tests {
                 None,
                 crate::flow::RELAY_BUFFER_BYTES,
                 true,
+                Arc::clone(&client_connection.recovery),
             )
             .await
             .unwrap()
@@ -2074,15 +3234,23 @@ mod tests {
             .unwrap();
         assert_eq!(&after, b"after");
         assert!(primary.stats().udp_tx.bytes > primary_tx_before);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while primary.status().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary path did not transition to failed");
         assert!(primary.status().is_err());
         assert!(backup.stats().udp_tx.bytes > backup_tx_before);
+        assert!(client_connection.recovery_snapshot().source_sent >= 2);
         assert_eq!(client_connection.stable_id(), stable_id);
         assert!(client_connection.backup_ready());
     }
 
     #[cfg(all(feature = "tls-rustls", unix))]
     #[tokio::test]
-    async fn authenticates_mutual_tls_and_both_alpn_profiles() {
+    async fn authenticates_mutual_tls_with_single_and_multipath_capabilities() {
         let directory = secure_tempdir();
         let directory = std::fs::canonicalize(directory.path()).unwrap();
         let CertifiedKey { cert, signing_key } =
@@ -2104,7 +3272,6 @@ mod tests {
             multipath: Multipath {
                 mode: MultipathMode::Off,
                 candidates: vec![PathCandidate {
-                    name: "primary".to_owned(),
                     local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                     server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
                 }],
@@ -2125,18 +3292,351 @@ mod tests {
         };
 
         authenticate(&client, &server).await;
+        authenticate_replay_safe(&client, &server).await;
         client.multipath.mode = MultipathMode::Failover;
         client.multipath.candidates.push(PathCandidate {
-            name: "backup".to_owned(),
             local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 4434)),
         });
-        authenticate(&client, &server).await;
+        authenticate_multipath_replay_safe(&client, &server).await;
+    }
+
+    #[cfg(all(feature = "tls-rustls", unix))]
+    #[allow(clippy::too_many_lines)]
+    async fn authenticate_multipath_replay_safe(
+        client_config: &ClientConfig,
+        server_config: &ServerConfig,
+    ) {
+        let bind_pair = || {
+            let primary = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let backup = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            primary.set_nonblocking(true).unwrap();
+            backup.set_nonblocking(true).unwrap();
+            [primary, backup]
+        };
+        let [client_primary, client_backup] = bind_pair();
+        let [server_primary, server_backup] = bind_pair();
+        let client_primary_addr = client_primary.local_addr().unwrap();
+        let client_backup_addr = client_backup.local_addr().unwrap();
+        let server_primary_addr = server_primary.local_addr().unwrap();
+        let server_backup_addr = server_backup.local_addr().unwrap();
+
+        let mut client_config = client_config.clone();
+        client_config.multipath = Multipath {
+            mode: MultipathMode::Failover,
+            candidates: vec![
+                PathCandidate {
+                    local_ip: client_primary_addr.ip(),
+                    server_addr: server_primary_addr,
+                },
+                PathCandidate {
+                    local_ip: client_backup_addr.ip(),
+                    server_addr: server_backup_addr,
+                },
+            ],
+        };
+        let mut server_config = server_config.clone();
+        server_config.listen_addrs = vec![server_primary_addr, server_backup_addr];
+        let runtime: Arc<dyn Runtime> = Arc::new(noq::TokioRuntime);
+        let client_socket = MultipathSocket::new(
+            (
+                runtime.wrap_udp_socket(client_primary).unwrap(),
+                server_primary_addr,
+            ),
+            (
+                runtime.wrap_udp_socket(client_backup).unwrap(),
+                server_backup_addr,
+            ),
+        )
+        .unwrap();
+        let server_socket = MultipathSocket::new(
+            (
+                runtime.wrap_udp_socket(server_primary).unwrap(),
+                client_primary_addr,
+            ),
+            (
+                runtime.wrap_udp_socket(server_backup).unwrap(),
+                client_backup_addr,
+            ),
+        )
+        .unwrap();
+        let client_endpoint = build_client_endpoint_with_socket(
+            &client_config,
+            Box::new(client_socket),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let server_endpoint = build_server_endpoint_with_socket(
+            &server_config,
+            Box::new(server_socket),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let recovery = server_config.transport.recovery;
+        let server = Server::from_endpoint_with_limits(
+            server_endpoint,
+            128,
+            16,
+            crate::flow::RELAY_BUFFER_BYTES,
+            true,
+            Arc::clone(&runtime),
+            None,
+            recovery,
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
+            1200,
+        );
+        let client = Client::from_endpoint_with_runtime(
+            client_endpoint,
+            server_primary_addr,
+            client_config.tls.as_ref().unwrap().server_name.clone(),
+            Some(Arc::clone(&runtime)),
+            None,
+            Some(BackupPath {
+                remote: server_backup_addr,
+                local_ip: client_backup_addr.ip(),
+            }),
+            crate::flow::RELAY_BUFFER_BYTES,
+            true,
+            client_config.transport.recovery,
+            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
+            1200,
+        );
+        let admission = crate::ReplayAdmission::new(&[0xa5; 32], 9, 16).unwrap();
+
+        let server_connection = async { server.accept().await.unwrap().handshake().await.unwrap() };
+        let (server_connection, client_connection) =
+            tokio::join!(server_connection, client.connect());
+        let client_connection = client_connection.unwrap();
+        wait_for_backup_ready(&client_connection).await;
+        let prime = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("multipath-prime.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let (server_prime, client_prime) = tokio::join!(
+            async {
+                server_connection
+                    .accept_flow(true)
+                    .await
+                    .unwrap()
+                    .accept()
+                    .await
+                    .unwrap()
+            },
+            client_connection.open_flow(prime, true)
+        );
+        drop((server_prime, client_prime.unwrap()));
+        let token = server_connection
+            .issue_replay_token(&admission, 100, 60)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        server_connection.close(ApplicationError::FlowAbort, b"token issued");
+        client_connection.close(ApplicationError::FlowAbort, b"token received");
+        drop((server_connection, client_connection));
+
+        let initial = b"multipath replay-safe request";
+        let request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("multipath-early.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let server_side = async {
+            let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+            let pending = connection
+                .accept_replay_safe_flow_with_clock(&admission, || 101, true)
+                .await
+                .unwrap();
+            assert_eq!(pending.initial_data(), initial);
+            let flow = pending.accept().await.unwrap();
+            (connection, flow)
+        };
+        let client_side = client.connect_replay_safe(&token, 10, request, initial, true);
+        let ((server_connection, mut server_flow), client_result) =
+            tokio::join!(server_side, client_side);
+        let (client_connection, client_flow) = client_result.unwrap();
+        wait_for_backup_ready(&client_connection).await;
+        assert!(client_connection.backup_ready());
+        let mut received = vec![0; initial.len()];
+        server_flow.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, initial);
+
+        let next = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("multipath-next.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let (server_next, client_next) = tokio::join!(
+            async {
+                server_connection
+                    .accept_flow(true)
+                    .await
+                    .unwrap()
+                    .accept()
+                    .await
+                    .unwrap()
+            },
+            client_connection.open_flow(next, true)
+        );
+        assert!(client_next.is_ok());
+        drop((server_flow, client_flow, server_next, client_next));
+    }
+
+    #[cfg(all(feature = "tls-rustls", unix))]
+    #[allow(clippy::too_many_lines)]
+    async fn authenticate_replay_safe(client: &ClientConfig, server_config: &ServerConfig) {
+        let server_endpoint = noq::Endpoint::server(
+            build_server_config(server_config).unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let client_endpoint =
+            noq::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        client_endpoint.set_default_client_config(build_client_config(client).unwrap());
+        let server_control = server_endpoint.clone();
+        let server = Server::from_endpoint(server_endpoint);
+        let client = Client::from_endpoint(
+            client_endpoint,
+            server_addr,
+            client.tls.as_ref().unwrap().server_name.clone(),
+        );
+        let admission = crate::ReplayAdmission::new(&[0xa5; 32], 9, 16).unwrap();
+
+        let server_connection = async { server.accept().await.unwrap().handshake().await.unwrap() };
+        let (server_connection, client_connection) =
+            tokio::join!(server_connection, client.connect());
+        let client_connection = client_connection.unwrap();
+        let prime = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("tls-prime.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let server_prime = async {
+            server_connection
+                .accept_flow(true)
+                .await
+                .unwrap()
+                .accept()
+                .await
+                .unwrap()
+        };
+        let (server_prime, client_prime) =
+            tokio::join!(server_prime, client_connection.open_flow(prime, true));
+        drop((server_prime, client_prime.unwrap()));
+        let token = server_connection
+            .issue_replay_token(&admission, 100, 60)
+            .unwrap();
+        let capability_fingerprint = server_connection.recovery.capability_fingerprint().unwrap();
+        let incompatible_token = admission
+            .issue(
+                100,
+                60,
+                capability_fingerprint
+                    .checked_add(1)
+                    .expect("default capability fingerprint has headroom"),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        server_connection.close(crate::ApplicationError::FlowAbort, b"token issued");
+        client_connection.close(crate::ApplicationError::FlowAbort, b"token received");
+        drop((server_connection, client_connection));
+
+        let request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("tls-early.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let initial = b"tls replay-safe request";
+        let server_side = async {
+            let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+            let pending = connection
+                .accept_replay_safe_flow_with_clock(&admission, || 101, true)
+                .await
+                .unwrap();
+            assert_eq!(pending.initial_data(), initial);
+            let flow = pending.accept().await.unwrap();
+            (connection, flow)
+        };
+        let client_side = client.connect_replay_safe(&token, 10, request, initial, true);
+        let ((server_connection, mut server_flow), client_result) =
+            tokio::join!(server_side, client_side);
+        let (client_connection, mut client_flow) = client_result.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client_flow.flush())
+            .await
+            .expect("accepted TLS early bytes are already flushed")
+            .unwrap();
+        let mut received = vec![0; initial.len()];
+        server_flow.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, initial);
+        assert_eq!(server_connection.recovery_snapshot().early_accepted, 1);
+        drop((
+            server_flow,
+            client_flow,
+            server_connection,
+            client_connection,
+        ));
+
+        let mismatch_request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("tls-capability-mismatch.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let server_mismatch = async {
+            let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+            let result = connection
+                .accept_replay_safe_flow_with_clock(&admission, || 102, true)
+                .await;
+            assert!(matches!(
+                result,
+                Err(crate::flow::FlowError::Replay(
+                    crate::ReplayTokenError::CapabilitiesChanged
+                ))
+            ));
+            let snapshot = connection.recovery_snapshot();
+            assert_eq!(snapshot.early_accepted, 0);
+            assert_eq!(snapshot.early_rejected, 1);
+            assert_eq!(connection.recovery.registered_flow_count(), 0);
+            connection.close(crate::ApplicationError::FlowAbort, b"capability mismatch");
+        };
+        let client_mismatch = client.connect_replay_safe(
+            &incompatible_token,
+            11,
+            mismatch_request,
+            b"must not reach the TLS application",
+            true,
+        );
+        let ((), mismatch_result) = tokio::join!(server_mismatch, client_mismatch);
+        assert!(mismatch_result.is_err());
+
+        server_control.set_server_config(Some(build_early_rejecting_server_config(server_config)));
+        let fallback_request = crate::wire::OpenRequest::new(
+            crate::wire::CanonicalHost::parse("tls-fallback.example").unwrap(),
+            NonZeroU16::new(443).unwrap(),
+        );
+        let fallback_initial = b"fallback after backend 0-RTT rejection";
+        let server_side = async {
+            let connection = server.accept().await.unwrap().accept_replay_safe().unwrap();
+            let pending = connection
+                .accept_replay_safe_flow_with_clock(&admission, || 102, true)
+                .await
+                .unwrap();
+            assert_eq!(pending.initial_data(), []);
+            let mut flow = pending.accept().await.unwrap();
+            let mut received = vec![0; fallback_initial.len()];
+            flow.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, fallback_initial);
+            (connection, flow)
+        };
+        let client_side =
+            client.connect_replay_safe(&token, 12, fallback_request, fallback_initial, true);
+        let ((server_connection, server_flow), client_result) =
+            tokio::join!(server_side, client_side);
+        let (client_connection, client_flow) = client_result.unwrap();
+        assert_eq!(server_connection.recovery_snapshot().early_accepted, 0);
+        drop((
+            server_flow,
+            client_flow,
+            server_connection,
+            client_connection,
+        ));
     }
 
     #[cfg(all(feature = "tls-rustls", unix))]
     async fn authenticate(client: &ClientConfig, server: &ServerConfig) {
-        let profile = crate::session::ApplicationProfile::from(client.multipath.mode);
         let client_config = build_client_config(client).unwrap();
         let server_config = build_server_config(server).unwrap();
         let server_endpoint =
@@ -2164,19 +3664,7 @@ mod tests {
         };
         let (server_connection, client_connection) =
             tokio::join!(server_connection, client_connection);
-        let wrong_profile = match profile {
-            crate::session::ApplicationProfile::SinglePath => {
-                crate::session::ApplicationProfile::Multipath
-            }
-            crate::session::ApplicationProfile::Multipath => {
-                crate::session::ApplicationProfile::SinglePath
-            }
-        };
-        assert_eq!(
-            wrong_profile.admit_connection(&server_connection, true),
-            Err(crate::session::SessionError::ProfileMismatch)
-        );
-        profile.admit_connection(&server_connection, true).unwrap();
-        profile.admit_connection(&client_connection, true).unwrap();
+        crate::session::admit_negotiated(&server_connection, true).unwrap();
+        crate::session::admit_negotiated(&client_connection, true).unwrap();
     }
 }

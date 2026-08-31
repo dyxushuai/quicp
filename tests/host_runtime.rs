@@ -155,9 +155,12 @@ fn host_runtime_wakes_the_host_when_work_becomes_ready() {
     })));
 
     runtime.spawn(Box::pin(async {})).expect("spawn");
+    runtime.spawn(Box::pin(async {})).expect("spawn");
     assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(runtime.drive(Duration::ZERO, NonZeroUsize::MIN), Ok(1));
+    assert_eq!(wakes.load(Ordering::Relaxed), 2);
     assert_eq!(runtime.drive(Duration::ZERO, NonZeroUsize::MIN), Ok(1));
 
     runtime.spawn(Box::pin(async {})).expect("spawn");
-    assert_eq!(wakes.load(Ordering::Relaxed), 2);
+    assert_eq!(wakes.load(Ordering::Relaxed), 3);
 }

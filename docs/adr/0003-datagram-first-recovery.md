@@ -12,11 +12,11 @@ That delegates byte acknowledgement, retransmission, ordering, and flow control 
 but it also prevents a higher recovery layer from observing erasures and preserves stream-local
 head-of-line blocking.
 
-The existing `QueqiaoPlugin` does not change that data path. It is a one-shot configuration adapter
-that installs a shared congestion controller. It does not implement coded datagrams, byte-range
-acknowledgements, replay, flow scheduling, or substrate selection. Expanding the public plugin
-interface with packet and flow callbacks would expose ownership-sensitive hot-path behavior without
-hiding meaningful complexity.
+The removed `QueqiaoPlugin` did not change that data path. It was a one-shot configuration adapter
+that installed a shared congestion controller; it did not implement coded datagrams, byte-range
+acknowledgements, replay, flow scheduling, or substrate selection. Expanding that interface with
+packet and flow callbacks would have exposed ownership-sensitive hot-path behavior without hiding
+meaningful complexity.
 
 QUICP does not require wire compatibility with Queqiao Protocol 1. It will reuse the architectural
 ideas that match QUICP's goals while retaining its own wire contract, FakeTCP carrier, optional
@@ -27,9 +27,9 @@ security profiles, multipath backend, runtime-neutral flow interface, and native
 ### 1. Introduce one breaking QUICP/2 profile
 
 QUICP/2 replaces QUICP/1 rather than negotiating a compatibility mode. One profile token identifies
-the application protocol; DATAGRAM, FEC limits, and multipath are negotiated capabilities rather
-than separate profile tokens. The current `docs/protocol.md` remains the normative QUICP/1 document
-until the implementation and conformance vectors switch together.
+the application protocol. DATAGRAM and FEC limits are application capabilities; multipath is
+negotiated separately by QUIC transport parameters. `docs/protocol.md` and the committed
+conformance vectors define the implemented QUICP/2 contract.
 
 QUICP/2 keeps the existing public flow shape:
 
@@ -57,10 +57,11 @@ Each flow owns:
 - absolute send and receive byte offsets;
 - bounded replay and receive-reassembly state;
 - acknowledged ranges and receive credit; and
-- OPEN, FIN, RESET, and terminal state.
+- OPEN, FIN, QUIC `RESET_STREAM`, and terminal state.
 
-The reliable stream carries framed `OPEN`, `STATUS`, `ACK`, `MAX_OFFSET`, `FIN`, `RESET`, and
-fallback `STREAM_DATA` messages. Selected data normally travels through QUIC DATAGRAM. Keeping a
+The reliable stream carries framed `OPEN`, `STATUS`, `ACK`, `MAX_OFFSET`, `FIN`, and fallback
+`STREAM_DATA` messages. Abortive termination uses QUIC `RESET_STREAM`; QUICP does not duplicate it
+with an application control frame. Selected data normally travels through QUIC DATAGRAM. Keeping a
 stream per flow avoids a single connection-wide control-stream head-of-line dependency and reuses
 the current flow admission lifecycle.
 

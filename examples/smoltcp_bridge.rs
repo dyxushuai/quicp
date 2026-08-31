@@ -3,8 +3,6 @@
 //! A TUN, Network Extension, or `VpnService` adapter supplies complete IP packets through
 //! `ingress_ip_borrowed` and drains packets with `poll_egress_ip_into`; smoltcp remains single-owner.
 
-#![cfg(feature = "platform-smoltcp")]
-
 use quicp::platform::{PlatformPacketBridge, PlatformPacketConfig};
 use quicp::smolstack::SmoltcpConfig;
 use smoltcp::phy::{Device, TxToken};
