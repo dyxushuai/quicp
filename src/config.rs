@@ -313,7 +313,8 @@ pub(crate) fn verify_owner_and_acl(
             #[cfg(feature = "runtime-tokio")]
             TrustedFileMode::SystemOwned => !is_windows_system_sid(owner),
             TrustedFileMode::SharedReadable | TrustedFileMode::OwnerOnly => {
-                (unsafe { EqualSid(owner, token_user.User.Sid) }) == 0
+                let owner_is_user = unsafe { EqualSid(owner, token_user.User.Sid) } != 0;
+                owner_is_user || is_windows_system_sid(owner)
             }
         }
     {
@@ -382,7 +383,9 @@ pub(crate) fn verify_owner_and_acl(
                 }
                 let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
                 let sid = addr_of!(allowed.SidStart).cast::<core::ffi::c_void>() as PSID;
-                let trusted = unsafe { EqualSid(sid, owner) } != 0 || is_windows_system_sid(sid);
+                let trusted = unsafe { EqualSid(sid, owner) } != 0
+                    || unsafe { EqualSid(sid, token_user.User.Sid) } != 0
+                    || is_windows_system_sid(sid);
                 if !trusted
                     && (mode == TrustedFileMode::OwnerOnly || allowed.Mask & write_mask != 0)
                 {
