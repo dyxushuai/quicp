@@ -252,6 +252,11 @@ pub(crate) fn verify_owner_and_acl(
             addr_of_mut!(descriptor),
         )
     };
+    #[cfg(test)]
+    eprintln!(
+        "[ACLDBG] security_info status={status} descriptor_null={}",
+        descriptor.is_null()
+    );
     if status != ERROR_SUCCESS || descriptor.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
@@ -259,7 +264,11 @@ pub(crate) fn verify_owner_and_acl(
 
     let mut token = null_mut();
     let process = unsafe { GetCurrentProcess() };
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token)) } == 0 {
+    #[cfg(test)]
+    eprintln!("[ACLDBG] process_token_open={}", unsafe {
+        OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token))
+    });
+    if token.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     struct TokenGuard(windows_sys::Win32::Foundation::HANDLE);
@@ -278,6 +287,11 @@ pub(crate) fn verify_owner_and_acl(
     let mut token_bytes = 0u32;
     let first =
         unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, addr_of_mut!(token_bytes)) };
+    #[cfg(test)]
+    eprintln!(
+        "[ACLDBG] token_probe result={first} bytes={token_bytes} error={:?}",
+        std::io::Error::last_os_error().raw_os_error()
+    );
     if first != 0
         || token_bytes == 0
         || std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
@@ -301,14 +315,31 @@ pub(crate) fn verify_owner_and_acl(
     let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
 
     let mut owner_defaulted = 0;
+    #[cfg(test)]
+    let owner_result = unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor,
+            addr_of_mut!(owner),
+            addr_of_mut!(owner_defaulted),
+        )
+    };
+    #[cfg(not(test))]
+    let owner_result = unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor,
+            addr_of_mut!(owner),
+            addr_of_mut!(owner_defaulted),
+        )
+    };
+    #[cfg(test)]
+    eprintln!(
+        "[ACLDBG] owner result={owner_result} null={} owner_user={} owner_system={}",
+        owner.is_null(),
+        (!owner.is_null() && unsafe { EqualSid(owner, token_user.User.Sid) } != 0),
+        (!owner.is_null() && is_windows_system_sid(owner))
+    );
     if owner.is_null()
-        || unsafe {
-            GetSecurityDescriptorOwner(
-                descriptor,
-                addr_of_mut!(owner),
-                addr_of_mut!(owner_defaulted),
-            )
-        } == 0
+        || owner_result == 0
         || match mode {
             #[cfg(feature = "runtime-tokio")]
             TrustedFileMode::SystemOwned => !is_windows_system_sid(owner),
@@ -368,6 +399,11 @@ pub(crate) fn verify_owner_and_acl(
             return Err(ConfigError::InsecureAcl(path.to_owned()));
         }
         let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+        #[cfg(test)]
+        eprintln!(
+            "[ACLDBG] ace index={index} type={} flags={} size={}",
+            header.AceType, header.AceFlags, header.AceSize
+        );
         let ace_size = usize::from(header.AceSize);
         if ace_size < size_of::<windows_sys::Win32::Security::ACE_HEADER>() {
             return Err(ConfigError::InsecureAcl(path.to_owned()));
@@ -386,6 +422,15 @@ pub(crate) fn verify_owner_and_acl(
                 let trusted = unsafe { EqualSid(sid, owner) } != 0
                     || unsafe { EqualSid(sid, token_user.User.Sid) } != 0
                     || is_windows_system_sid(sid);
+                #[cfg(test)]
+                eprintln!(
+                    "[ACLDBG] allow mask=0x{:08x} owner={} user={} system={} trusted={}",
+                    allowed.Mask,
+                    unsafe { EqualSid(sid, owner) } != 0,
+                    unsafe { EqualSid(sid, token_user.User.Sid) } != 0,
+                    is_windows_system_sid(sid),
+                    trusted
+                );
                 if !trusted
                     && (mode == TrustedFileMode::OwnerOnly || allowed.Mask & write_mask != 0)
                 {
