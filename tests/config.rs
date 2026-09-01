@@ -1,5 +1,4 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 
 use quicp::load_config;
 use quicp::{
@@ -20,6 +19,11 @@ mode = "failover"
 "#;
 
 fn secure_tempdir() -> tempfile::TempDir {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .expect("USERPROFILE or HOME is required for trusted temporary files");
+    #[cfg(not(windows))]
     let home = std::env::var_os("HOME").expect("HOME is required for trusted temporary files");
     tempfile::tempdir_in(home).expect("trusted temporary directory")
 }
@@ -215,7 +219,7 @@ mss = { fixed = 1200 }
 
 #[test]
 fn tls_and_carrier_programmatic_constructors_validate_paths() {
-    let absolute = PathBuf::from("/etc/quicp/material.pem");
+    let absolute = std::env::temp_dir().join("quicp-material.pem");
     assert!(matches!(
         ClientTls::new("", absolute.clone(), absolute.clone(), absolute.clone(),),
         Err(ConfigError::EmptyTlsServerName)
