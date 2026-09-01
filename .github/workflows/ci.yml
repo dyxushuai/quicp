@@ -117,9 +117,12 @@ jobs:
       - name: Type-check Network Extension example
         run: |
           SWIFT_BIN=$(swift build --package-path sdk/apple --show-bin-path)
+          CQUICP_HEADERS="$GITHUB_WORKSPACE/sdk/apple/Artifacts/CQuicp.xcframework/macos-arm64_x86_64/Headers"
           xcrun swiftc -typecheck -warnings-as-errors \
             -target "$(uname -m)-apple-macosx12.0" \
             -I "$SWIFT_BIN" -I "$SWIFT_BIN/include" \
+            -Xcc -I -Xcc "$CQUICP_HEADERS" \
+            -Xcc "-fmodule-map-file=$CQUICP_HEADERS/module.modulemap" \
             sdk/apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift
 
   android:
