@@ -264,11 +264,10 @@ pub(crate) fn verify_owner_and_acl(
 
     let mut token = null_mut();
     let process = unsafe { GetCurrentProcess() };
+    let token_opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token)) };
     #[cfg(test)]
-    eprintln!("[ACLDBG] process_token_open={}", unsafe {
-        OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token))
-    });
-    if token.is_null() {
+    eprintln!("[ACLDBG] process_token_open={token_opened}");
+    if token_opened == 0 || token.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     struct TokenGuard(windows_sys::Win32::Foundation::HANDLE);
