@@ -2127,6 +2127,11 @@ mod tests {
         }
         let status = command.status().expect("icacls should start");
         assert!(status.success(), "icacls failed with {status}");
+        let details = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .expect("icacls inspection should start");
+        eprintln!("{}", String::from_utf8_lossy(&details.stdout));
     }
 
     #[cfg(unix)]
