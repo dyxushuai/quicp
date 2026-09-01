@@ -225,7 +225,7 @@ JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeConnectionState(
   (void)env;
   (void)type;
   return handle == 0
-             ? QUICP_STATUS_CLOSED
+             ? (jint)QUICP_STATUS_CLOSED
              : (jint)quicp_engine_connection_state(
                    (quicp_engine_t *)(uintptr_t)handle);
 }
@@ -419,7 +419,7 @@ JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeRejectPendingFlow(
   (void)env;
   (void)type;
   return handle == 0 || request <= 0
-      ? QUICP_STATUS_INVALID_ARGUMENT
+      ? (jint)QUICP_STATUS_INVALID_ARGUMENT
       : (jint)quicp_engine_reject_pending_flow(
             (quicp_engine_t *)(uintptr_t)handle, (uint64_t)request);
 }
@@ -502,7 +502,7 @@ JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeFlush(
   (void)env;
   (void)type;
   return handle == 0 || flow == 0
-             ? QUICP_STATUS_INVALID_ARGUMENT
+             ? (jint)QUICP_STATUS_INVALID_ARGUMENT
              : (jint)quicp_flow_flush((quicp_engine_t *)(uintptr_t)handle,
                                       (quicp_flow_t)flow);
 }
@@ -512,7 +512,7 @@ JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeShutdown(
   (void)env;
   (void)type;
   return handle == 0 || flow == 0
-             ? QUICP_STATUS_INVALID_ARGUMENT
+             ? (jint)QUICP_STATUS_INVALID_ARGUMENT
              : (jint)quicp_flow_shutdown((quicp_engine_t *)(uintptr_t)handle,
                                          (quicp_flow_t)flow);
 }
@@ -522,7 +522,7 @@ JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeCloseFlow(
   (void)env;
   (void)type;
   return handle == 0 || flow == 0
-             ? QUICP_STATUS_INVALID_ARGUMENT
+             ? (jint)QUICP_STATUS_INVALID_ARGUMENT
              : (jint)quicp_flow_close((quicp_engine_t *)(uintptr_t)handle,
                                       (quicp_flow_t)flow);
 }
