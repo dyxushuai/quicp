@@ -27,7 +27,7 @@ class QuicpVpnServiceExample : VpnService() {
                 val remote = InetSocketAddress("203.0.113.10", 44_443)
                 DatagramChannel.open().use { channel ->
                     channel.configureBlocking(false)
-                    channel.bind(InetSocketAddress(40_000))
+                    channel.socket().bind(InetSocketAddress(40_000))
                     check(protect(channel.socket())) { "failed to protect QUICP underlay" }
                     channel.connect(remote)
                     Selector.open().use { activeSelector ->
