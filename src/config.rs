@@ -252,11 +252,6 @@ pub(crate) fn verify_owner_and_acl(
             addr_of_mut!(descriptor),
         )
     };
-    #[cfg(test)]
-    eprintln!(
-        "[ACLDBG] security_info status={status} descriptor_null={}",
-        descriptor.is_null()
-    );
     if status != ERROR_SUCCESS || descriptor.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
@@ -265,8 +260,6 @@ pub(crate) fn verify_owner_and_acl(
     let mut token = null_mut();
     let process = unsafe { GetCurrentProcess() };
     let token_opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token)) };
-    #[cfg(test)]
-    eprintln!("[ACLDBG] process_token_open={token_opened}");
     if token_opened == 0 || token.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
@@ -286,11 +279,6 @@ pub(crate) fn verify_owner_and_acl(
     let mut token_bytes = 0u32;
     let first =
         unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, addr_of_mut!(token_bytes)) };
-    #[cfg(test)]
-    eprintln!(
-        "[ACLDBG] token_probe result={first} bytes={token_bytes} error={:?}",
-        std::io::Error::last_os_error().raw_os_error()
-    );
     if first != 0
         || token_bytes == 0
         || std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
@@ -307,26 +295,12 @@ pub(crate) fn verify_owner_and_acl(
             addr_of_mut!(token_bytes),
         )
     };
-    #[cfg(test)]
-    eprintln!(
-        "[ACLDBG] token_info result={token_info} bytes={token_bytes} error={:?}",
-        std::io::Error::last_os_error().raw_os_error()
-    );
     if token_buffer.is_empty() || token_info == 0 {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
 
     let mut owner_defaulted = 0;
-    #[cfg(test)]
-    let owner_result = unsafe {
-        GetSecurityDescriptorOwner(
-            descriptor,
-            addr_of_mut!(owner),
-            addr_of_mut!(owner_defaulted),
-        )
-    };
-    #[cfg(not(test))]
     let owner_result = unsafe {
         GetSecurityDescriptorOwner(
             descriptor,
@@ -336,11 +310,6 @@ pub(crate) fn verify_owner_and_acl(
     };
     let owner_is_user = !owner.is_null() && unsafe { EqualSid(owner, token_user.User.Sid) } != 0;
     let owner_is_system = !owner.is_null() && is_windows_system_sid(owner);
-    #[cfg(test)]
-    eprintln!(
-        "[ACLDBG] owner result={owner_result} null={} owner_user={owner_is_user} owner_system={owner_is_system}",
-        owner.is_null(),
-    );
     if owner.is_null()
         || owner_result == 0
         || match mode {
@@ -364,11 +333,6 @@ pub(crate) fn verify_owner_and_acl(
             addr_of_mut!(dacl_defaulted),
         )
     };
-    #[cfg(test)]
-    eprintln!(
-        "[ACLDBG] dacl result={dacl_result} present={dacl_present} null={}",
-        dacl.is_null()
-    );
     if dacl_result == 0 || dacl_present == 0 || dacl.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
@@ -382,11 +346,6 @@ pub(crate) fn verify_owner_and_acl(
             AclSizeInformation,
         )
     };
-    #[cfg(test)]
-    eprintln!(
-        "[ACLDBG] acl_info result={acl_info_result} ace_count={}",
-        acl_info.AceCount
-    );
     if acl_info_result == 0 {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
@@ -409,11 +368,6 @@ pub(crate) fn verify_owner_and_acl(
             return Err(ConfigError::InsecureAcl(path.to_owned()));
         }
         let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
-        #[cfg(test)]
-        eprintln!(
-            "[ACLDBG] ace index={index} type={} flags={} size={}",
-            header.AceType, header.AceFlags, header.AceSize
-        );
         let ace_size = usize::from(header.AceSize);
         if ace_size < size_of::<windows_sys::Win32::Security::ACE_HEADER>() {
             return Err(ConfigError::InsecureAcl(path.to_owned()));
@@ -432,15 +386,6 @@ pub(crate) fn verify_owner_and_acl(
                 let trusted = unsafe { EqualSid(sid, owner) } != 0
                     || unsafe { EqualSid(sid, token_user.User.Sid) } != 0
                     || is_windows_system_sid(sid);
-                #[cfg(test)]
-                eprintln!(
-                    "[ACLDBG] allow mask=0x{:08x} owner={} user={} system={} trusted={}",
-                    allowed.Mask,
-                    unsafe { EqualSid(sid, owner) } != 0,
-                    unsafe { EqualSid(sid, token_user.User.Sid) } != 0,
-                    is_windows_system_sid(sid),
-                    trusted
-                );
                 if !trusted
                     && (mode == TrustedFileMode::OwnerOnly || allowed.Mask & write_mask != 0)
                 {
@@ -2182,11 +2127,6 @@ mod tests {
         }
         let status = command.status().expect("icacls should start");
         assert!(status.success(), "icacls failed with {status}");
-        let details = std::process::Command::new("icacls")
-            .arg(path)
-            .output()
-            .expect("icacls inspection should start");
-        eprintln!("{}", String::from_utf8_lossy(&details.stdout));
     }
 
     #[cfg(unix)]
