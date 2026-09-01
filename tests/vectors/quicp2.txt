@@ -1,0 +1,19 @@
+# QUICP/2 language-neutral conformance vectors.
+# Format: name = lowercase hexadecimal; invalid vectors start with invalid_.
+profile = 71756963702f32
+capabilities = 01080b04b00040020010
+open = 020e0b6578616d706c652e636f6d01bb
+status_ok = 030100
+ack = 0406000140404080
+max_offset = 05024080
+fin = 06024080
+invalid_reserved_frame = 0703104080
+stream_data = 0806000068656c70
+early_open = 091a01aa00000000000000010b6578616d706c652e636f6d01bb6869
+source = 2000000001010000000468656c70
+repair = 2100000002000000010001000401020304aabbccdd
+invalid_noncanonical_vint = 054001
+invalid_unknown_frame = ff00
+invalid_ack_range = 0406000140804040
+invalid_repair_span_zero = 2100000002000000010000000401020304aabbccdd
+invalid_repair_span_257 = 2100000002000000010101000401020304aabbccdd

@@ -4,181 +4,24 @@
 //! macOS, and Windows packet adapters are target-gated; the protocol and host-carrier API remain in
 //! the parent.
 
-#[cfg(any(test, unix, windows))]
-use std::io::{self, IoSliceMut};
-#[cfg(any(test, unix, windows))]
-use std::net::{IpAddr, SocketAddr};
-#[cfg(any(test, unix, windows))]
-use std::num::NonZeroUsize;
-#[cfg(any(test, unix, windows))]
-use std::pin::Pin;
-#[cfg(any(test, unix, windows))]
+use std::io;
 use std::sync::Arc;
-#[cfg(any(test, unix, windows))]
-use std::task::{Context, Poll};
-#[cfg(any(unix, windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(any(test, unix, windows))]
-use noq::udp::{RecvMeta, Transmit};
-#[cfg(any(test, unix, windows))]
-use noq::{AsyncUdpSocket, UdpSender};
+use noq::AsyncUdpSocket;
 
-#[cfg(any(unix, windows))]
-use crate::config::{
-    CarrierConfig, ClientConfig, ConfigError, MssMode, ServerConfig, SynDataPolicy,
-};
-#[cfg(any(unix, windows))]
+use crate::config::{CarrierConfig, ClientConfig, ConfigError, MssMode, ServerConfig};
 use crate::congestion::TransportOptions;
-#[cfg(any(unix, windows))]
 use crate::faketcp::{CarrierDirection, FakeTcpSocket, FourTuple, SynDataMode};
 
-#[cfg(any(unix, windows))]
 use super::{
-    Client, Server, TransportError, ValidatedClientConfig, ValidatedServerConfig,
-    build_client_endpoint_with_validated_config, build_server_endpoint_with_validated_config,
-    configured_backup_path, listen_addr_admits,
+    Client, MultipathSocket, RecoveryMemoryBudget, Server, TransportError, ValidatedClientConfig,
+    ValidatedServerConfig, build_client_config_with_options_and_payload, build_client_endpoint,
+    build_server_config_with_options_and_payload, build_server_endpoint, configured_backup_path,
+    listen_addr_admits,
 };
 
-#[cfg(any(unix, windows))]
 pub(crate) const SYN_COOKIE_EPOCH_SECONDS: u64 = 60;
-#[cfg(any(test, unix, windows))]
-#[derive(Debug)]
-pub(crate) struct MultipathSocket {
-    children: [Box<dyn AsyncUdpSocket>; 2],
-    routes: [(IpAddr, SocketAddr); 2],
-    next_recv: usize,
-}
-
-#[cfg(any(test, unix, windows))]
-impl MultipathSocket {
-    pub(crate) fn new(
-        primary: (Box<dyn AsyncUdpSocket>, SocketAddr),
-        backup: (Box<dyn AsyncUdpSocket>, SocketAddr),
-    ) -> io::Result<Self> {
-        let routes = [
-            (primary.0.local_addr()?.ip(), primary.1),
-            (backup.0.local_addr()?.ip(), backup.1),
-        ];
-        if routes[0] == routes[1] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "multipath routes must be unique",
-            ));
-        }
-        Ok(Self {
-            children: [primary.0, backup.0],
-            routes,
-            next_recv: 0,
-        })
-    }
-}
-
-#[cfg(any(test, unix, windows))]
-impl AsyncUdpSocket for MultipathSocket {
-    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
-        Box::pin(MultipathSender {
-            children: [
-                self.children[0].create_sender(),
-                self.children[1].create_sender(),
-            ],
-            routes: self.routes,
-        })
-    }
-
-    fn poll_recv(
-        &mut self,
-        cx: &mut Context<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<io::Result<usize>> {
-        let mut path_error = None;
-        let mut unavailable = 0;
-        for offset in 0..2 {
-            let index = (self.next_recv + offset) % 2;
-            match self.children[index].poll_recv(cx, bufs, meta) {
-                Poll::Ready(Ok(received)) => {
-                    self.next_recv = (index + 1) % 2;
-                    return Poll::Ready(Ok(received));
-                }
-                Poll::Ready(Err(error)) if is_path_unavailable(&error) => {
-                    unavailable += 1;
-                    path_error.get_or_insert(error);
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => {}
-            }
-        }
-        if unavailable == self.children.len() {
-            Poll::Ready(Err(path_error.expect("all paths returned an error")))
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.children[0].local_addr()
-    }
-
-    fn max_receive_segments(&self) -> NonZeroUsize {
-        self.children[0]
-            .max_receive_segments()
-            .max(self.children[1].max_receive_segments())
-    }
-
-    fn may_fragment(&self) -> bool {
-        self.children[0].may_fragment() || self.children[1].may_fragment()
-    }
-}
-
-#[cfg(any(test, unix, windows))]
-fn is_path_unavailable(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::AddrNotAvailable
-            | io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkDown
-            | io::ErrorKind::NetworkUnreachable
-    )
-}
-
-#[cfg(any(test, unix, windows))]
-#[derive(Debug)]
-struct MultipathSender {
-    children: [Pin<Box<dyn UdpSender>>; 2],
-    routes: [(IpAddr, SocketAddr); 2],
-}
-
-#[cfg(any(test, unix, windows))]
-impl UdpSender for MultipathSender {
-    fn poll_send(
-        mut self: Pin<&mut Self>,
-        transmit: &Transmit<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        let Some(index) = self.routes.iter().position(|(source, destination)| {
-            transmit.destination == *destination
-                && transmit.src_ip.is_none_or(|requested| requested == *source)
-        }) else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "no multipath socket is bound to {:?} -> {}",
-                    transmit.src_ip, transmit.destination
-                ),
-            )));
-        };
-        self.children[index].as_mut().poll_send(transmit, cx)
-    }
-
-    fn max_transmit_segments(&self) -> NonZeroUsize {
-        self.children[0]
-            .max_transmit_segments()
-            .min(self.children[1].max_transmit_segments())
-    }
-}
-
-#[cfg(any(unix, windows))]
 impl Client {
     /// Binds a native `FakeTCP` client endpoint.
     ///
@@ -202,7 +45,8 @@ impl Client {
         tuples: &[FourTuple],
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
-        let endpoint = build_fake_tcp_client_endpoint_with_options(config, tuples, options)?;
+        let (endpoint, payload_ceiling) =
+            build_fake_tcp_client_endpoint_with_options(config, tuples, options)?;
         let Some(primary) = tuples.first() else {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "FakeTCP requires a path").into(),
@@ -218,14 +62,18 @@ impl Client {
             server_addr,
             server_name,
             Some(Arc::new(noq::TokioRuntime)),
+            None,
             configured_backup_path(config),
-            Some(*primary),
             config.transport().flow_write_buffer_bytes as usize,
             config.transport().default_nodelay,
+            config.transport().recovery,
+            Arc::new(RecoveryMemoryBudget::new(
+                config.transport().recovery_memory_budget_bytes,
+            )),
+            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
         ))
     }
 }
-#[cfg(any(unix, windows))]
 impl Server {
     /// Binds a native `FakeTCP` server endpoint.
     ///
@@ -249,40 +97,29 @@ impl Server {
         tuples: &[FourTuple],
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
-        build_fake_tcp_server_endpoint_with_options(config, tuples, options)
-            .map(|endpoint| Self::from_endpoint_with_config(endpoint, config))
+        let (endpoint, payload_ceiling) =
+            build_fake_tcp_server_endpoint_with_options(config, tuples, options)?;
+        Ok(Self::from_endpoint_with_limits(
+            endpoint,
+            usize::from(config.transport().max_active_connections),
+            usize::from(config.transport().max_active_connections_per_peer),
+            config.transport().flow_write_buffer_bytes as usize,
+            config.transport().default_nodelay,
+            Arc::new(noq::TokioRuntime),
+            None,
+            config.transport().recovery,
+            Arc::new(RecoveryMemoryBudget::new(
+                config.transport().recovery_memory_budget_bytes,
+            )),
+            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
+        ))
     }
 }
-/// Builds a client endpoint whose underlay is raw TCP-shaped packets rather than UDP.
-///
-/// Each path owns independent tuple-bound carrier state. The builder loads the configured
-/// owner-only cookie secret and derives the current tuple-bound SYN cookie; callers provide only
-/// the path tuples. Backup path lifecycle remains with the caller; [`Client::bind_fake_tcp`] arms
-/// configured backups automatically.
-///
-/// # Errors
-///
-/// Returns an error for TLS configuration, native packet-adapter setup, or endpoint construction.
-#[cfg(any(unix, windows))]
-pub fn build_fake_tcp_client_endpoint(
-    config: &ClientConfig,
-    tuples: &[FourTuple],
-) -> Result<noq::Endpoint, TransportError> {
-    build_fake_tcp_client_endpoint_with_options(config, tuples, &TransportOptions::default())
-}
-
-/// Builds a native `FakeTCP` client endpoint with runtime-neutral Rust extension options.
-///
-/// # Errors
-///
-/// Returns an error for invalid paths, an unavailable cookie secret, raw-socket setup failure, or
-/// endpoint construction.
-#[cfg(any(unix, windows))]
-pub fn build_fake_tcp_client_endpoint_with_options(
+fn build_fake_tcp_client_endpoint_with_options(
     config: &ClientConfig,
     tuples: &[FourTuple],
     options: &TransportOptions,
-) -> Result<noq::Endpoint, TransportError> {
+) -> Result<(noq::Endpoint, u16), TransportError> {
     let config = ValidatedClientConfig::new(config)?;
     let paths = configure_fake_tcp_paths(&config.carrier, config.transport(), tuples)?;
     if paths.len() != usize::from(config.multipath.mode.path_limit())
@@ -305,47 +142,27 @@ pub fn build_fake_tcp_client_endpoint_with_options(
         .transport()
         .mtu
         .static_payload_ceiling(None, tuples.iter().map(|tuple| tuple.source.is_ipv4()))?;
+    let transport =
+        build_client_config_with_options_and_payload(config, options, Some(payload_ceiling))?;
     let socket = bind_fake_tcp_paths(
         &paths,
         CarrierDirection::ClientToServer,
         config.carrier.packet_socket,
     )?;
-    build_client_endpoint_with_validated_config(
+    build_client_endpoint(
         config,
+        transport,
         socket,
         Arc::new(noq::TokioRuntime),
-        options,
-        Some(payload_ceiling),
+        payload_ceiling,
     )
 }
 
-/// Builds a server endpoint whose underlay is raw TCP-shaped packets rather than UDP.
-///
-/// Every path source must be admitted by the server's listen-address policy.
-///
-/// # Errors
-///
-/// Returns an error for TLS configuration, native packet-adapter setup, or endpoint construction.
-#[cfg(any(unix, windows))]
-pub fn build_fake_tcp_server_endpoint(
-    config: &ServerConfig,
-    tuples: &[FourTuple],
-) -> Result<noq::Endpoint, TransportError> {
-    build_fake_tcp_server_endpoint_with_options(config, tuples, &TransportOptions::default())
-}
-
-/// Builds a native `FakeTCP` server endpoint with runtime-neutral Rust extension options.
-///
-/// # Errors
-///
-/// Returns an error for invalid paths, an unavailable cookie secret, raw-socket setup failure, or
-/// endpoint construction.
-#[cfg(any(unix, windows))]
-pub fn build_fake_tcp_server_endpoint_with_options(
+fn build_fake_tcp_server_endpoint_with_options(
     config: &ServerConfig,
     tuples: &[FourTuple],
     options: &TransportOptions,
-) -> Result<noq::Endpoint, TransportError> {
+) -> Result<(noq::Endpoint, u16), TransportError> {
     let config = ValidatedServerConfig::new(config)?;
     let paths = configure_fake_tcp_paths(&config.carrier, config.transport(), tuples)?;
     if paths.is_empty()
@@ -364,21 +181,22 @@ pub fn build_fake_tcp_server_endpoint_with_options(
         .transport()
         .mtu
         .static_payload_ceiling(None, tuples.iter().map(|tuple| tuple.source.is_ipv4()))?;
+    let transport =
+        build_server_config_with_options_and_payload(config, options, Some(payload_ceiling))?;
     let socket = bind_fake_tcp_paths(
         &paths,
         CarrierDirection::ServerToClient,
         config.carrier.packet_socket,
     )?;
-    build_server_endpoint_with_validated_config(
+    build_server_endpoint(
         config,
+        transport,
         socket,
         Arc::new(noq::TokioRuntime),
-        options,
-        Some(payload_ceiling),
+        payload_ceiling,
     )
 }
 
-#[cfg(any(unix, windows))]
 fn bind_fake_tcp_paths(
     paths: &[(FourTuple, SynDataMode, u16, u16)],
     direction: CarrierDirection,
@@ -420,37 +238,11 @@ fn bind_fake_tcp_paths(
     }
 }
 
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn validate_fake_tcp_syn_data(
-    policy: SynDataPolicy,
-    paths: &[(FourTuple, SynDataMode, u16, u16)],
-) -> io::Result<()> {
-    if policy == SynDataPolicy::Cookie
-        && paths
-            .iter()
-            .all(|(_, mode, _, _)| matches!(mode, SynDataMode::Cookie(_)))
-    {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "raw FakeTCP requires cookie SYN data until empty-SYN fallback is implemented",
-    ))
-}
-
-#[cfg(any(unix, windows))]
 pub(crate) fn configure_fake_tcp_paths(
     carrier: &CarrierConfig,
     transport: &crate::config::QuicpTransportConfig,
     tuples: &[FourTuple],
 ) -> Result<Vec<(FourTuple, SynDataMode, u16, u16)>, TransportError> {
-    if carrier.syn_data() != SynDataPolicy::Cookie {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "raw FakeTCP requires cookie SYN data until empty-SYN fallback is implemented",
-        )
-        .into());
-    }
     let secret = carrier.load_cookie_secret()?;
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -475,7 +267,7 @@ pub(crate) fn configure_fake_tcp_paths(
             };
             Ok::<_, ConfigError>((
                 tuple,
-                carrier.syn_data_mode(&secret, tuple, epoch),
+                carrier.syn_cookie_mode(&secret, tuple, epoch),
                 syn_mss,
                 transport.mtu.outer_ip_mtu,
             ))

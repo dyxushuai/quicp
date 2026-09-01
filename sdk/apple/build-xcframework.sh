@@ -10,15 +10,15 @@ export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
 
 cd "$ROOT"
-cargo rustc --release --locked --features ffi-c --crate-type staticlib \
+cargo rustc --release --locked --features ffi-c,tls-rustls --crate-type staticlib \
     --target aarch64-apple-darwin
-cargo rustc --release --locked --features ffi-c --crate-type staticlib \
+cargo rustc --release --locked --features ffi-c,tls-rustls --crate-type staticlib \
     --target x86_64-apple-darwin
-cargo rustc --release --locked --features ffi-c --crate-type staticlib \
+cargo rustc --release --locked --features ffi-c,tls-rustls --crate-type staticlib \
     --target aarch64-apple-ios
-cargo rustc --release --locked --features ffi-c --crate-type staticlib \
+cargo rustc --release --locked --features ffi-c,tls-rustls --crate-type staticlib \
     --target aarch64-apple-ios-sim
-cargo rustc --release --locked --features ffi-c --crate-type staticlib \
+cargo rustc --release --locked --features ffi-c,tls-rustls --crate-type staticlib \
     --target x86_64-apple-ios
 
 mkdir -p "$WORK/headers" "$ROOT/sdk/apple/Artifacts"

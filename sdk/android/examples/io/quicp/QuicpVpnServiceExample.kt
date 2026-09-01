@@ -2,89 +2,105 @@ package io.quicp
 
 import android.content.Intent
 import android.net.VpnService
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import java.nio.channels.DatagramChannel
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 
 /**
- * Minimal VpnService packet-loop example.
+ * VpnService ownership skeleton for one QUICP underlay.
  *
- * The Rust bridge owns only bounded packet queues. The service owns the TUN descriptor, the
- * underlay socket/carrier, cancellation, and the single-thread call ordering. This example does
- * not grant raw underlay access or implement routing by itself.
+ * The app still owns route policy and the mapping between TUN IP packets and application flows.
  */
 class QuicpVpnServiceExample : VpnService() {
-    @Volatile
-    private var running = false
+    @Volatile private var running = false
+    @Volatile private var selector: Selector? = null
+    @Volatile private var worker: Thread? = null
 
+    @Synchronized
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val tun = Builder()
-            .setSession("QUICP")
-            .addAddress("198.18.0.2", 15)
-            .addRoute("0.0.0.0", 0)
-            .establish() ?: return START_NOT_STICKY
-
-        Thread {
-            QuicpBridge.create().use { bridge ->
-                running = true
-                val input = FileInputStream(tun.fileDescriptor).channel
-                val output = FileOutputStream(tun.fileDescriptor).channel
-                val inputData = ByteBuffer.allocateDirect(64 * 1500)
-                val inputDescriptors = ByteBuffer.allocateDirect(64 * QuicpBridge.INPUT_DESCRIPTOR_BYTES)
-                    .order(ByteOrder.nativeOrder())
-                val outputData = ByteBuffer.allocateDirect(64 * 1500)
-                val outputDescriptors = ByteBuffer.allocateDirect(64 * QuicpBridge.OUTPUT_DESCRIPTOR_BYTES)
-                    .order(ByteOrder.nativeOrder())
-
-                // Replace this loop's TUN reads/writes with the app's nonblocking selector. The
-                // bridge call remains single-owner and all descriptor memory stays host-owned.
-                while (running) {
-                    inputData.clear()
-                    inputDescriptors.clear()
-                    outputData.clear()
-                    outputDescriptors.clear()
-                    val length = input.read(inputData)
-                    if (length <= 0) break
-                    inputDescriptors.putInt(0, 0)
-                    inputDescriptors.putInt(Int.SIZE_BYTES, length)
-                    for (index in 0 until 64) {
-                        val field = index * QuicpBridge.OUTPUT_DESCRIPTOR_BYTES
-                        outputDescriptors.putInt(field, index * 1500)
-                        outputDescriptors.putInt(field + Int.SIZE_BYTES, 1500)
-                        outputDescriptors.putInt(field + 2 * Int.SIZE_BYTES, 0)
+        if (worker?.isAlive == true) return START_NOT_STICKY
+        running = true
+        worker = Thread {
+            try {
+                val remote = InetSocketAddress("203.0.113.10", 44_443)
+                DatagramChannel.open().use { channel ->
+                    channel.configureBlocking(false)
+                    channel.socket().bind(InetSocketAddress(40_000))
+                    check(protect(channel.socket())) { "failed to protect QUICP underlay" }
+                    channel.connect(remote)
+                    Selector.open().use { activeSelector ->
+                        selector = activeSelector
+                        channel.register(activeSelector, SelectionKey.OP_READ)
+                        try {
+                            QuicpEngine.create(
+                                role = QuicpEngine.Role.CLIENT,
+                                paths = listOf(
+                                    QuicpPath(
+                                        local = QuicpSocketAddress("192.0.2.10", 40_000),
+                                        peer = QuicpSocketAddress("203.0.113.10", 44_443),
+                                    )
+                                ),
+                            ).use { engine ->
+                                val started = System.nanoTime()
+                                val packet = ByteBuffer.allocateDirect(65_535)
+                                while (running) {
+                                    check(
+                                        engine.drive(System.nanoTime() - started).status == QuicpStatus.OK
+                                    ) { "QUICP engine stopped" }
+                                    while (true) {
+                                        packet.clear()
+                                        val result = engine.egress(0, packet)
+                                        if (result.status == QuicpStatus.WOULD_BLOCK) break
+                                        check(result.status == QuicpStatus.OK) { "QUICP egress failed" }
+                                        packet.limit(result.bytes)
+                                        check(channel.write(packet) == result.bytes) {
+                                            "QUICP underlay send would block"
+                                        }
+                                    }
+                                    val elapsed = System.nanoTime() - started
+                                    val delay = engine.nextTimerNanos?.minus(elapsed)
+                                    if (delay == null) {
+                                        activeSelector.select()
+                                    } else if (delay <= 0) {
+                                        activeSelector.selectNow()
+                                    } else {
+                                        activeSelector.select((delay + 999_999) / 1_000_000)
+                                    }
+                                    activeSelector.selectedKeys().clear()
+                                    packet.clear()
+                                    if (channel.read(packet) > 0) {
+                                        packet.flip()
+                                        check(
+                                            engine.ingress(0, packet, packet.remaining()) == QuicpStatus.OK
+                                        ) { "QUICP ingress failed" }
+                                    }
+                                }
+                            }
+                        } finally {
+                            selector = null
+                        }
                     }
-                    val result = bridge.processBatch(
-                        inputData,
-                        inputDescriptors,
-                        1,
-                        outputData,
-                        outputDescriptors,
-                        64,
-                    )
-                    if (result.status == QuicpBridge.STATUS_CLOSED) break
-                    for (index in 0 until result.outputsWritten) {
-                        val field = index * QuicpBridge.OUTPUT_DESCRIPTOR_BYTES
-                        val offset = outputDescriptors.getInt(field)
-                        val produced = outputDescriptors.getInt(field + 2 * Int.SIZE_BYTES)
-                        outputData.position(offset)
-                        outputData.limit(offset + produced)
-                        while (outputData.hasRemaining()) output.write(outputData)
-                        outputData.clear()
-                    }
-                    // Pump the permitted underlay carrier after this TUN tick. It must feed
-                    // returned datagrams back through ingress descriptors on the next iteration.
                 }
-                input.close()
-                output.close()
+            } finally {
+                running = false
+                synchronized(this) { worker = null }
+                stopSelf(startId)
             }
-            tun.close()
-        }.start()
-        return START_STICKY
+        }.also(Thread::start)
+        return START_NOT_STICKY
     }
 
     override fun onRevoke() {
         running = false
+        selector?.wakeup()
         super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        running = false
+        selector?.wakeup()
+        super.onDestroy()
     }
 }

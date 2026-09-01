@@ -6,6 +6,7 @@ This checklist is the release gate for QUICP. A checked item needs reproducible 
 the release record. An item marked `N/A` must include the reason and the profile in which the
 capability is not admitted. “Works in a unit test” is not evidence for a carrier, privilege,
 platform, or failure-mode gate.
+The release evidence must use the [normative QUICP/2 protocol](protocol.md).
 
 ## 1. Release identity and scope
 
@@ -81,8 +82,10 @@ Any failure in this section is a release blocker.
 - [ ] Mutual authentication, certificate identity, expiry, and policy failures fail closed.
 - [ ] Custom header protection is tested as header obfuscation only; it is not accepted as a claim of
   payload confidentiality or authenticity.
-- [ ] QUIC/QUICP transport 0-RTT is explicitly reported as `N/A/not admitted`; TFO-style SYN data
-  carries only the backend handshake datagram and is not advertised as application early data.
+- [ ] Ordinary OPEN/writes remain blocked by handshake admission; replay-safe 0-RTT requires a
+  valid token, fresh nonce, compatible capabilities, bounded initial bytes, and cache capacity.
+- [ ] Duplicate, expired, bad-MAC, wrong-epoch, capability-mismatch, and exhausted-cache attempts
+  fail before application side effects; fallback produces one local byte sequence.
 - [ ] PSK is either implemented and tested as an authenticated profile, or explicitly marked
   `N/A/not admitted`. The current backend exposes no-TLS and optional TLS; do not advertise PSK
   until its adapter exists.
@@ -114,26 +117,6 @@ Any failure in this section is a release blocker.
   socket path bypasses those hooks; use an isolated veth/netns pair or a second host and capture
   on the actual underlay interface.
 
-Evidence note (2026-08-21): three consecutive two-host runs between `dev-firebat`
-(`192.168.1.101`) and `dev-gtr7` (`192.168.1.104`) installed tuple-scoped `tc` drops on `eth0`,
-observed non-zero ingress/egress drop counters, and delivered the post-blackhole bytes on the
-backup tuple with the same server-side flow. The same harness also passed a backup-only blackhole
-(client setup failed closed), a both-path blackhole (no post-blackhole bytes reached the server),
-and a 60-message one-second-per-message primary-blackhole soak with exact ordered delivery. The
-client write in the both-path case may complete while data is buffered; server-side non-delivery
-and connection closure are the authoritative assertions. A separate 60-message real-underlay
-`netem` run with 5% loss, 20 ms +/- 10 ms delay, and 25% reorder delivered all ordered messages;
-the qdisc recorded 2,812 packets, 149 drops, and 208 requeues. The in-memory coordinator matrix
-also now fails closed on late, repeated, and out-of-order path transitions. Dynamic path-ID
-churn/reopen is explicitly `N/A/not admitted` in this fixed-two-candidate profile; a future
-replacement adapter needs a separate delayed-event and churn capture before admission.
-
-Packet-level evidence (same primary-drop run, 2026-08-21): an AF_PACKET capture on `dev-gtr7` saw
-all four expected tuples, including 48 client-to-server primary packets, 45 client-to-server
-backup packets, 17 server-to-client primary packets, and 6 server-to-client backup packets. The
-server-side ingress filter dropped 108 bytes across 2 primary packets, while the server asserted
-same-flow delivery after failover. Temporary ingress qdisc and RST rules were absent after teardown.
-
 ### 2.5 Resource, concurrency, and lifecycle safety
 
 - [ ] Published packet, stream, connection, path, queue, and batch limits are enforced under load.
@@ -161,6 +144,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-features --all-targets --locked -- -D warnings
 cargo test --locked
+cargo test --features runtime-tokio --locked
 cargo test --all-features --locked
 cargo test --locked --features platform-smoltcp --test smolstack
 cargo run --locked --example smoltcp_bridge --features platform-smoltcp
@@ -181,13 +165,15 @@ cargo audit
 cargo check --locked --features ffi-c --target aarch64-apple-ios
 cargo check --locked --features ffi-c --target aarch64-apple-ios-sim
 cargo check --locked --features ffi-c --target x86_64-apple-ios
+cargo check --locked --features platform-smoltcp --target aarch64-apple-ios
+cargo check --locked --features runtime-tokio --target aarch64-apple-ios
 cargo check --locked --features runtime-tokio --target aarch64-apple-darwin
 sh sdk/apple/build-xcframework.sh
 swift test --package-path sdk/apple
 ```
 
-- [ ] Swift tests cover create, empty batch, close, repeated close, invalid status, and caller
-  buffer ownership.
+- [ ] Swift tests cover create, timers, recovery snapshots, flow I/O, close, repeated close,
+  invalid status, and caller-buffer ownership.
 - [ ] The Network Extension example is documented as an entitlement/carrier skeleton and is not
   accepted as proof of raw-underlay access.
 
@@ -200,8 +186,12 @@ export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/28.2.13676358"
 export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
 cargo ndk -t arm64-v8a -t x86_64 -P 21 \
   check --locked --features ffi-c
+cargo ndk -t arm64-v8a -t x86_64 -P 21 \
+  check --locked --features platform-smoltcp
+cargo ndk -t arm64-v8a -t x86_64 -P 21 \
+  check --locked --features runtime-tokio
 cargo ndk -t arm64-v8a -P 21 \
-  rustc --locked --features ffi-c --crate-type staticlib
+  rustc --locked --features ffi-c,tls-rustls --crate-type staticlib
 cmake -S sdk/android -B "$RUNNER_TEMP/quicp-jni" \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
@@ -210,25 +200,29 @@ cmake --build "$RUNNER_TEMP/quicp-jni" --parallel
 ```
 
 - [ ] Build the JNI wrapper with `sdk/android/CMakeLists.txt` for at least arm64-v8a.
-- [ ] Kotlin tests cover direct-buffer validation, native byte order, descriptor bounds, output
-  read-only rejection, empty batches, partial progress, and close.
-- [ ] The VpnService example is documented as a packet-loop/carrier skeleton and is not accepted as
+- [ ] Kotlin checks cover direct-buffer validation, engine layout, timer/drive, generation handles,
+  flow I/O, and close.
+- [ ] The VpnService example is documented as a host-underlay skeleton and is not accepted as
   proof of arbitrary raw TCP injection.
 
-### 3.3 Windows host-driven and packet bridge
+### 3.3 Windows host-driven and C engine
 
-The runtime-neutral host API, smoltcp packet bridge, C packet ABI, and WinDivert-backed Tier 0
-carrier are supported on Windows. The native carrier requires the external signed WinDivert
-provider and Administrator privileges; it does not create a Wintun/TAP handle.
+The runtime-neutral host API, optional smoltcp bridge, C engine ABI, and WinDivert-backed Tier 0
+carrier are supported on Windows. The native carrier requires the pinned WinDivert 2.2.2-A x64
+distribution in a protected installation directory and Administrator privileges; it does not
+create a Wintun/TAP handle.
 
 - [ ] Run the native Windows host-driven echo and shutdown tests.
-- [ ] Run the C packet-bridge smoke test with caller-owned buffers.
-- [ ] Install the matching signed `WinDivert.dll` and `WinDivert64.sys` beside the test binary and
-  run `cargo test --locked --features runtime-tokio,internal-bench --test windows_windivert -- --ignored`
-  from an elevated Windows shell.
+- [ ] Run the C engine connection/flow E2E with caller-owned buffers.
+- [ ] Stage the test executable, pinned `WinDivert.dll`, and signed `WinDivert64.sys` in a directory
+  owned by `SYSTEM`, `Administrators`, or `TrustedInstaller`, with mutation rights limited to those
+  principals; invoke the test executable directly with
+  `windivert_carrier_binds_a_filtered_tuple --ignored` from an elevated Windows shell.
 - [ ] Capture an external-interface packet round trip, including SYN data, tuple filtering, kernel
   RST suppression, loss/reordering, and shutdown cleanup.
-- [ ] TODO: implement and test a native Wintun/TAP Tier 1 handle adapter with rollback cleanup.
+
+Native Wintun/TAP handle ownership is deferred Tier 1 work; it is not part of the QUICP/2 core or
+this release gate.
 
 ### 3.4 Other non-Linux behavior
 
@@ -281,10 +275,10 @@ replace them.
   unauthenticated.
 - [ ] TLS profile: verify mutual-auth success, wrong identity, expired certificate, profile-token
   mismatch, and downgrade attempts.
-- [ ] Confirm transport 0-RTT has no configuration switch or application path in either security
-  profile.
-- [ ] Confirm a TFO-style SYN carries only the backend handshake datagram and application `OPEN`
-  remains blocked until ordinary connection admission.
+- [ ] Confirm only the explicit replay-safe API can send initial application bytes before handshake
+  completion and that ordinary OPEN remains blocked.
+- [ ] Confirm no-security bearer tokens are not described as peer authentication and replay cache
+  scope is documented as process-local.
 
 ## 5. Performance and stability gates
 
@@ -294,16 +288,18 @@ CPU pinning, MTU, connection state, and no-TLS security profile.
 - [ ] Run the authoritative Linux raw comparison on the release host:
 
 ```sh
-cargo bench --bench loopback --features runtime-tokio,internal-bench -- --quiet
+cargo bench --locked --bench loopback --features runtime-tokio -- --quiet
+QUICP_ONLY=1 QUICP_ENFORCE_CLEAN_PATH=1 \
+  cargo bench --locked --bench loopback --features runtime-tokio -- --quiet
 ```
-
-`internal-bench` is a repository-only raw bench/test seam; it is not part of the stable facade or
-the mobile/FFI release profile, and it does not select among backends.
 
 - [ ] Compare QUICP FakeTCP and ordinary kernel TCP at 64 B, 1,200 B, and 4,096 B application
   payloads, with connection and flow establishment excluded from the timed region.
-- [ ] Record median, p95, p99, Gbps, CPU%, RSS, allocations, retransmissions, and drops for at least
-  five interleaved samples per payload size.
+- [ ] Record p50, p95, p99, Gbps, CPU%, allocations, absolute peak live Rust heap, replay, repair,
+  fallback, and drops for six interleaved samples per payload size. Record lifetime RSS separately;
+  it is process-wide and is not attributable to either recovery mode.
+- [ ] Run the SOCKS5 client and server as separate processes over Tier 0 FakeTCP, pass one real
+  CONNECT request through the tunnel, and attach the tuple-scoped RST rule plus cleanup evidence.
 - [ ] Reject results that mix raw FakeTCP with TUN/smoltcp, TLS with no-TLS, or in-memory codec
   microbenchmarks with end-to-end TCP.
 - [ ] Require no statistically significant regression against the last accepted baseline, or attach
@@ -334,6 +330,8 @@ not a gate for the portable transport core or the current carrier-only mobile SD
 
 - [ ] Configuration loading rejects symlinks, writable private files, malformed candidates, unknown
   fields, duplicate tuples, and invalid security/multipath combinations.
+- [ ] Endpoint-wide recovery memory tests prove retained decoder sources, repair rows, pre-OPEN
+  data, and flow reassembly cannot exceed the configured budget and teardown returns all credit.
 - [ ] Logs contain profile, path state, close reason, queue pressure, and counters but never secrets,
   private keys, raw application payloads, or unredacted target data.
 - [ ] Health checks distinguish “process alive”, “carrier bound”, “authenticated”, “backup ready”,

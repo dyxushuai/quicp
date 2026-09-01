@@ -30,8 +30,14 @@ pub const MIN_QUIC_PAYLOAD: u16 = 1200;
 pub const MAX_QUIC_PAYLOAD: u16 = 65_527;
 /// Maximum per-flow buffer allocated by the transport.
 pub const MAX_FLOW_BUFFER_BYTES: u32 = 16 * 1024 * 1024;
+/// Maximum endpoint-wide recovery memory budget.
+pub const MAX_RECOVERY_MEMORY_BUDGET_BYTES: u32 = 1024 * 1024 * 1024;
 /// Maximum bytes retained for one pending handshake.
 pub const MAX_PENDING_HANDSHAKE_BUFFER_BYTES: u32 = 1024 * 1024;
+/// Maximum number of source symbols covered by one repair symbol.
+pub const MAX_REPAIR_SPAN: u16 = 256;
+/// Maximum bounded decoder window.
+pub const MAX_DECODER_WINDOW: u16 = 4096;
 const DEFAULT_OUTER_IP_MTU: u16 = 1500;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -70,9 +76,7 @@ pub(crate) fn read_trusted_file(
     {
         let metadata = verify_file(path, &file)?;
         #[cfg(windows)]
-        if mode == TrustedFileMode::OwnerOnly {
-            verify_owner_and_acl(path, &file)?;
-        }
+        verify_owner_and_acl(path, &file, mode)?;
         #[cfg(unix)]
         if mode == TrustedFileMode::OwnerOnly && metadata.mode() & 0o077 != 0 {
             return Err(ConfigError::InsecurePermissions {
@@ -99,6 +103,8 @@ pub(crate) fn read_trusted_file(
 pub(crate) enum TrustedFileMode {
     SharedReadable,
     OwnerOnly,
+    #[cfg(all(windows, feature = "runtime-tokio"))]
+    SystemOwned,
 }
 
 #[cfg(unix)]
@@ -204,17 +210,22 @@ impl Drop for LocalSecurityDescriptor {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
+pub(crate) fn verify_owner_and_acl(
+    path: &Path,
+    file: &File,
+    mode: TrustedFileMode,
+) -> Result<(), ConfigError> {
     use std::mem::size_of;
     use std::ptr::{addr_of, addr_of_mut, null_mut};
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE,
+    };
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
@@ -248,7 +259,8 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
 
     let mut token = null_mut();
     let process = unsafe { GetCurrentProcess() };
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token)) } == 0 {
+    let token_opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, addr_of_mut!(token)) };
+    if token_opened == 0 || token.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     struct TokenGuard(windows_sys::Win32::Foundation::HANDLE);
@@ -274,66 +286,72 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     let mut token_buffer = vec![0u8; usize::try_from(token_bytes).unwrap_or(0)];
-    if token_buffer.is_empty()
-        || unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                token_buffer.as_mut_ptr().cast(),
-                token_bytes,
-                addr_of_mut!(token_bytes),
-            )
-        } == 0
-    {
+    let token_info = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            token_buffer.as_mut_ptr().cast(),
+            token_bytes,
+            addr_of_mut!(token_bytes),
+        )
+    };
+    if token_buffer.is_empty() || token_info == 0 {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
 
     let mut owner_defaulted = 0;
+    let owner_result = unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor,
+            addr_of_mut!(owner),
+            addr_of_mut!(owner_defaulted),
+        )
+    };
+    let owner_is_user = !owner.is_null() && unsafe { EqualSid(owner, token_user.User.Sid) } != 0;
+    let owner_is_system = !owner.is_null() && is_windows_system_sid(owner);
     if owner.is_null()
-        || unsafe {
-            GetSecurityDescriptorOwner(
-                descriptor,
-                addr_of_mut!(owner),
-                addr_of_mut!(owner_defaulted),
-            )
-        } == 0
-        || unsafe { EqualSid(owner, token_user.User.Sid) } == 0
+        || owner_result == 0
+        || match mode {
+            #[cfg(feature = "runtime-tokio")]
+            TrustedFileMode::SystemOwned => !owner_is_system,
+            TrustedFileMode::SharedReadable | TrustedFileMode::OwnerOnly => {
+                !owner_is_user && !owner_is_system
+            }
+        }
     {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
 
     let mut dacl_present = 0;
     let mut dacl_defaulted = 0;
-    if unsafe {
+    let dacl_result = unsafe {
         GetSecurityDescriptorDacl(
             descriptor,
             addr_of_mut!(dacl_present),
             addr_of_mut!(dacl),
             addr_of_mut!(dacl_defaulted),
         )
-    } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-    {
+    };
+    if dacl_result == 0 || dacl_present == 0 || dacl.is_null() {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
 
     let mut acl_info = ACL_SIZE_INFORMATION::default();
-    if unsafe {
+    let acl_info_result = unsafe {
         GetAclInformation(
             dacl,
             addr_of_mut!(acl_info).cast(),
             u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
             AclSizeInformation,
         )
-    } == 0
-    {
+    };
+    if acl_info_result == 0 {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
 
-    // Do not include READ_CONTROL or SYNCHRONIZE from FILE_GENERIC_WRITE. Those bits are also
-    // present in read-only ACEs and would make a normal read grant look writable.
+    // READ_CONTROL and SYNCHRONIZE also appear in read grants, so only mutation rights belong in
+    // this mask. Generic rights must be checked because an ACL may not have mapped them yet.
     let write_mask = FILE_APPEND_DATA
         | FILE_DELETE_CHILD
         | FILE_WRITE_ATTRIBUTES
@@ -341,7 +359,9 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
         | FILE_WRITE_EA
         | DELETE
         | WRITE_DAC
-        | WRITE_OWNER;
+        | WRITE_OWNER
+        | GENERIC_ALL
+        | GENERIC_WRITE;
     for index in 0..acl_info.AceCount {
         let mut ace = null_mut();
         if unsafe { GetAce(dacl, index, addr_of_mut!(ace)) } == 0 || ace.is_null() {
@@ -352,6 +372,9 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
         if ace_size < size_of::<windows_sys::Win32::Security::ACE_HEADER>() {
             return Err(ConfigError::InsecureAcl(path.to_owned()));
         }
+        if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
         match u32::from(header.AceType) {
             ACCESS_DENIED_ACE_TYPE => {}
             ACCESS_ALLOWED_ACE_TYPE => {
@@ -359,29 +382,13 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
                     return Err(ConfigError::InsecureAcl(path.to_owned()));
                 }
                 let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-                if allowed.Mask & write_mask == 0 {
-                    continue;
-                }
                 let sid = addr_of!(allowed.SidStart).cast::<core::ffi::c_void>() as PSID;
-                let mut trusted = unsafe { EqualSid(sid, owner) } != 0;
-                for well_known in [WinLocalSystemSid, WinBuiltinAdministratorsSid] {
-                    let mut buffer = [0u8; 68];
-                    let mut length = buffer.len() as u32;
-                    if unsafe {
-                        CreateWellKnownSid(
-                            well_known,
-                            null_mut(),
-                            buffer.as_mut_ptr().cast(),
-                            addr_of_mut!(length),
-                        )
-                    } != 0
-                        && unsafe { EqualSid(sid, buffer.as_mut_ptr().cast()) } != 0
-                    {
-                        trusted = true;
-                        break;
-                    }
-                }
-                if !trusted {
+                let trusted = unsafe { EqualSid(sid, owner) } != 0
+                    || unsafe { EqualSid(sid, token_user.User.Sid) } != 0
+                    || is_windows_system_sid(sid);
+                if !trusted
+                    && (mode == TrustedFileMode::OwnerOnly || allowed.Mask & write_mask != 0)
+                {
                     return Err(ConfigError::InsecureAcl(path.to_owned()));
                 }
             }
@@ -389,6 +396,65 @@ fn verify_owner_and_acl(path: &Path, file: &File) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn is_windows_system_sid(sid: windows_sys::Win32::Security::PSID) -> bool {
+    use std::ptr::{addr_of_mut, null_mut};
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CreateWellKnownSid, EqualSid, FreeSid, SECURITY_NT_AUTHORITY,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        SECURITY_TRUSTED_INSTALLER_RID1, SECURITY_TRUSTED_INSTALLER_RID2,
+        SECURITY_TRUSTED_INSTALLER_RID3, SECURITY_TRUSTED_INSTALLER_RID4,
+        SECURITY_TRUSTED_INSTALLER_RID5,
+    };
+
+    if [WinLocalSystemSid, WinBuiltinAdministratorsSid]
+        .into_iter()
+        .any(|well_known| {
+            let mut buffer = [0u8; 68];
+            let mut length = buffer.len() as u32;
+            unsafe {
+                CreateWellKnownSid(
+                    well_known,
+                    null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    addr_of_mut!(length),
+                ) != 0
+                    && EqualSid(sid, buffer.as_mut_ptr().cast()) != 0
+            }
+        })
+    {
+        return true;
+    }
+
+    let mut trusted_installer = null_mut();
+    if unsafe {
+        AllocateAndInitializeSid(
+            &SECURITY_NT_AUTHORITY,
+            6,
+            80,
+            SECURITY_TRUSTED_INSTALLER_RID1,
+            SECURITY_TRUSTED_INSTALLER_RID2,
+            SECURITY_TRUSTED_INSTALLER_RID3,
+            SECURITY_TRUSTED_INSTALLER_RID4,
+            SECURITY_TRUSTED_INSTALLER_RID5,
+            0,
+            0,
+            addr_of_mut!(trusted_installer),
+        )
+    } == 0
+    {
+        return false;
+    }
+    let matches = unsafe { EqualSid(sid, trusted_installer) != 0 };
+    unsafe {
+        let _ = FreeSid(trusted_installer);
+    }
+    matches
 }
 
 #[cfg(unix)]
@@ -490,7 +556,13 @@ impl ClientConfig {
     ///
     /// Returns an error when the multipath or carrier configuration is invalid.
     pub fn insecure(multipath: Multipath, carrier: CarrierConfig) -> Result<Self, ConfigError> {
-        Self::from_parts(None, true, multipath, carrier, None)
+        Self::from_parts(
+            None,
+            true,
+            multipath,
+            carrier,
+            QuicpTransportConfig::default(),
+        )
     }
 
     /// Creates a client configuration using the supplied TLS identity and trust material.
@@ -503,7 +575,13 @@ impl ClientConfig {
         multipath: Multipath,
         carrier: CarrierConfig,
     ) -> Result<Self, ConfigError> {
-        Self::from_parts(Some(tls), false, multipath, carrier, None)
+        Self::from_parts(
+            Some(tls),
+            false,
+            multipath,
+            carrier,
+            QuicpTransportConfig::default(),
+        )
     }
 
     fn from_parts(
@@ -511,17 +589,14 @@ impl ClientConfig {
         allow_insecure: bool,
         multipath: Multipath,
         carrier: CarrierConfig,
-        transport: Option<QuicpTransportConfig>,
+        transport: QuicpTransportConfig,
     ) -> Result<Self, ConfigError> {
-        let congestion_control = carrier.congestion_control;
         let config = Self {
             tls,
             allow_insecure,
             multipath,
             carrier,
-            transport: transport.unwrap_or_else(|| {
-                QuicpTransportConfig::default().with_congestion_control(congestion_control)
-            }),
+            transport,
         };
         config.validate()?;
         Ok(config)
@@ -589,7 +664,13 @@ impl ServerConfig {
         listen_addrs: Vec<SocketAddr>,
         carrier: CarrierConfig,
     ) -> Result<Self, ConfigError> {
-        Self::from_parts(listen_addrs, None, true, carrier, None)
+        Self::from_parts(
+            listen_addrs,
+            None,
+            true,
+            carrier,
+            QuicpTransportConfig::default(),
+        )
     }
 
     /// Creates a server configuration using the supplied TLS identity and trust material.
@@ -602,7 +683,13 @@ impl ServerConfig {
         tls: ServerTls,
         carrier: CarrierConfig,
     ) -> Result<Self, ConfigError> {
-        Self::from_parts(listen_addrs, Some(tls), false, carrier, None)
+        Self::from_parts(
+            listen_addrs,
+            Some(tls),
+            false,
+            carrier,
+            QuicpTransportConfig::default(),
+        )
     }
 
     fn from_parts(
@@ -610,17 +697,14 @@ impl ServerConfig {
         tls: Option<ServerTls>,
         allow_insecure: bool,
         carrier: CarrierConfig,
-        transport: Option<QuicpTransportConfig>,
+        transport: QuicpTransportConfig,
     ) -> Result<Self, ConfigError> {
-        let congestion_control = carrier.congestion_control;
         let config = Self {
             listen_addrs,
             tls,
             allow_insecure,
             carrier,
-            transport: transport.unwrap_or_else(|| {
-                QuicpTransportConfig::default().with_congestion_control(congestion_control)
-            }),
+            transport,
         };
         config.validate()?;
         Ok(config)
@@ -678,7 +762,7 @@ impl ServerConfig {
     }
 }
 
-/// TLS settings for the temporary backend adapter.
+/// TLS settings for a QUICP client.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTls {
@@ -742,7 +826,7 @@ impl ClientTls {
     }
 }
 
-/// Server TLS settings for the temporary backend adapter.
+/// TLS settings for a QUICP server.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerTls {
@@ -1022,6 +1106,9 @@ pub struct QuicpTransportConfig {
     /// Bounded per-flow write buffer.
     #[serde(default = "default_flow_buffer")]
     pub flow_write_buffer_bytes: u32,
+    /// Maximum recovery bytes retained across all connections of one endpoint.
+    #[serde(default = "default_recovery_memory_budget")]
+    pub recovery_memory_budget_bytes: u32,
     /// Maximum simultaneous server handshakes.
     #[serde(default = "default_pending_handshakes")]
     pub max_pending_handshakes: u16,
@@ -1037,6 +1124,9 @@ pub struct QuicpTransportConfig {
     /// Built-in congestion controller used by the QUICP transport.
     #[serde(default)]
     pub congestion_control: CongestionControl,
+    /// QUICP/2 logical recovery policy.
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
 }
 
 impl Default for QuicpTransportConfig {
@@ -1055,11 +1145,13 @@ impl Default for QuicpTransportConfig {
             max_ack_delay: Duration::from_millis(1),
             default_nodelay: true,
             flow_write_buffer_bytes: 32 * 1024,
+            recovery_memory_budget_bytes: 64 * 1024 * 1024,
             max_pending_handshakes: 128,
             pending_handshake_buffer_bytes: 32 * 1024,
             max_active_connections: 128,
             max_active_connections_per_peer: 16,
             congestion_control: CongestionControl::Cubic,
+            recovery: RecoveryConfig::default(),
         }
     }
 }
@@ -1083,6 +1175,13 @@ impl QuicpTransportConfig {
     #[must_use]
     pub const fn with_nodelay(mut self, nodelay: bool) -> Self {
         self.default_nodelay = nodelay;
+        self
+    }
+
+    /// Replaces the QUICP/2 recovery policy.
+    #[must_use]
+    pub const fn with_recovery(mut self, recovery: RecoveryConfig) -> Self {
+        self.recovery = recovery;
         self
     }
 
@@ -1132,6 +1231,18 @@ impl QuicpTransportConfig {
         if self.ack_eliciting_threshold == 0 || self.flow_write_buffer_bytes == 0 {
             return Err(ConfigError::ZeroTransportValue("ACK or flow buffer"));
         }
+        if self.recovery_memory_budget_bytes == 0 {
+            return Err(ConfigError::ZeroTransportValue(
+                "recovery_memory_budget_bytes",
+            ));
+        }
+        if self.recovery_memory_budget_bytes > MAX_RECOVERY_MEMORY_BUDGET_BYTES {
+            return Err(ConfigError::InvalidTransportBuffer {
+                name: "recovery_memory_budget_bytes",
+                value: self.recovery_memory_budget_bytes,
+                maximum: MAX_RECOVERY_MEMORY_BUDGET_BYTES,
+            });
+        }
         if self.flow_write_buffer_bytes > MAX_FLOW_BUFFER_BYTES {
             return Err(ConfigError::InvalidTransportBuffer {
                 name: "flow_write_buffer_bytes",
@@ -1139,6 +1250,7 @@ impl QuicpTransportConfig {
                 maximum: MAX_FLOW_BUFFER_BYTES,
             });
         }
+        self.recovery.validate(self.flow_write_buffer_bytes)?;
         if self.max_pending_handshakes == 0
             || self.pending_handshake_buffer_bytes == 0
             || self.max_active_connections == 0
@@ -1164,6 +1276,121 @@ impl QuicpTransportConfig {
             .ok_or(ConfigError::HandshakeBudgetOverflow)?;
         Ok(())
     }
+}
+
+/// QUICP/2 payload recovery substrate.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryMode {
+    /// Use source DATAGRAMs, adaptive repair, selective replay, and reliable fallback.
+    #[default]
+    Adaptive,
+    /// Carry payload through framed reliable control streams only.
+    ReliableOnly,
+}
+
+/// Bounded QUICP/2 recovery limits shared by both endpoints.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Selected recovery substrate.
+    #[serde(default)]
+    pub mode: RecoveryMode,
+    /// Reject peers that do not negotiate DATAGRAM and repair support.
+    #[serde(default)]
+    pub require_adaptive: bool,
+    /// Largest number of source symbols covered by one repair symbol.
+    #[serde(default = "default_repair_span")]
+    pub max_repair_span: u16,
+    /// Maximum source symbols retained by the decoder.
+    #[serde(default = "default_decoder_window")]
+    pub decoder_window: u16,
+    /// Maximum selective ranges in one logical ACK.
+    #[serde(default = "default_ack_ranges")]
+    pub max_ack_ranges: u8,
+    /// Maximum unacknowledged application bytes retained per flow.
+    #[serde(default = "default_recovery_buffer")]
+    pub replay_buffer_bytes: u32,
+    /// Maximum out-of-order application bytes retained per flow.
+    #[serde(default = "default_recovery_buffer")]
+    pub reassembly_buffer_bytes: u32,
+    /// Maximum source symbols accepted before their OPEN stream is admitted.
+    #[serde(default = "default_pre_open_symbols")]
+    pub pre_open_symbols: u16,
+    /// Maximum recovery work quanta per DATAGRAM, scaled by the symbol-byte ceiling.
+    #[serde(default = "default_recovery_work_budget")]
+    pub work_budget: u16,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            mode: RecoveryMode::Adaptive,
+            require_adaptive: false,
+            max_repair_span: default_repair_span(),
+            decoder_window: default_decoder_window(),
+            max_ack_ranges: default_ack_ranges(),
+            replay_buffer_bytes: default_recovery_buffer(),
+            reassembly_buffer_bytes: default_recovery_buffer(),
+            pre_open_symbols: default_pre_open_symbols(),
+            work_budget: default_recovery_work_budget(),
+        }
+    }
+}
+
+impl RecoveryConfig {
+    fn validate(self, flow_buffer_bytes: u32) -> Result<(), ConfigError> {
+        if self.require_adaptive && self.mode != RecoveryMode::Adaptive {
+            return Err(ConfigError::InvalidRecoveryPolicy);
+        }
+        validate_recovery_limit(
+            "max_repair_span",
+            u32::from(self.max_repair_span),
+            1,
+            u32::from(MAX_REPAIR_SPAN),
+        )?;
+        validate_recovery_limit(
+            "decoder_window",
+            u32::from(self.decoder_window),
+            512,
+            u32::from(MAX_DECODER_WINDOW),
+        )?;
+        if self.decoder_window < self.max_repair_span {
+            return Err(ConfigError::InvalidRecoveryPolicy);
+        }
+        validate_recovery_limit("max_ack_ranges", u32::from(self.max_ack_ranges), 1, 32)?;
+        validate_recovery_limit(
+            "replay_buffer_bytes",
+            self.replay_buffer_bytes,
+            flow_buffer_bytes,
+            MAX_FLOW_BUFFER_BYTES,
+        )?;
+        validate_recovery_limit(
+            "reassembly_buffer_bytes",
+            self.reassembly_buffer_bytes,
+            flow_buffer_bytes,
+            MAX_FLOW_BUFFER_BYTES,
+        )?;
+        validate_recovery_limit("pre_open_symbols", u32::from(self.pre_open_symbols), 0, 256)?;
+        validate_recovery_limit("work_budget", u32::from(self.work_budget), 1, 4096)
+    }
+}
+
+fn validate_recovery_limit(
+    name: &'static str,
+    value: u32,
+    minimum: u32,
+    maximum: u32,
+) -> Result<(), ConfigError> {
+    if !(minimum..=maximum).contains(&value) {
+        return Err(ConfigError::InvalidRecoveryLimit {
+            name,
+            value,
+            minimum,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 fn validate_payload(name: &'static str, value: u16) -> Result<(), ConfigError> {
@@ -1233,12 +1460,40 @@ const fn default_flow_buffer() -> u32 {
     32 * 1024
 }
 
+const fn default_recovery_memory_budget() -> u32 {
+    64 * 1024 * 1024
+}
+
 const fn default_pending_handshakes() -> u16 {
     128
 }
 
 const fn default_pending_handshake_buffer() -> u32 {
     32 * 1024
+}
+
+const fn default_repair_span() -> u16 {
+    64
+}
+
+const fn default_decoder_window() -> u16 {
+    512
+}
+
+const fn default_ack_ranges() -> u8 {
+    16
+}
+
+const fn default_recovery_buffer() -> u32 {
+    256 * 1024
+}
+
+const fn default_pre_open_symbols() -> u16 {
+    32
+}
+
+const fn default_recovery_work_budget() -> u16 {
+    128
 }
 
 const fn default_active_connections() -> u16 {
@@ -1253,25 +1508,18 @@ const fn default_active_connections_per_peer() -> u16 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CarrierConfig {
-    #[serde(default)]
-    pub(crate) syn_data: SynDataPolicy,
     #[serde(default = "default_cookie_secret_file")]
     pub(crate) cookie_secret_file: PathBuf,
     /// Use filtered Linux `AF_PACKET` sockets for both directions instead of IP raw sockets.
     #[serde(default)]
     pub(crate) packet_socket: bool,
-    /// Selects the built-in congestion controller used by the QUICP transport.
-    #[serde(default)]
-    pub(crate) congestion_control: CongestionControl,
 }
 
 impl Default for CarrierConfig {
     fn default() -> Self {
         Self {
-            syn_data: SynDataPolicy::Cookie,
             cookie_secret_file: default_cookie_secret_file(),
             packet_socket: false,
-            congestion_control: CongestionControl::Cubic,
         }
     }
 }
@@ -1282,16 +1530,10 @@ impl CarrierConfig {
     /// # Errors
     ///
     /// Returns an error when the SYN-cookie secret path is not absolute.
-    pub fn new(
-        syn_data: SynDataPolicy,
-        cookie_secret_file: impl Into<PathBuf>,
-        congestion_control: CongestionControl,
-    ) -> Result<Self, ConfigError> {
+    pub fn new(cookie_secret_file: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let config = Self {
-            syn_data,
             cookie_secret_file: cookie_secret_file.into(),
             packet_socket: false,
-            congestion_control,
         };
         config.validate()?;
         Ok(config)
@@ -1319,21 +1561,15 @@ impl CarrierConfig {
         Ok(bytes)
     }
 
-    /// Converts the configured policy into the tuple-bound SYN mode used by one path.
+    /// Creates the tuple-bound SYN cookie used by one path.
     #[must_use]
-    pub fn syn_data_mode(&self, cookie_secret: &[u8], tuple: FourTuple, epoch: u64) -> SynDataMode {
-        match self.syn_data {
-            SynDataPolicy::Disabled => SynDataMode::Disabled,
-            SynDataPolicy::Cookie => {
-                SynDataMode::Cookie(issue_syn_cookie(cookie_secret, tuple, epoch))
-            }
-        }
-    }
-
-    #[must_use]
-    /// Returns the configured SYN-data policy.
-    pub const fn syn_data(&self) -> SynDataPolicy {
-        self.syn_data
+    pub fn syn_cookie_mode(
+        &self,
+        cookie_secret: &[u8],
+        tuple: FourTuple,
+        epoch: u64,
+    ) -> SynDataMode {
+        SynDataMode::Cookie(issue_syn_cookie(cookie_secret, tuple, epoch))
     }
 
     #[must_use]
@@ -1346,12 +1582,6 @@ impl CarrierConfig {
     /// Returns whether Linux packet sockets are selected over IP raw sockets.
     pub const fn packet_socket(&self) -> bool {
         self.packet_socket
-    }
-
-    #[must_use]
-    /// Returns the selected built-in congestion controller.
-    pub const fn congestion_control(&self) -> CongestionControl {
-        self.congestion_control
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -1383,17 +1613,6 @@ fn default_cookie_secret_file() -> PathBuf {
     }
 }
 
-/// Policy for TCP-shaped SYN payloads on the raw carrier.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum SynDataPolicy {
-    /// Disables SYN data; raw endpoint construction currently rejects this mode.
-    Disabled,
-    /// Carries a tuple-bound carrier cookie and backend handshake datagram.
-    #[default]
-    Cookie,
-}
-
 /// Built-in congestion-control algorithms for one QUICP connection/path.
 ///
 /// This setting affects transport pacing and congestion windows; it does not change the QUICP
@@ -1419,11 +1638,10 @@ pub struct Multipath {
     pub(crate) candidates: Vec<PathCandidate>,
 }
 
-/// One named local-address to server-address path candidate.
+/// One local-address to server-address path candidate.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PathCandidate {
-    pub(crate) name: String,
     pub(crate) local_ip: IpAddr,
     pub(crate) server_addr: SocketAddr,
 }
@@ -1447,7 +1665,7 @@ impl Multipath {
     ///
     /// # Errors
     ///
-    /// Returns an error when the candidates duplicate a name or path tuple.
+    /// Returns an error when the candidates duplicate a path tuple.
     pub fn failover(primary: PathCandidate, backup: PathCandidate) -> Result<Self, ConfigError> {
         let multipath = Self {
             mode: MultipathMode::Failover,
@@ -1475,25 +1693,14 @@ impl PathCandidate {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty name, unusable address, mixed address family, or zero port.
-    pub fn new(
-        name: impl Into<String>,
-        local_ip: IpAddr,
-        server_addr: SocketAddr,
-    ) -> Result<Self, ConfigError> {
+    /// Returns an error for an unusable address, mixed address family, or zero port.
+    pub fn new(local_ip: IpAddr, server_addr: SocketAddr) -> Result<Self, ConfigError> {
         let candidate = Self {
-            name: name.into(),
             local_ip,
             server_addr,
         };
         validate_path_candidate(&candidate)?;
         Ok(candidate)
-    }
-
-    #[must_use]
-    /// Returns the diagnostic candidate name.
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     #[must_use]
@@ -1584,9 +1791,6 @@ pub enum ConfigError {
         /// Observed candidate count.
         actual: usize,
     },
-    /// Two candidates used the same diagnostic name.
-    #[error("duplicate path candidate name {0}")]
-    DuplicateCandidateName(String),
     /// Two candidates used the same local/remote tuple.
     #[error("duplicate path candidate tuple {local_ip} -> {server_addr}")]
     DuplicateCandidateTuple {
@@ -1596,16 +1800,20 @@ pub enum ConfigError {
         server_addr: SocketAddr,
     },
     /// A candidate mixed IPv4 and IPv6 endpoints.
-    #[error("path candidate {name} uses different IP families")]
+    #[error("path candidate {local_ip} -> {server_addr} uses different IP families")]
     AddressFamilyMismatch {
-        /// Rejected candidate name.
-        name: String,
+        /// Rejected local source address.
+        local_ip: IpAddr,
+        /// Rejected server address.
+        server_addr: SocketAddr,
     },
     /// A candidate used an unspecified, multicast, or otherwise unusable address.
-    #[error("path candidate {name} has an unusable address")]
+    #[error("path candidate {local_ip} -> {server_addr} has an unusable address")]
     UnusableCandidateAddress {
-        /// Rejected candidate name.
-        name: String,
+        /// Rejected local source address.
+        local_ip: IpAddr,
+        /// Rejected server address.
+        server_addr: SocketAddr,
     },
     /// A server configuration supplied no listen addresses.
     #[error("server listen allowlist must not be empty")]
@@ -1628,6 +1836,9 @@ pub enum ConfigError {
     /// A TLS material path was relative.
     #[error("TLS material path must be absolute: {0}")]
     TlsPathNotAbsolute(PathBuf),
+    /// TLS was requested without its optional backend.
+    #[error("TLS configuration requires the `tls-rustls` feature")]
+    TlsFeatureDisabled,
     /// The no-security profile was not explicitly selected.
     #[error("the unauthenticated no-security profile requires allow_insecure = true")]
     InsecureProfileRequiresOptIn,
@@ -1692,6 +1903,21 @@ pub enum ConfigError {
         /// Maximum supported byte count.
         maximum: u32,
     },
+    /// A QUICP/2 recovery bound is outside its supported range.
+    #[error("recovery limit {name}={value} must be between {minimum} and {maximum}")]
+    InvalidRecoveryLimit {
+        /// Rejected field name.
+        name: &'static str,
+        /// Rejected value.
+        value: u32,
+        /// Smallest accepted value.
+        minimum: u32,
+        /// Largest accepted value.
+        maximum: u32,
+    },
+    /// Recovery fields describe an internally inconsistent policy.
+    #[error("recovery policy is internally inconsistent")]
+    InvalidRecoveryPolicy,
     /// A transport value that must be positive was zero.
     #[error("transport value {0} must be nonzero")]
     ZeroTransportValue(&'static str),
@@ -1745,7 +1971,7 @@ enum RawConfig {
         #[serde(default)]
         carrier: CarrierConfig,
         #[serde(default)]
-        transport: Option<QuicpTransportConfig>,
+        transport: QuicpTransportConfig,
     },
     Server {
         listen_addrs: Vec<SocketAddr>,
@@ -1756,7 +1982,7 @@ enum RawConfig {
         #[serde(default)]
         carrier: CarrierConfig,
         #[serde(default)]
-        transport: Option<QuicpTransportConfig>,
+        transport: QuicpTransportConfig,
     },
 }
 
@@ -1825,6 +2051,8 @@ pub(crate) const fn validate_security_profile(
     match (tls_configured, allow_insecure) {
         (false, false) => Err(ConfigError::InsecureProfileRequiresOptIn),
         (true, true) => Err(ConfigError::TlsWithInsecureOptIn),
+        #[cfg(not(feature = "tls-rustls"))]
+        (true, false) => Err(ConfigError::TlsFeatureDisabled),
         _ => Ok(()),
     }
 }
@@ -1842,16 +2070,13 @@ pub(crate) fn validate_multipath(multipath: &Multipath) -> Result<(), ConfigErro
     for candidate in &multipath.candidates {
         validate_path_candidate(candidate)?;
     }
-    if let [primary, backup] = multipath.candidates.as_slice() {
-        if primary.name == backup.name {
-            return Err(ConfigError::DuplicateCandidateName(backup.name.clone()));
-        }
-        if (primary.local_ip, primary.server_addr) == (backup.local_ip, backup.server_addr) {
-            return Err(ConfigError::DuplicateCandidateTuple {
-                local_ip: backup.local_ip,
-                server_addr: backup.server_addr,
-            });
-        }
+    if let [primary, backup] = multipath.candidates.as_slice()
+        && (primary.local_ip, primary.server_addr) == (backup.local_ip, backup.server_addr)
+    {
+        return Err(ConfigError::DuplicateCandidateTuple {
+            local_ip: backup.local_ip,
+            server_addr: backup.server_addr,
+        });
     }
     Ok(())
 }
@@ -1859,17 +2084,18 @@ pub(crate) fn validate_multipath(multipath: &Multipath) -> Result<(), ConfigErro
 fn validate_path_candidate(candidate: &PathCandidate) -> Result<(), ConfigError> {
     if candidate.local_ip.is_ipv4() != candidate.server_addr.is_ipv4() {
         return Err(ConfigError::AddressFamilyMismatch {
-            name: candidate.name.clone(),
+            local_ip: candidate.local_ip,
+            server_addr: candidate.server_addr,
         });
     }
-    if candidate.name.is_empty()
-        || candidate.local_ip.is_unspecified()
+    if candidate.local_ip.is_unspecified()
         || candidate.local_ip.is_multicast()
         || candidate.server_addr.ip().is_unspecified()
         || candidate.server_addr.ip().is_multicast()
     {
         return Err(ConfigError::UnusableCandidateAddress {
-            name: candidate.name.clone(),
+            local_ip: candidate.local_ip,
+            server_addr: candidate.server_addr,
         });
     }
     if candidate.server_addr.port() == 0 {
@@ -1883,7 +2109,25 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{ConfigError, TrustedFileMode, read_trusted_file};
+    #[cfg(unix)]
+    use super::ConfigError;
+    use super::{TrustedFileMode, read_trusted_file};
+
+    #[cfg(windows)]
+    fn set_windows_acl(path: &std::path::Path, extra_grant: Option<&str>) {
+        let user = std::env::var("USERNAME").expect("USERNAME is required");
+        let mut command = std::process::Command::new("icacls");
+        command
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:F"))
+            .args(["*S-1-5-18:F", "*S-1-5-32-544:F"]);
+        if let Some(grant) = extra_grant {
+            command.arg(grant);
+        }
+        let status = command.status().expect("icacls should start");
+        assert!(status.success(), "icacls failed with {status}");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1903,17 +2147,40 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn shared_config_file_is_supported() {
-        let directory = tempfile::tempdir().unwrap();
+    fn shared_config_allows_untrusted_read_but_owner_only_does_not() {
+        let home = std::env::var_os("USERPROFILE").expect("USERPROFILE is required");
+        let directory = tempfile::tempdir_in(home).unwrap();
         let path = std::fs::canonicalize(directory.path())
             .unwrap()
             .join("config.toml");
         std::fs::write(&path, b"role = \"client\"\n").unwrap();
+        set_windows_acl(&path, Some("*S-1-1-0:R"));
 
         assert_eq!(
             read_trusted_file(&path, 1024, TrustedFileMode::SharedReadable).unwrap(),
             b"role = \"client\"\n"
         );
+        assert!(matches!(
+            read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly),
+            Err(super::ConfigError::InsecureAcl(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_config_rejects_untrusted_write_access() {
+        let home = std::env::var_os("USERPROFILE").expect("USERPROFILE is required");
+        let directory = tempfile::tempdir_in(home).unwrap();
+        let path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("config.toml");
+        std::fs::write(&path, b"role = \"client\"\n").unwrap();
+        set_windows_acl(&path, Some("*S-1-1-0:M"));
+
+        assert!(matches!(
+            read_trusted_file(&path, 1024, TrustedFileMode::SharedReadable),
+            Err(super::ConfigError::InsecureAcl(_))
+        ));
     }
 
     #[cfg(windows)]
@@ -1925,15 +2192,7 @@ mod tests {
             .unwrap()
             .join("secret");
         std::fs::write(&path, b"secret").unwrap();
-        let user = std::env::var("USERNAME").expect("USERNAME is required");
-        let status = std::process::Command::new("icacls")
-            .arg(&path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("{user}:F"))
-            .args(["*S-1-5-18:F", "*S-1-5-32-544:F"])
-            .status()
-            .unwrap();
-        assert!(status.success(), "icacls failed with {status}");
+        set_windows_acl(&path, None);
 
         assert_eq!(
             read_trusted_file(&path, 1024, TrustedFileMode::OwnerOnly).unwrap(),

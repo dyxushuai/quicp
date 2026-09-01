@@ -10,11 +10,13 @@ First source release candidate for the QUICP transport core.
 - TCP-shaped FakeTCP carrier with independent QUICP datagrams and bounded SYN handshake data.
 - Validated transport policy for MTU/MSS/PMTU, flow-control, timers, ACK behavior, and resource
   budgets.
-- Optional mutual TLS, custom no-TLS header protection, congestion-control, and plugin seams.
-- Optional smoltcp packet bridge and C ABI used by the Apple and Android packet-bridge SDK sources.
+- QUICP/2 adaptive DATAGRAM recovery with bounded FEC, replay, reliable fallback, and typed policy.
+- Optional mutual TLS, custom no-TLS header protection, and congestion-control seams.
+- Optional smoltcp packet bridge plus a synchronous C engine used by the Apple and Android SDKs.
 - Linux raw-carrier comparison and carrier codec benchmarks.
 - Windows Tier 0 WinDivert packet adapter with filtered tuple capture/injection and native bind
-  smoke test; the external signed provider remains a deployment prerequisite.
+  smoke test; the pinned 2.2.2-A x64 distribution and protected installation boundary remain
+  deployment prerequisites.
 
 ### Release boundary
 
@@ -24,9 +26,9 @@ First source release candidate for the QUICP transport core.
   output is not a complete QUICP source artifact.
 - The project is dual-licensed under MIT OR Apache-2.0; both license texts are included in the
   source release.
-- No IETF QUIC wire interoperability, mobile connection API, VPN implementation, PSK profile, or
-  transport/application 0-RTT is claimed. Windows Tier 0 packet admission still requires the
-  external signed WinDivert provider and black-box network evidence.
+- No IETF QUIC wire interoperability, VPN implementation, or PSK profile is claimed. Replay-safe
+  application 0-RTT is process-local and requires explicit token admission. Windows Tier 0 packet
+  admission still requires the pinned WinDivert distribution and black-box network evidence.
 - No-TLS mode is intentionally unauthenticated and unencrypted. TLS or another caller-owned
   authenticated layer is required when confidentiality or peer authentication is needed.
 

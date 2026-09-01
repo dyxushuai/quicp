@@ -8,7 +8,7 @@ use quicp::{
     CongestionControl, CongestionController, CongestionControllerFactory, CongestionMetrics,
     FlowError, HeaderProtectionFactory, HeaderProtectionKeys, HeaderProtectionSide,
     HostDatagramSocket, HostRuntime, Multipath, OpenRequest, PacketSent, PathCandidate,
-    PluginRegistry, QueqiaoPlugin, QuicpHeaderProtector, SessionError, TransportOptions,
+    QuicpHeaderProtector, RecoveryConfig, RecoveryMode, SessionError, TransportOptions,
 };
 #[cfg(feature = "platform-smoltcp")]
 use quicp::{PlatformPacketBridge, PlatformPacketConfig};
@@ -75,8 +75,8 @@ fn common_library_api_is_available_from_the_crate_root() {
         NonZeroU16::new(443).unwrap(),
     );
     #[cfg(feature = "platform-smoltcp")]
-    let bridge = PlatformPacketBridge::new(PlatformPacketConfig::default()).unwrap();
-    let host_socket = HostDatagramSocket::new(
+    PlatformPacketBridge::new(PlatformPacketConfig::default()).unwrap();
+    HostDatagramSocket::new(
         "127.0.0.1:10000".parse().unwrap(),
         "127.0.0.1:10001".parse().unwrap(),
         1,
@@ -95,17 +95,11 @@ allow_insecure = true
 
     assert_eq!(request.port, NonZeroU16::new(443).unwrap());
     assert!(config.server().is_some());
-    #[cfg(feature = "platform-smoltcp")]
-    assert_eq!(bridge.ingress_len(), 0);
-    assert_eq!(host_socket.ingress_len(), 0);
     assert_eq!(CongestionControl::default(), CongestionControl::Cubic);
     let _options = TransportOptions::new()
         .with_congestion_controller_factory(Arc::new(ApiFactory))
         .with_header_protection_factory(Arc::new(ApiHeaderFactory));
-    let mut plugins = PluginRegistry::new();
-    plugins.register(QueqiaoPlugin::default()).unwrap();
-    assert_eq!(plugins.len(), 1);
-    let _plugin_options = plugins.build_transport_options().unwrap();
+    assert_eq!(RecoveryConfig::default().mode, RecoveryMode::Adaptive);
 
     assert_eq!(ApplicationError::FlowAbort.code(), 0x101);
     let flow_error = FlowError::Session(SessionError::PolicyRejected);
@@ -118,13 +112,11 @@ allow_insecure = true
 #[test]
 fn fixed_peer_host_carrier_rejects_multipath_without_silent_fallback() {
     let primary = PathCandidate::new(
-        "primary",
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
     )
     .unwrap();
     let backup = PathCandidate::new(
-        "backup",
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 4434)),
     )

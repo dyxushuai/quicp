@@ -1,7 +1,14 @@
 /target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
 /.tmp*/
+/.build/
 .DS_Store
 perf.data*
 *.profraw
 /sdk/apple/Artifacts/
 /sdk/apple/.build/
+/sdk/android/.gradle/
+/sdk/android/.kotlin/
+/sdk/android/build/

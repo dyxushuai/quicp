@@ -5,7 +5,7 @@
 //! TLS profile or a separate authenticated packet layer when confidentiality and integrity are
 //! required.
 
-use alloc::sync::Arc;
+use std::sync::Arc;
 
 /// Which endpoint direction is creating a header-protection key pair.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

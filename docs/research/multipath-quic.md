@@ -220,10 +220,9 @@ congestion state, and scheduler behavior stay local to the transport Adapter;
 the flow layer sees only connection availability and streams
 ([canonical runtime seam](../protocol.md#7-smoltcp-and-runtime-adapters)).
 
-**Wire and failure boundary.** `off` uses the single-path profile. Multipath
-modes use the canonical `quicp/1-mp` profile token; the TLS backend encodes that
-token as ALPN. Both endpoints require an exact token/transport-state match in
-either direction before accepting an application flow.
+**Wire and failure boundary.** Single-path and multipath use the canonical
+`quicp/2` profile token with separately negotiated capabilities. Both endpoints
+require an exact token/transport-state match before accepting an application flow.
 This does not add an application frame or control stream. A lost path
 keeps existing flows only while the same backend session has another usable
 path; loss of the connection resets them

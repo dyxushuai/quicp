@@ -31,10 +31,6 @@ mod macos;
 use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!(
-    "QUICP raw FakeTCP is not implemented for this Unix target; use the host-driven carrier or add an explicit platform adapter"
-);
 use platform::RawPlatform;
 
 const RAW_PACKET_BUFFER_BYTES: usize = MAX_PACKET_BYTES;
@@ -131,6 +127,7 @@ impl FakeTcpSocket {
 
     /// Number of underlay packets that failed carrier decode and were dropped.
     #[must_use]
+    #[cfg(all(test, target_os = "linux"))]
     pub const fn rejected_datagrams(&self) -> u64 {
         self.decode_rejects
     }

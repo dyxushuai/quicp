@@ -3,11 +3,15 @@
 ## User-facing contract
 
 - [Protocol and release boundaries](protocol.md)
-- [Plugin and extension API](plugin-system.md)
 - [Production acceptance checklist](production-acceptance-checklist.md)
 - [Mobile SDK sources](../sdk/README.md)
 - [Rust examples](../examples/README.md)
 - [Benchmark commands](../benches/README.md)
+
+## Architecture decisions
+
+- [Carrier platform matrix](adr/0001-carrier-platform-matrix.md)
+- [Datagram-first adaptive recovery](adr/0003-datagram-first-recovery.md)
 
 ## Background material
 
