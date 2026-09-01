@@ -76,6 +76,7 @@ mod linux {
     const DELIVERY_SAMPLES: usize = 256;
     const DELIVERY_COMPLETE: u64 = 1 << 63;
     const DEADLINE: Duration = Duration::from_secs(30);
+    #[allow(clippy::too_many_lines)]
     pub(super) fn run() -> io::Result<()> {
         assert_eq!(quantile(&[5, 1, 3, 2, 4], 50), 3);
         assert_eq!(median(&[1, 2, 4, 5]), 3);
