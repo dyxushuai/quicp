@@ -298,17 +298,21 @@ pub(crate) fn verify_owner_and_acl(
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     let mut token_buffer = vec![0u8; usize::try_from(token_bytes).unwrap_or(0)];
-    if token_buffer.is_empty()
-        || unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                token_buffer.as_mut_ptr().cast(),
-                token_bytes,
-                addr_of_mut!(token_bytes),
-            )
-        } == 0
-    {
+    let token_info = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            token_buffer.as_mut_ptr().cast(),
+            token_bytes,
+            addr_of_mut!(token_bytes),
+        )
+    };
+    #[cfg(test)]
+    eprintln!(
+        "[ACLDBG] token_info result={token_info} bytes={token_bytes} error={:?}",
+        std::io::Error::last_os_error().raw_os_error()
+    );
+    if token_buffer.is_empty() || token_info == 0 {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
     let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
