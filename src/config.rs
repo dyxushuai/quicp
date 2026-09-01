@@ -334,21 +334,20 @@ pub(crate) fn verify_owner_and_acl(
             addr_of_mut!(owner_defaulted),
         )
     };
+    let owner_is_user = !owner.is_null() && unsafe { EqualSid(owner, token_user.User.Sid) } != 0;
+    let owner_is_system = !owner.is_null() && is_windows_system_sid(owner);
     #[cfg(test)]
     eprintln!(
-        "[ACLDBG] owner result={owner_result} null={} owner_user={} owner_system={}",
+        "[ACLDBG] owner result={owner_result} null={} owner_user={owner_is_user} owner_system={owner_is_system}",
         owner.is_null(),
-        (!owner.is_null() && unsafe { EqualSid(owner, token_user.User.Sid) } != 0),
-        (!owner.is_null() && is_windows_system_sid(owner))
     );
     if owner.is_null()
         || owner_result == 0
         || match mode {
             #[cfg(feature = "runtime-tokio")]
-            TrustedFileMode::SystemOwned => !is_windows_system_sid(owner),
+            TrustedFileMode::SystemOwned => !owner_is_system,
             TrustedFileMode::SharedReadable | TrustedFileMode::OwnerOnly => {
-                let owner_is_user = unsafe { EqualSid(owner, token_user.User.Sid) } != 0;
-                owner_is_user || is_windows_system_sid(owner)
+                !owner_is_user && !owner_is_system
             }
         }
     {
