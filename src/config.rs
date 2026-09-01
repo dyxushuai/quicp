@@ -353,14 +353,20 @@ pub(crate) fn verify_owner_and_acl(
 
     let mut dacl_present = 0;
     let mut dacl_defaulted = 0;
-    if unsafe {
+    let dacl_result = unsafe {
         GetSecurityDescriptorDacl(
             descriptor,
             addr_of_mut!(dacl_present),
             addr_of_mut!(dacl),
             addr_of_mut!(dacl_defaulted),
         )
-    } == 0
+    };
+    #[cfg(test)]
+    eprintln!(
+        "[ACLDBG] dacl result={dacl_result} present={dacl_present} null={}",
+        dacl.is_null()
+    );
+    if dacl_result == 0
         || dacl_present == 0
         || dacl.is_null()
     {
@@ -368,15 +374,20 @@ pub(crate) fn verify_owner_and_acl(
     }
 
     let mut acl_info = ACL_SIZE_INFORMATION::default();
-    if unsafe {
+    let acl_info_result = unsafe {
         GetAclInformation(
             dacl,
             addr_of_mut!(acl_info).cast(),
             u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
             AclSizeInformation,
         )
-    } == 0
-    {
+    };
+    #[cfg(test)]
+    eprintln!(
+        "[ACLDBG] acl_info result={acl_info_result} ace_count={}",
+        acl_info.AceCount
+    );
+    if acl_info_result == 0 {
         return Err(ConfigError::InsecureAcl(path.to_owned()));
     }
 
