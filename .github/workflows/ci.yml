@@ -68,6 +68,8 @@ jobs:
             | cc -std=c11 -Wall -Wextra -Werror -Iinclude -x c -fsyntax-only -
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@cargo-fuzz
+        with:
+          tool: cargo-fuzz
       - run: cargo +nightly fuzz run protocol -- -max_total_time=60
 
   windows:
