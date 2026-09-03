@@ -1178,7 +1178,7 @@ impl Connection {
             .map(|manager| lock_budget(manager).health())
     }
 
-    /// Returns a lock-free snapshot of QUICP/2 recovery counters.
+    /// Returns a lock-free snapshot of QUICP recovery counters.
     #[must_use]
     pub fn recovery_snapshot(&self) -> RecoverySnapshot {
         self.recovery.snapshot()
@@ -1226,7 +1226,7 @@ impl Connection {
         .await
     }
 
-    /// Issues a replay-safe token bound to this connection's negotiated QUICP/2 capabilities.
+    /// Issues a replay-safe token bound to this connection's negotiated QUICP capabilities.
     ///
     /// # Errors
     ///

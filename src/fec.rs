@@ -1,4 +1,4 @@
-//! Bounded scalar GF(256) sliding-window repair used by QUICP/2.
+//! Bounded scalar GF(256) sliding-window repair used by QUICP.
 
 #[cfg(test)]
 use std::collections::BTreeMap;

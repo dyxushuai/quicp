@@ -5,7 +5,7 @@ QUICP is a QUIC-based TCP alternative carried in TCP-shaped `FakeTCP` packets. I
 independent QUIC flows instead of recreating one reliable TCP byte stream. `FakeTCP` is an
 underlay format, not a TCP connection and not a security boundary.
 
-The [normative QUICP/2 protocol specification](https://github.com/dyxushuai/quicp/blob/main/docs/protocol.md)
+The [normative QUICP protocol specification](https://github.com/dyxushuai/quicp/blob/main/docs/protocol.md)
 defines the wire format, recovery rules, and resource limits.
 
 The stable integration path is host-driven and runtime-neutral: the caller owns datagram I/O,
@@ -55,8 +55,8 @@ See `examples/echo.rs` for the complete bounded pump/drive flow. [`config`] owns
 configuration; [`host_carrier`] and [`HostRuntime`] are the portable host seam; [`flow`] exposes
 established application flows.
 Optional [`congestion`] and [`header_protection`] interfaces are Rust-only extensions. The
-repository README documents features, platform support, security boundaries,
-mobile SDKs, and the unpublished documentation workflow.
+repository README documents features, platform support, security boundaries, mobile SDKs, and
+release verification.
 
 ## Examples
 
@@ -70,6 +70,21 @@ mobile SDKs, and the unpublished documentation workflow.
   ownership seam.
 - Apple and Android packet-loop skeletons live under `sdk/apple/Examples` and
   `sdk/android/examples`.
+
+## Feature flags
+
+Features add integrations; they do not select another QUICP wire profile:
+
+| Feature | Provides | Starting point |
+| --- | --- | --- |
+| None | Runtime-neutral host API and core FakeTCP codec | `examples/echo.rs` |
+| `runtime-tokio` | Tokio adapter and native raw FakeTCP | `examples/socks5_tunnel.rs` |
+| `tls-rustls` | Optional mutual TLS authentication and encryption | [`ClientTls`] and [`ServerTls`] |
+| `platform-smoltcp` | smoltcp packet bridge | `examples/smoltcp_bridge.rs` |
+| `ffi-c` | Synchronous C/Swift/Kotlin ABI | `sdk/README.md` |
+
+Enable only the rows required by the host application. The repository README has the complete
+platform matrix and SDK build commands.
 
 ## Security
 

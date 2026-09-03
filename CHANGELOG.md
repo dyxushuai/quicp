@@ -1,21 +1,24 @@
 # Changelog
 
+Package versions below track the Rust distribution; the repository defines one wire profile,
+`quicp`.
+
 ## [0.1.1] - 2026-09-03
 
-First published QUICP implementation.
+First public crates.io release of the QUICP implementation.
 
 ### Release changes
 
 - Published the hardened `noq` backend as `quicp-noq` and `quicp-noq-proto` so the crates.io
   package resolves the same bounded-event and multipath fixes as the repository build.
 - Preserved the runtime-neutral API, optional TLS, smoltcp bridge, C ABI, and platform carrier
-  matrix from the source release candidate.
-- The registry already contained an unrelated immutable `quicp 0.1.0`; this implementation is
-  therefore released as `quicp 0.1.1`.
+  matrix from the repository source snapshot.
+- crates.io already contained an unrelated immutable `quicp 0.1.0`, so this package is published
+  as `quicp 0.1.1`.
 
 ## [0.1.0] - 2026-08-24
 
-First source release candidate for the QUICP transport core.
+Initial repository source snapshot for the QUICP transport core.
 
 ### Added
 
@@ -23,7 +26,7 @@ First source release candidate for the QUICP transport core.
 - TCP-shaped FakeTCP carrier with independent QUICP datagrams and bounded SYN handshake data.
 - Validated transport policy for MTU/MSS/PMTU, flow-control, timers, ACK behavior, and resource
   budgets.
-- QUICP/2 adaptive DATAGRAM recovery with bounded FEC, replay, reliable fallback, and typed policy.
+- Adaptive DATAGRAM recovery with bounded FEC, replay, reliable fallback, and typed policy.
 - Optional mutual TLS, custom no-TLS header protection, and congestion-control seams.
 - Optional smoltcp packet bridge plus a synchronous C engine used by the Apple and Android SDKs.
 - Linux raw-carrier comparison and carrier codec benchmarks.
@@ -31,10 +34,10 @@ First source release candidate for the QUICP transport core.
   smoke test; the pinned 2.2.2-A x64 distribution and protected installation boundary remain
   deployment prerequisites.
 
-### Source release boundary
+### Release boundary
 
-- This is the repository source release candidate that preceded the crates.io publication. The
-  vendored backend is retained for source auditing; the published `0.1.1` package resolves the
+- This snapshot preceded the crates.io publication. The vendored backend is retained for source
+  auditing; the published `0.1.1` package resolves the
   separately published `quicp-noq` and `quicp-noq-proto` crates.
 - The project is dual-licensed under MIT OR Apache-2.0; both license texts are included in the
   source release.

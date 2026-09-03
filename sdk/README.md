@@ -1,104 +1,111 @@
-# Mobile SDK
+# QUICP SDK
 
-These thin wrappers drive real QUICP/2 connections and flows over host-owned underlay datagrams.
-Calls for one engine must be serialized by the event loop that owns it.
-Their wire and recovery behavior follows the [normative protocol specification](../docs/protocol.md).
+Use QUICP from C, Swift, or Kotlin through a thin synchronous wrapper. The host owns underlay
+datagrams, buffers, the clock, the event loop, and platform permissions. One engine has one
+serialized owner. Wire and recovery behavior follow the [QUICP protocol specification](../docs/protocol.md).
 
-## Minimum support
+## Choose a target
 
-| Surface | Minimum | Current artifact | Validation |
+| Surface | Minimum | Artifact | Start here |
 | --- | --- | --- | --- |
-| Rust core and C ABI | Rust 1.88; C ABI version 3 | Static library plus `include/quicp.h` | Rust MSRV, FFI E2E, and C header CI jobs |
-| Apple | iOS 15; macOS 12; Swift tools 5.7 | Local Swift package containing an XCFramework | Apple target builds and `swift test` |
-| Android | API 21; NDK r28.2 | Source integration through `cargo-ndk` and CMake | Kotlin compile and JNI build at API 21 |
-| Android ABIs | `arm64-v8a` and `x86_64` | Host application chooses the matching archive | ABI builds are explicit |
+| Rust core and C ABI | Rust 1.88; C ABI 3 | Static library and [`include/quicp.h`](../include/quicp.h) | [`ffi-c` build](#build-the-c-archive) |
+| Apple | iOS 15; macOS 12; Swift tools 5.7 | Local Swift package with an XCFramework | [Apple setup](#apple) |
+| Android | API 21; NDK r28.2 | Source integration through `cargo-ndk` and CMake | [Android setup](#android) |
+| Android ABIs | `arm64-v8a`, `x86_64` | The application supplies the matching archive | [Android setup](#android) |
 
-The minimum versions are part of the SDK contract. A future release may raise them only with a
-release-note entry and a new compatibility decision. The Rust crate's `rust-version` remains the
-source of truth for the core MSRV.
+Minimum versions are part of the SDK contract. The Rust crate's `rust-version` is the source of
+truth for the core MSRV.
+
+## Build the C archive
+
+From the repository root:
+
+```sh
+cargo rustc --crate-type staticlib --features ffi-c
+```
+
+Add `tls-rustls` to that command when the engine must use mutual TLS. The C archive is synchronous
+and nonblocking; it does not start a Rust thread or executor.
 
 ## ABI contract
 
-`include/quicp.h` is the only cross-language ABI. `QUICP_ABI_VERSION` is independent of the Rust,
-Swift, Kotlin, and package versions; change it when a layout or ownership contract changes.
+[`include/quicp.h`](../include/quicp.h) is the only cross-language ABI. `QUICP_ABI_VERSION` is
+independent of Rust, Swift, Kotlin, and package versions; change it when a layout or ownership
+contract changes.
 
 - The host allocates underlay and flow input/output storage.
 - Rust never retains a foreign pointer after an ABI call returns.
-- One engine has one logical owner; the owner serializes ingress, egress, drive, flow, and close.
-- The call is synchronous and nonblocking. No Rust thread, executor, callback, coroutine, future,
+- One engine has one logical owner. That owner serializes ingress, egress, drive, flow, and close.
+- Calls are synchronous and nonblocking. No Rust thread, executor, callback, coroutine, future,
   TUN descriptor, or packet arena crosses the boundary.
-- Null, unaligned, overflowing, closed, and invalid generation handles are rejected. Rust panics are
-  converted to `QUICP_STATUS_PANIC` and never unwind into foreign code.
+- Null, unaligned, overflowing, closed, and stale-generation handles are rejected. Rust panics
+  become `QUICP_STATUS_PANIC` and never unwind into foreign code.
 
-The payload path is deliberately copy-free at the language boundary. A platform loop may copy
-when it reads from a TUN API or writes to a socket; that is an adapter decision, not an ABI
-requirement.
+The payload path is copy-free at the language boundary. A platform loop may copy while reading a
+TUN API or writing to a socket; that is an adapter choice, not an ABI requirement.
 
-The C, Swift, and Kotlin surfaces create one connection, open flows, inspect pending server OPENs
-before accepting or rejecting them, expose ordered reads/writes, drive timers, and move DATAGRAMs
-over one or two host-owned paths. They do not grant raw-underlay privileges or bypass the platform
-VPN admission model.
+The engine creates connections, opens or accepts flows, exposes ordered reads and writes, drives
+timers, and moves DATAGRAMs over one or two host-owned paths. It does not grant raw-underlay
+privileges or bypass Network Extension or `VpnService` admission.
 
-Security is explicit: omit the SDK security value for the unencrypted profile, or pass mutual-TLS
-server name, CA, certificate, and private-key paths. Server engines require an empty server name.
-Creation copies every UTF-8 value; no foreign string pointer is retained.
+## Security and early data
 
-The C, Swift, and Kotlin engines also expose replay admission, token issuance, and replay-safe
-initial bytes on an established connection. Issue a token only after an ordinary flow has
-negotiated the capabilities bound into it. Token, secret, and initial-data buffers are borrowed
-only for the call. Transport handshake 0-RTT still requires a reusable Rust endpoint/session and
-is available through Rust's `Client::connect_replay_safe`; the foreign engine does not claim that
-a newly created engine can resume a previous transport session.
+Omit the SDK security value for the no-TLS profile, or provide the mutual-TLS server name, CA,
+certificate, and private-key paths. Server engines use an empty server name. Creation copies every
+UTF-8 value and retains no foreign string pointer. No-TLS is intentionally unauthenticated and
+unencrypted, like TCP; carrier cookies do not identify the QUICP peer.
+
+Replay-safe initial bytes require an established connection to issue a token. The token, secret,
+nonce, and initial-data buffers are borrowed for one call. Transport 0-RTT resumption remains a
+Rust-only operation through `Client::connect_replay_safe`; a newly created foreign engine cannot
+resume an earlier transport session.
 
 ## Apple
 
-Run `sdk/apple/build-xcframework.sh`, then add `sdk/apple` as a local Swift package.
-`QuicpEngine` and `QuicpFlow` borrow Swift buffers directly for each synchronous call.
+Build the local XCFramework, then add `sdk/apple` as a local Swift package:
 
-During development, the package uses a local binary target. A published package should replace
-that target with a versioned remote XCFramework and its SwiftPM checksum; generated binaries are
-intentionally not committed here.
+```sh
+sh sdk/apple/build-xcframework.sh
+```
 
-`apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift` is a carrier and ownership
-skeleton. It does not provide entitlements, create an underlay socket, or claim that a Network
-Extension can inject arbitrary raw TCP packets.
+`QuicpEngine` and `QuicpFlow` borrow Swift buffers for each synchronous call. The development
+package uses a local binary target; generated binaries are not committed. A published package
+would need a versioned remote XCFramework and a SwiftPM checksum.
+
+[`QuicpNetworkExtensionPacketTunnelProvider.swift`](apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift)
+shows the serialized `NEPacketTunnelProvider` loop. It does not provide entitlements, create an
+underlay socket, or claim arbitrary raw-TCP injection.
 
 ## Android
 
-Build `libquicp.a` with `cargo ndk -t <abi> -P 21 rustc --crate-type staticlib --features ffi-c,tls-rustls`
-for each Android ABI. Add `sdk/android/src/main/kotlin` and
-`sdk/android/CMakeLists.txt` to the application module, passing the matching archive as
-`-DQUICP_RUST_LIB=...` and `-DANDROID_PLATFORM=android-21`. The Kotlin wrapper accepts direct
-native-order `ByteBuffer` values with position zero for underlay and flow I/O.
+Build one archive per ABI:
 
-The current source release does not publish a prebuilt AAR or Maven repository. Applications
-embed the JNI library through their own Android library module. A future AAR/Maven publication
-must have repeatable signing and ABI artifact provenance; adding a packaging scaffold without
-those release inputs would be misleading.
+```sh
+cargo ndk -t <abi> -P 21 rustc \
+  --crate-type staticlib --features ffi-c,tls-rustls
+```
 
-The wrappers intentionally do not own a thread, coroutine, callback, TUN descriptor, socket, or
-packet arena. Those belong to the platform event loop.
+Add `sdk/android/src/main/kotlin` and [`CMakeLists.txt`](android/CMakeLists.txt) to the application
+module. Pass the matching archive as `-DQUICP_RUST_LIB=...` and `-DANDROID_PLATFORM=android-21`.
+The Kotlin wrapper accepts direct, native-order `ByteBuffer` values with position zero for underlay
+and flow I/O.
 
-If a host socket or interface reports a permanent failure, call `markPathUnavailable` so a
-multipath engine can fail over immediately instead of waiting for idle-path detection.
+This repository does not publish an AAR or Maven repository. Applications embed the JNI library
+through their own Android library module. The [`VpnService` example](android/examples/io/quicp/QuicpVpnServiceExample.kt)
+shows ownership and direct-buffer layout; it does not create an underlay socket or bypass platform
+permissions.
 
-The Rust-only host-driven carrier is `HostDatagramSocket` plus `HostRuntime`. It is useful for a
-custom event loop or an integration test: copy one underlay datagram into
-`ingress_datagram_from`, drain one outbound datagram with `poll_egress_datagram_into`, and advance
-`HostRuntime::drive`. `Client::from_host_socket` and `Server::from_host_socket` (or their
-`_with_options` variants) provide the portable Rust endpoint facade. It is
-fixed-peer and supports the same optional TLS profile, but it does not grant iOS or Android raw-underlay privileges; the
-Network Extension/VpnService carrier remains a separate platform admission.
+## Host event loop
 
-The no-TLS host path is unauthenticated and unencrypted, like TCP. Select TLS in Rust when peer
-or through the Swift/Kotlin security value when authentication and confidentiality are required;
-carrier cookies and their secret are not a peer
-identity.
+For a Rust-only integration, use `HostDatagramSocket` with `HostRuntime`. Copy each received
+underlay datagram into `ingress_datagram_from`, drain outbound data with
+`poll_egress_datagram_into`, and call `HostRuntime::drive` after I/O or timer readiness.
+`Client::from_host_socket` and `Server::from_host_socket` provide the fixed-peer facade; the
+`_with_options` variants expose the same host-owned execution model.
 
-## Platform loop examples
+If a host socket or interface fails permanently, call `markPathUnavailable` so multipath can fail
+over immediately instead of waiting for idle-path detection.
 
-`apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift` shows the serialized
-`NEPacketTunnelProvider` read/process/write loop. `android/examples/io/quicp/QuicpVpnServiceExample.kt`
-shows the matching `VpnService` ownership and direct-buffer layout. Both are intentionally host
-integration skeletons: they do not bypass platform permissions, create an underlay socket, or
-claim to be a complete VPN.
+The Network Extension and `VpnService` sources are platform-loop examples, not complete VPN
+products. DNS, FakeIP allocation, TUN creation, sockets, and packet scheduling remain platform
+responsibilities.

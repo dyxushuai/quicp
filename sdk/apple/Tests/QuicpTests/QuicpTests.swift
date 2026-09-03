@@ -196,7 +196,7 @@ final class QuicpTests: XCTestCase {
     XCTAssertEqual(server.markPathUnavailable(0), .ok)
     activePaths = [1]
 
-    let payload = Array("QUICP/2 through Swift".utf8)
+    let payload = Array("QUICP through Swift".utf8)
     let write = payload.withUnsafeBytes { sender.write(from: $0) }
     XCTAssertEqual(write.0, .ok)
     XCTAssertEqual(write.1, payload.count)

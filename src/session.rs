@@ -5,12 +5,12 @@ use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
 
-use crate::wire::{QUICP_V2_PROFILE, WireError};
+use crate::wire::{QUICP_PROFILE, WireError};
 
 const REPLAY_TOKEN_VERSION: u8 = 1;
 const REPLAY_TOKEN_BODY_BYTES: usize = 1 + 8 + 8 + 8 + 16;
 const REPLAY_TOKEN_BYTES: usize = REPLAY_TOKEN_BODY_BYTES + 32;
-const REPLAY_TOKEN_DOMAIN: &[u8] = b"quicp/2 replay token\0";
+const REPLAY_TOKEN_DOMAIN: &[u8] = b"quicp replay token\0";
 const REPLAY_TOKEN_AUTH_BYTES: usize = REPLAY_TOKEN_DOMAIN.len() + REPLAY_TOKEN_BODY_BYTES;
 const MAX_REPLAY_ATTEMPTS: usize = 65_536;
 
@@ -26,7 +26,7 @@ impl ReplayToken {
     ///
     /// # Errors
     ///
-    /// Returns an error unless the token has the exact QUICP/2 token length and version.
+    /// Returns an error unless the token has the exact length and version.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplayTokenError> {
         let bytes: [u8; REPLAY_TOKEN_BYTES] =
             bytes.try_into().map_err(|_| ReplayTokenError::Malformed)?;
@@ -213,7 +213,7 @@ pub enum ReplayTokenError {
 
 #[must_use]
 pub(crate) const fn application_profile_token() -> &'static [u8] {
-    QUICP_V2_PROFILE
+    QUICP_PROFILE
 }
 
 fn admit_evidence(evidence: &HandshakeEvidence) -> Result<(), SessionError> {
@@ -223,13 +223,13 @@ fn admit_evidence(evidence: &HandshakeEvidence) -> Result<(), SessionError> {
     if !evidence.current_policy_authorized {
         return Err(SessionError::PolicyRejected);
     }
-    if evidence.selected_profile_token != QUICP_V2_PROFILE {
+    if evidence.selected_profile_token != QUICP_PROFILE {
         return Err(SessionError::UnsupportedProfileToken);
     }
     Ok(())
 }
 
-/// Admits an established backend connection using the QUICP/2 application profile.
+/// Admits an established backend connection using the QUICP application profile.
 ///
 /// # Errors
 ///
@@ -386,12 +386,12 @@ mod tests {
     fn session_admission_requires_profile_and_policy_evidence() {
         for evidence in [
             HandshakeEvidence {
-                selected_profile_token: b"quicp/2".to_vec(),
+                selected_profile_token: b"quicp".to_vec(),
                 peer_admission: PeerAdmission::Unauthenticated,
                 current_policy_authorized: true,
             },
             HandshakeEvidence {
-                selected_profile_token: b"quicp/2".to_vec(),
+                selected_profile_token: b"quicp".to_vec(),
                 peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
                 current_policy_authorized: false,
             },
@@ -400,7 +400,7 @@ mod tests {
         }
 
         admit_evidence(&HandshakeEvidence {
-            selected_profile_token: b"quicp/2".to_vec(),
+            selected_profile_token: b"quicp".to_vec(),
             peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
             current_policy_authorized: true,
         })
@@ -409,10 +409,10 @@ mod tests {
 
     #[test]
     fn profile_requires_exact_token() {
-        assert_eq!(application_profile_token(), b"quicp/2");
+        assert_eq!(application_profile_token(), b"quicp");
         assert!(matches!(
             admit_evidence(&HandshakeEvidence {
-                selected_profile_token: b"quicp/1".to_vec(),
+                selected_profile_token: b"quicp-legacy".to_vec(),
                 peer_admission: PeerAdmission::ExplicitlyUnauthenticated,
                 current_policy_authorized: true,
             }),

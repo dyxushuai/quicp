@@ -1,4 +1,4 @@
-//! Bounded logical ACK, replay, and ordered reassembly state for QUICP/2.
+//! Bounded logical ACK, replay, and ordered reassembly state for QUICP.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -60,7 +60,7 @@ const fn repair_span_is_negotiated(span: u16, max_span: u16) -> bool {
     span <= max_span
 }
 
-/// QUICP/2 recovery counters and gauges for one connection.
+/// QUICP recovery counters and gauges for one connection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RecoverySnapshot {
     /// Source DATAGRAMs sent by the backend.

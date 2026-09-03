@@ -1,235 +1,83 @@
-# ADR 0003: Make adaptive datagram recovery the QUICP core
+# ADR 0003: Use datagrams for QUICP payloads
 
 - Status: Accepted
 - Date: 2026-08-26
-- Supersedes: ADR 0002
-
-## Context
-
-QUICP targets weak, lossy, long-RTT, and QoS-constrained paths while presenting an ordered,
-TCP-like flow interface. QUICP/1 maps each application flow directly to a reliable QUIC stream.
-That delegates byte acknowledgement, retransmission, ordering, and flow control to the backend,
-but it also prevents a higher recovery layer from observing erasures and preserves stream-local
-head-of-line blocking.
-
-The removed `QueqiaoPlugin` did not change that data path. It was a one-shot configuration adapter
-that installed a shared congestion controller; it did not implement coded datagrams, byte-range
-acknowledgements, replay, flow scheduling, or substrate selection. Expanding that interface with
-packet and flow callbacks would have exposed ownership-sensitive hot-path behavior without hiding
-meaningful complexity.
-
-QUICP does not require wire compatibility with Queqiao Protocol 1. It will reuse the architectural
-ideas that match QUICP's goals while retaining its own wire contract, FakeTCP carrier, optional
-security profiles, multipath backend, runtime-neutral flow interface, and native SDK boundary.
 
 ## Decision
 
-### 1. Introduce one breaking QUICP/2 profile
+QUICP exposes a TCP-like ordered flow API, but sends payload data as QUIC DATAGRAMs whenever the
+peer supports them. Reliable QUIC streams carry flow admission, control, acknowledgements, and a
+reliable fallback. The exact wire format and limits live in the [protocol specification](../protocol.md).
 
-QUICP/2 replaces QUICP/1 rather than negotiating a compatibility mode. One profile token identifies
-the application protocol. DATAGRAM and FEC limits are application capabilities; multipath is
-negotiated separately by QUIC transport parameters. `docs/protocol.md` and the committed
-conformance vectors define the implemented QUICP/2 contract.
+QUICP uses one profile token, `quicp`. There is no compatibility mode or alternate token. Cargo
+features select optional dependencies and platform adapters; they do not select a second protocol
+or a recovery algorithm.
 
-QUICP/2 keeps the existing public flow shape:
+## Why datagrams
 
-```text
-Connection::open_flow / accept_flow
-QuicpFlow::poll_read / poll_write / poll_flush / poll_shutdown / reset
-```
+A reliable stream retransmits and reorders every byte in that stream. That is useful for control, but
+it makes a lost payload byte hold later bytes in the same stream. A datagram plane lets QUICP recover
+loss independently and keep unrelated flows readable while one flow waits for repair or replay.
 
-Callers do not choose a wire substrate for each write and do not handle FEC or acknowledgement
-callbacks.
+FEC is a bounded, connection-wide GF(256) sliding window. Source symbols are sent unchanged and
+repair symbols cover recent symbols across all validated paths. Logical byte-range ACKs and bounded
+replay provide reliability after direct delivery or FEC recovery. A clean path sends no parity.
 
-### 2. Make logical flow reliability a core module
+## Ownership boundaries
 
-Each connection owns:
+The backend owns QUIC packet ACKs, RTT measurement, congestion control, pacing, TLS packet
+protection, path validation, and packet scheduling. QUICP owns flow offsets, logical ACKs, replay,
+reassembly, FEC, flow ordering, and resource limits.
 
-- a connection-wide DATAGRAM plane and one reader;
-- a shared directional path model;
-- a flow table and DATAGRAM demultiplexer;
-- one connection-wide sliding-window encoder and decoder per direction; and
-- bounded symbol, replay, reassembly, pre-open, and scheduling storage.
+Each FakeTCP four-tuple has independent carrier sequence state. Carrier sequence numbers are
+camouflage metadata; they are never QUICP byte offsets, ACKs, symbol identifiers, or multipath
+state. A carrier packet contains exactly one QUICP datagram and never retransmits or orders it.
 
-Each flow owns:
+The host owns packet I/O and the clock. The runtime-neutral API advances bounded work after I/O or
+timer readiness. Tokio, smoltcp, raw sockets, Network Extension, `VpnService`, and the C/Swift/Kotlin
+wrappers are adapters around that host boundary.
 
-- its existing bidirectional QUIC stream, repurposed for reliable control and data fallback;
-- absolute send and receive byte offsets;
-- bounded replay and receive-reassembly state;
-- acknowledged ranges and receive credit; and
-- OPEN, FIN, QUIC `RESET_STREAM`, and terminal state.
+## Flow behavior
 
-The reliable stream carries framed `OPEN`, `STATUS`, `ACK`, `MAX_OFFSET`, `FIN`, and fallback
-`STREAM_DATA` messages. Abortive termination uses QUIC `RESET_STREAM`; QUICP does not duplicate it
-with an application control frame. Selected data normally travels through QUIC DATAGRAM. Keeping a
-stream per flow avoids a single connection-wide control-stream head-of-line dependency and reuses
-the current flow admission lifecycle.
+Each flow keeps one reliable bidirectional stream for `OPEN`, `STATUS`, `ACK`, `MAX_OFFSET`, `FIN`,
+and fallback `STREAM_DATA`. Payload writes may share a source symbol when no-delay is disabled;
+no-delay writes are emitted on the next bounded driver turn. Reads expose only the contiguous byte
+prefix, even when later bytes arrived first.
 
-### 3. Use connection-wide coded DATAGRAMs
+Invalid flow offsets, credit, ACKs, or FIN transitions reset that flow. Invalid shared negotiation,
+resource abuse, or a failed driver closes the connection. Malformed datagrams are dropped before
+they can mutate shared recovery state. Every peer-controlled count, length, range, and limit is
+validated before allocation.
 
-QUICP/2 defines source and repair datagrams. A source symbol contains one or more logical flow data
-records identified by QUIC stream ID, absolute byte offset, flags, and payload. A repair symbol
-names the consecutive source-symbol window it covers. Source, repair, and transmission sequences
-are directional and connection-scoped.
+## Multipath
 
-Small writes may share a symbol when no-delay is disabled. No-delay writes are emitted without
-waiting for aggregation. Large writes are fragmented across consecutive symbols. A receiver emits
-whole logical records as soon as they arrive or are recovered; only each flow's contiguous byte
-prefix is exposed to its caller.
+Multipath keeps the same QUICP session and flow state while each path uses its own FakeTCP tuple,
+carrier sequence space, socket owner, and backend path state. A validated backup can carry repair,
+replay, or fallback data after the primary fails. The current policy admits one primary and one
+backup; it does not reopen discarded paths automatically.
 
-DATAGRAM is the primary data substrate when adaptive recovery is active. Reliable stream data is a
-fallback when DATAGRAM was not negotiated, coding is not worthwhile on the measured path, or the
-adaptive policy has abandoned repeated residual recovery.
+## Early data and security
 
-### 4. Separate packet acknowledgement from logical acknowledgement
+FakeTCP SYN data may carry the first backend handshake datagram. Application early data is separate
+and requires an explicit replay-safe operation, a server-issued expiring MAC token, a fresh attempt
+nonce, compatible capabilities, and bounded process-local replay admission. Ordinary `open_flow`
+remains replay-unsafe. Transport-level early-data rejection falls back once to ordinary `OPEN`;
+token or replay rejection fails closed.
 
-Backend QUIC ACKs continue to own packet loss detection, RTT estimation, congestion control, and
-pacing. They do not acknowledge recovered logical bytes.
+TLS is optional. The no-TLS profile is intentionally unauthenticated and unencrypted, like TCP.
+Header protection, FEC, checksums, and FakeTCP cookies do not authenticate a peer or encrypt an
+application payload.
 
-QUICP/2 flow ACKs carry a contiguous byte offset, a bounded set of additional received ranges, and
-the maximum permitted receive offset. They acknowledge bytes received directly or reconstructed by
-FEC. The sender retains unacknowledged bytes in a bounded replay buffer, reissues residual gaps, and
-reclaims storage only after logical acknowledgement.
+## Extensions
 
-Repeated data, ACKs, and FINs are idempotent. A retransmission uses a new source-symbol identity but
-the original flow byte offset. A FIN carries the final byte offset; EOF is exposed only after every
-byte below that offset is contiguous.
-
-### 5. Use sliding-window random linear coding
-
-The coding model follows the systematic GF(256) sliding-window RLC design described by RFC 8681,
-with QUICP-specific framing and policy. Source symbols are sent unchanged. Repair symbols are
-deterministic linear combinations of recent source symbols. The decoder performs bounded
-incremental elimination and may recover symbols out of order.
-
-The QUICP/2 protocol specification will pin the field polynomial, coefficient generation,
-identifier arithmetic, padding rules, maximum repair span, decoder width, and conformance vectors.
-The initial bounds are a maximum 256-source repair span and a minimum 512-symbol decoder window.
-
-Coding rate and window size are sender policy derived from directional loss, RTT, delivery rate,
-burst behavior, and the cost of replay. Tail repair protects the end of a burst. A clean path sends
-no parity. FEC reduces recovery latency but does not claim reliability; the byte-range replay layer
-handles residual loss.
-
-No public `FecCodec` or recovery trait is introduced. Existing mature Rust block-code crates do not
-implement this sliding-window wire model. The implementation is an internal sans-I/O module,
-validated by committed vectors and fuzz/property tests. A mature GF(256) arithmetic kernel may be
-reused if it preserves the pinned wire result and improves measured performance.
-
-### 6. Keep coding connection-scoped across paths
-
-A coding window spans all active paths in one direction. A repair arriving on one path can recover
-a source erased on another path. FakeTCP continues to create independent TCP-shaped sequence state
-for each four-tuple; those carrier sequences never become flow acknowledgements or FEC identities.
-
-The initial implementation lets `noq` select a path for DATAGRAM transmission and consumes its
-per-path RTT, congestion, and path-health state. QUICP/2 does not initially require a vendored
-`send_datagram_on(path_id)` extension. Explicit source/repair path placement is added only if
-same-window measurements prove that backend scheduling prevents useful path diversity; that change
-does not require a QUICP/2 wire change.
-
-### 7. Admit application 0-RTT explicitly
-
-FakeTCP SYN data may carry a backend handshake datagram and remains distinct from application
-early data.
-
-Application 0-RTT requires a server-issued, expiring, MAC-protected resumption token bound to the
-QUICP profile and server epoch. An early flow includes the token identity and a fresh attempt nonce.
-The server admits it only when the token is valid, the remembered profile is compatible, the
-attempt is absent from a bounded replay cache, and the caller explicitly marked the operation as
-replay-safe.
-
-Ordinary `open_flow` remains replay-unsafe by default. The transport suppresses duplicate delivery
-within one accepted early attempt, but it cannot guarantee cross-connection exactly-once effects.
-Only replay-safe application operations may use early data. A multi-instance deployment needs a
-shared replay cache before claiming strict anti-replay. The no-security profile can validate a
-server-issued token but still provides neither peer identity nor payload authenticity.
-
-### 8. Replace the generic plugin registry with typed seams
-
-`PluginRegistry`, `QuicpPlugin`, `QueqiaoPlugin`, and `MAX_PLUGINS` are removed. Queqiao-inspired
-recovery is core protocol behavior, not a plugin.
-
-Runtime choices use explicit configuration:
-
-- a built-in or Rust-only custom congestion-controller factory;
-- adaptive or reliable-only recovery configuration; and
-- explicit security/header-protection configuration.
-
-No packet, flow-data, scheduler, FEC, or foreign-language callback interface is added. Swift,
-Kotlin, and C select built-in profiles through bounded enum/struct configuration and retain the
-existing synchronous, caller-buffer-owned packet interface. Cargo features continue to select
-optional dependencies and platform adapters, not runtime protocol policy.
-
-### 9. Fail closed at protocol and resource seams
-
-All untrusted counts, offsets, ranges, symbol identifiers, lengths, and negotiated limits are
-validated before allocation or decoder mutation. Replay storage, decoder rows, ACK ranges,
-fragment groups, pending flow state, and pre-open DATAGRAM storage have hard limits.
-
-- Local pressure applies backpressure instead of dropping reliable flow bytes.
-- Invalid per-flow offsets, credit, ACKs, or final offsets reset that flow.
-- Invalid shared control state or peer resource-limit violations close the connection.
-- Malformed source and repair datagrams are discarded before entering shared FEC state.
-- Symbols leaving the decoder unrecovered trigger replay and do not close the connection.
-
-TLS-protected source and repair DATAGRAMs inherit QUIC AEAD authenticity. The no-security profile
-remains explicitly unauthenticated; checksums and FEC do not become a security boundary.
-
-## Implementation sequence
-
-1. Publish the QUICP/2 frame grammar, state transitions, limits, and conformance vectors.
-2. Implement and fuzz sans-I/O range, reassembly, replay, and sliding-window coding modules.
-3. Enable backend DATAGRAM negotiation and add the connection-wide DATAGRAM plane.
-4. Replace `QuicpFlow`'s direct stream storage with an internal flow handle while preserving its
-   public poll interface.
-5. Add framed control, byte-range ACKs, replay, and reliable stream fallback.
-6. Add adaptive coding and shared directional path measurement.
-7. Integrate multipath, application 0-RTT, FFI/SDK configuration, examples, and metrics.
-8. Delete QUICP/1 flow code and the generic plugin registry after QUICP/2 end-to-end tests pass.
-
-The repository does not retain a runtime compatibility switch or dual wire implementation. Each
-step must leave the branch buildable, and unrelated carrier/platform adapters remain intact.
-
-## Verification
-
-The release gate covers:
-
-- exact frame and FEC conformance vectors;
-- deterministic clean, random-loss, burst-loss, reorder, duplicate, and repair-loss channels;
-- single and multiple symbol recovery plus residual replay;
-- ACK compression, duplicate ACKs, invalid ranges, flow credit, FIN gaps, and reset races;
-- DATAGRAM-before-OPEN handling and every memory bound;
-- malformed offset, ESI, repair, and resumption-token fuzzing;
-- accepted, rejected, expired, replayed, and profile-mismatched 0-RTT;
-- primary-path failure with recovery on a validated backup path;
-- runtime-neutral core, Tokio adapter, C ABI, Swift, and Kotlin smoke tests; and
-- aligned reliable-only and adaptive benchmarks on the same carrier and workload.
-
-Performance reports include useful goodput, p50/p99 latency, parity overhead, residual replay, CPU,
-allocations, and peak memory. A clean path must disable parity and avoid a material regression.
+Use typed configuration for recovery, MTU/MSS/PMTU, congestion control, security, and header
+protection. Do not add hot-path packet, flow, scheduler, FEC, or foreign-language callbacks: they
+would expose ownership and protocol invariants without hiding meaningful complexity.
 
 ## Consequences
 
-- QUICP owns more transport behavior and testing responsibility than QUICP/1.
-- The architecture matches the weak-path goal and can recover data without waiting for a stream
-  retransmission round trip.
-- Application and SDK interfaces remain TCP-like and runtime-neutral.
-- Wire compatibility with QUICP/1 and Queqiao Protocol 1 is intentionally absent.
-- The generic plugin registry disappears; explicit typed seams remain where behavior genuinely
-  varies.
-- The vendored QUIC backend remains responsible for connection establishment, packet protection,
-  packet ACKs, congestion/pacing, path validation, and multipath packet scheduling.
-
-## Rejected alternatives
-
-- FEC over reliable QUIC streams duplicates retransmission and cannot remove stream head-of-line
-  blocking.
-- Coding complete QUIC packets below the backend preserves the current flow implementation but does
-  not provide Queqiao-style logical acknowledgement, selective recovery, or cross-flow scheduling.
-- A DATAGRAM-only protocol would rebuild reliable control delivery that QUIC streams already
-  provide.
-- A public hot-path plugin interface would expose packet ownership and protocol invariants while
-  the project still has only one recovery implementation.
-- A fixed Reed-Solomon block code has mature implementations but adds block-sealing latency and
-  cannot adapt parity for symbols already in flight.
+- QUICP can recover loss without waiting for a reliable-stream retransmission round trip.
+- The application and SDK interfaces remain ordered, TCP-like, and runtime-neutral.
+- QUICP owns more recovery behavior than a stream-only transport and must enforce its own bounds and
+  logical acknowledgements.
+- No interoperability with unrelated protocols or unreleased designs is implied.

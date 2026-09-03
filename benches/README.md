@@ -1,7 +1,7 @@
 # QUICP benchmarks
 
 These binaries are measurement tools, not part of the runtime API.
-They compare modes of the [normative QUICP/2 protocol](../docs/protocol.md).
+They compare modes of the [normative QUICP protocol](../docs/protocol.md).
 
 | Benchmark | Purpose | Requirements |
 | --- | --- | --- |

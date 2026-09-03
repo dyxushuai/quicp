@@ -221,7 +221,7 @@ the flow layer sees only connection availability and streams
 ([canonical runtime seam](../protocol.md#7-smoltcp-and-runtime-adapters)).
 
 **Wire and failure boundary.** Single-path and multipath use the canonical
-`quicp/2` profile token with separately negotiated capabilities. Both endpoints
+`quicp` profile token with separately negotiated capabilities. Both endpoints
 require an exact token/transport-state match before accepting an application flow.
 This does not add an application frame or control stream. A lost path
 keeps existing flows only while the same backend session has another usable

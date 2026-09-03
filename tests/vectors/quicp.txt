@@ -1,6 +1,6 @@
-# QUICP/2 language-neutral conformance vectors.
+# QUICP language-neutral conformance vectors.
 # Format: name = lowercase hexadecimal; invalid vectors start with invalid_.
-profile = 71756963702f32
+profile = 7175696370
 capabilities = 01080b04b00040020010
 open = 020e0b6578616d706c652e636f6d01bb
 status_ok = 030100

@@ -1,4 +1,4 @@
-//! Fuzz-only dispatch into every peer-controlled QUICP/2 decoder and recovery state machine.
+//! Fuzz-only dispatch into every peer-controlled QUICP decoder and recovery state machine.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Range;
