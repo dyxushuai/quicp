@@ -273,49 +273,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
-name = "noq"
-version = "1.1.1"
-dependencies = [
- "bytes",
- "cfg_aliases",
- "derive_more",
- "noq-proto",
- "noq-udp",
- "pin-project-lite",
- "rustc-hash",
- "socket2",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "noq-proto"
-version = "1.1.1"
-dependencies = [
- "bytes",
- "derive_more",
- "enum-assoc",
- "getrandom 0.4.3",
- "identity-hash",
- "lru-slab",
- "rand",
- "rand_pcg",
- "ring",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "slab",
- "sorted-index-buffer",
- "thiserror",
- "tinyvec",
- "tracing",
- "web-time",
-]
-
-[[package]]
 name = "noq-udp"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,13 +308,13 @@ dependencies = [
 
 [[package]]
 name = "quicp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "crc32c",
  "futures-core",
- "noq",
- "noq-proto",
+ "quicp-noq",
+ "quicp-noq-proto",
  "ring",
  "rustix",
  "serde",
@@ -372,6 +329,49 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "quicp",
+]
+
+[[package]]
+name = "quicp-noq"
+version = "1.1.1"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "derive_more",
+ "noq-udp",
+ "pin-project-lite",
+ "quicp-noq-proto",
+ "rustc-hash",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quicp-noq-proto"
+version = "1.1.1"
+dependencies = [
+ "bytes",
+ "derive_more",
+ "enum-assoc",
+ "getrandom 0.4.3",
+ "identity-hash",
+ "lru-slab",
+ "rand",
+ "rand_pcg",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "sorted-index-buffer",
+ "thiserror",
+ "tinyvec",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]

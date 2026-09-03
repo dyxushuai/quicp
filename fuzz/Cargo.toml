@@ -12,8 +12,8 @@ libfuzzer-sys = "0.4"
 quicp = { path = ".." }
 
 [patch.crates-io]
-noq = { path = "../vendor/noq" }
-noq-proto = { path = "../vendor/noq-proto" }
+quicp-noq = { path = "../vendor/noq" }
+quicp-noq-proto = { path = "../vendor/noq-proto" }
 
 [[bin]]
 name = "protocol"
