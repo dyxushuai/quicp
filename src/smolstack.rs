@@ -228,6 +228,12 @@ impl Device for RingDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // smoltcp returns a transmit token together with every receive token.  Do not consume an
+        // ingress packet when the bounded egress pool cannot provide that token: doing so would
+        // make a stack-generated response an unobservable drop under backpressure.
+        if !self.egress.can_push(self.mtu) {
+            return None;
+        }
         let packet = self.ingress.pop()?;
         Some((
             RingRxToken {

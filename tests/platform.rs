@@ -144,6 +144,29 @@ fn platform_bridge_serializes_parallel_ingress_calls() {
 }
 
 #[test]
+fn smoltcp_device_preserves_ingress_when_egress_is_full() {
+    let config = PlatformPacketConfig {
+        packet_capacity: 1,
+        smoltcp: SmoltcpConfig::default(),
+    };
+    let bridge = PlatformPacketBridge::new(config).expect("bridge");
+    let mut device = bridge.smoltcp_device(config.smoltcp).expect("device");
+
+    let tx = device.transmit(Instant::ZERO).expect("egress slot");
+    tx.consume(1, |packet| packet[0] = 0xaa);
+    bridge
+        .ingress_ip_borrowed(&[0x45; 64])
+        .expect("ingress packet");
+
+    assert!(device.receive(Instant::ZERO).is_none());
+
+    let mut output = [0; 1500];
+    assert_eq!(bridge.poll_egress_ip_into(&mut output), Ok(Some(1)));
+    let (rx, _tx) = device.receive(Instant::ZERO).expect("packet retained");
+    rx.consume(|packet| assert_eq!(packet, [0x45; 64]));
+}
+
+#[test]
 fn platform_bridge_allows_only_one_smoltcp_owner() {
     let bridge = PlatformPacketBridge::new(PlatformPacketConfig::default()).expect("bridge");
     let device = bridge

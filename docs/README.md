@@ -11,6 +11,7 @@
 ## Architecture decisions
 
 - [Carrier platform matrix](adr/0001-carrier-platform-matrix.md)
+- [Configuration extension policy](adr/0002-configuration-extension-policy.md)
 - [Datagram-first adaptive recovery](adr/0003-datagram-first-recovery.md)
 
 ## Background material
