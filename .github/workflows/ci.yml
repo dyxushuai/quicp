@@ -93,6 +93,11 @@ jobs:
           cargo run --all-features --locked --example echo
           cargo run --all-features --locked --example multipath
           cargo run --all-features --locked --example zero_rtt
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build Windows docs.rs-compatible API documentation
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc --all-features --no-deps --locked --target x86_64-pc-windows-msvc
 
   apple:
     runs-on: macos-14
@@ -133,6 +138,13 @@ jobs:
             -Xcc -I -Xcc "$CQUICP_HEADERS" \
             -Xcc "-fmodule-map-file=$CQUICP_HEADERS/module.modulemap" \
             sdk/apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build Apple docs.rs-compatible API documentation
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc --all-features --no-deps --locked --target aarch64-apple-darwin
 
   android:
     runs-on: ubuntu-latest
