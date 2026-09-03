@@ -6,7 +6,7 @@ This checklist is the release gate for QUICP. A checked item needs reproducible 
 the release record. An item marked `N/A` must include the reason and the profile in which the
 capability is not admitted. “Works in a unit test” is not evidence for a carrier, privilege,
 platform, or failure-mode gate.
-The release evidence must use the [normative QUICP/2 protocol](protocol.md).
+The release evidence must use the [normative QUICP protocol](protocol.md).
 
 ## 1. Release identity and scope
 
@@ -221,7 +221,7 @@ create a Wintun/TAP handle.
 - [ ] Capture an external-interface packet round trip, including SYN data, tuple filtering, kernel
   RST suppression, loss/reordering, and shutdown cleanup.
 
-Native Wintun/TAP handle ownership is deferred Tier 1 work; it is not part of the QUICP/2 core or
+Native Wintun/TAP handle ownership is deferred Tier 1 work; it is not part of the QUICP core or
 this release gate.
 
 ### 3.4 Other non-Linux behavior

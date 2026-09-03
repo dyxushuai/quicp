@@ -1,10 +1,11 @@
-# QUICP/2: datagram-first recovery over FakeTCP
+# QUICP: datagram-first recovery over FakeTCP
 
 Status: normative protocol implemented by this repository.
 
-QUICP/2 is a TCP-like ordered-flow protocol carried by QUIC DATAGRAM and reliable control streams.
-It is not wire-compatible with QUICP/1. The exact profile token is `quicp/2`; no alternate
-multipath token exists. FakeTCP preserves datagram boundaries and never retransmits or orders data.
+QUICP is a TCP-like ordered-flow protocol carried by QUIC DATAGRAM and reliable control streams.
+It is the only QUICP wire profile defined by this repository. The exact profile token is `quicp`;
+no alternate or multipath-specific token exists. FakeTCP preserves datagram boundaries and never
+retransmits or orders data.
 
 The words MUST, MUST NOT, SHOULD, and MAY are normative.
 
@@ -108,7 +109,7 @@ modulo `2^32`. Mix `x` with `x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15;
 x *= 0x846ca68b; x ^= x >> 16`, again modulo `2^32`, and use its low byte, replacing zero with one.
 Repair bytes are the XOR of each
 zero-padded source multiplied by its coefficient. Elimination selects the lowest source identifier
-as pivot and normalizes the pivot to one. The exact vectors in `tests/vectors/quicp2.txt` are
+as pivot and normalizes the pivot to one. The exact vectors in `tests/vectors/quicp.txt` are
 normative.
 
 The decoder retains at most the negotiated window and row count. Each received DATAGRAM gets the
@@ -167,8 +168,8 @@ magic:"QPCS" | kind:u8 | profile_len:u8 | params_len:u16 | profile | QUIC transp
 `kind` is `1` CLIENT_HELLO, `2` SERVER_HELLO, or `3` CLIENT_CONFIRM. `profile_len` is `1..=32`,
 `params_len` is network byte order, and the complete message length is `8 + profile_len +
 params_len`; trailing bytes are invalid. The state order is CLIENT_HELLO, SERVER_HELLO,
-CLIENT_CONFIRM. Every message carries the exact `quicp/2` profile. The TLS profile uses TLS 1.3
-with ALPN `quicp/2`; it does not change QUICP/2 flow or DATAGRAM framing.
+CLIENT_CONFIRM. Every message carries the exact `quicp` profile. The TLS profile uses TLS 1.3
+with ALPN `quicp`; it does not change QUICP flow or DATAGRAM framing.
 
 A replay token is exactly 73 bytes:
 
@@ -177,7 +178,7 @@ version:u8=1 | epoch:u64 | expiry_seconds:u64 | capability_fingerprint:u64 |
 identity:16 bytes | tag:32 bytes
 ```
 
-`tag` is HMAC-SHA-256 over ASCII `quicp/2 replay token`, one zero byte, and the preceding 41-byte
+`tag` is HMAC-SHA-256 over ASCII `quicp replay token`, one zero byte, and the preceding 41-byte
 token body. The HMAC key is a dedicated server secret of at least 32 bytes. A server MUST NOT issue
 a token before an ordinary flow has completed capability negotiation. The fingerprint binds that
 negotiated snapshot; it is not a replacement for capability negotiation.
@@ -243,9 +244,9 @@ TUN creation, raw-socket privilege, and mobile entitlements are outside the QUIC
 
 ## 10. Independent implementation checklist
 
-An implementation claiming QUICP/2 interoperability must:
+An implementation claiming QUICP interoperability must:
 
-1. select only `quicp/2` and reproduce the committed wire vectors;
+1. select only `quicp` and reproduce the committed wire vectors;
 2. implement every peer-controlled bound before allocation or state mutation;
 3. keep the reliable stream as control/fallback while source data normally uses DATAGRAM;
 4. preserve ordered, duplicate-free flow reads under loss, reorder, repair, replay, and fallback;

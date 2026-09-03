@@ -1124,7 +1124,7 @@ pub struct QuicpTransportConfig {
     /// Built-in congestion controller used by the QUICP transport.
     #[serde(default)]
     pub congestion_control: CongestionControl,
-    /// QUICP/2 logical recovery policy.
+    /// QUICP logical recovery policy.
     #[serde(default)]
     pub recovery: RecoveryConfig,
 }
@@ -1178,7 +1178,7 @@ impl QuicpTransportConfig {
         self
     }
 
-    /// Replaces the QUICP/2 recovery policy.
+    /// Replaces the QUICP recovery policy.
     #[must_use]
     pub const fn with_recovery(mut self, recovery: RecoveryConfig) -> Self {
         self.recovery = recovery;
@@ -1278,7 +1278,7 @@ impl QuicpTransportConfig {
     }
 }
 
-/// QUICP/2 payload recovery substrate.
+/// QUICP payload recovery substrate.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecoveryMode {
@@ -1289,7 +1289,7 @@ pub enum RecoveryMode {
     ReliableOnly,
 }
 
-/// Bounded QUICP/2 recovery limits shared by both endpoints.
+/// Bounded QUICP recovery limits shared by both endpoints.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryConfig {
@@ -1903,7 +1903,7 @@ pub enum ConfigError {
         /// Maximum supported byte count.
         maximum: u32,
     },
-    /// A QUICP/2 recovery bound is outside its supported range.
+    /// A QUICP recovery bound is outside its supported range.
     #[error("recovery limit {name}={value} must be between {minimum} and {maximum}")]
     InvalidRecoveryLimit {
         /// Rejected field name.

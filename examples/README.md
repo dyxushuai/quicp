@@ -1,29 +1,28 @@
 # QUICP examples
 
-These examples implement the [normative QUICP/2 protocol](../docs/protocol.md).
+These examples exercise the [normative QUICP protocol](../docs/protocol.md). Choose the example
+that matches the layer you are integrating.
 
-Use the example that matches the layer you are integrating:
-
-The real ISP-facing carrier example is `socks5_tunnel.rs` on Linux. The host, smoltcp, Apple, and
-Android examples exercise packet seams only; they do not claim to emit FakeTCP on a physical ISP
-interface.
+[`socks5_tunnel.rs`](socks5_tunnel.rs) is the Linux ISP-facing carrier example. The host, smoltcp,
+Apple, and Android examples exercise integration seams; they do not claim to emit FakeTCP on a
+physical ISP interface.
 
 | Scenario | Entry point | Run or inspect |
 | --- | --- | --- |
-| Runtime-neutral QUICP echo flow | `echo.rs` | `cargo run --locked --example echo` |
-| SOCKS5 client/server tunnel | `socks5_tunnel.rs` | `cargo build --locked --example socks5_tunnel --features runtime-tokio` |
-| Primary/backup flow failover | `multipath.rs` | `cargo run --locked --example multipath` |
-| Custom QUICP header protection | `header_protection.rs` | `cargo run --locked --example header_protection` |
-| Replay-safe application 0-RTT | `zero_rtt.rs` | `cargo run --locked --example zero_rtt` |
-| smoltcp/TUN packet seam | `smoltcp_bridge.rs` | `cargo run --locked --example smoltcp_bridge --features platform-smoltcp` |
-| iOS/macOS Network Extension | `sdk/apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift` | Swift package and host entitlements required |
-| Android `VpnService` | `sdk/android/examples/io/quicp/QuicpVpnServiceExample.kt` | Android app, TUN permission, and JNI archive required |
+| Runtime-neutral QUICP echo flow | [`echo.rs`](echo.rs) | `cargo run --locked --example echo` |
+| SOCKS5 client/server tunnel | [`socks5_tunnel.rs`](socks5_tunnel.rs) | `cargo build --locked --example socks5_tunnel --features runtime-tokio` |
+| Primary/backup flow failover | [`multipath.rs`](multipath.rs) | `cargo run --locked --example multipath` |
+| Custom QUICP header protection | [`header_protection.rs`](header_protection.rs) | `cargo run --locked --example header_protection` |
+| Replay-safe application 0-RTT | [`zero_rtt.rs`](zero_rtt.rs) | `cargo run --locked --example zero_rtt` |
+| smoltcp/TUN packet seam | [`smoltcp_bridge.rs`](smoltcp_bridge.rs) | `cargo run --locked --example smoltcp_bridge --features platform-smoltcp` |
+| iOS/macOS Network Extension | [`QuicpNetworkExtensionPacketTunnelProvider.swift`](../sdk/apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift) | Swift package and host entitlements required |
+| Android `VpnService` | [`QuicpVpnServiceExample.kt`](../sdk/android/examples/io/quicp/QuicpVpnServiceExample.kt) | Android app, TUN permission, and JNI archive required |
 
-## Important boundaries
+## What each example proves
 
 - `echo.rs` is the smallest complete flow example: it opens a QUICP flow, sends bytes, and echoes
   them back through the host-owned datagram pump.
-- `socks5_tunnel.rs` is a real two-process Linux client/server tunnel. The client accepts
+- `socks5_tunnel.rs` is a two-process Linux client/server tunnel. The client accepts
   unauthenticated SOCKS5 `CONNECT` requests with domain names; the server connects each QUICP flow
   to the requested destination. Both processes require `CAP_NET_RAW`, the same owner-only cookie
   secret, and tuple-scoped TCP RST suppression:

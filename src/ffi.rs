@@ -1,4 +1,4 @@
-//! Synchronous C ABI for a host-driven QUICP/2 connection.
+//! Synchronous C ABI for a host-driven QUICP connection.
 //!
 //! Foreign buffers are borrowed for one call. One engine is single-owner and host-driven; no
 //! Rust future, callback, collection, or retained foreign pointer crosses the ABI.

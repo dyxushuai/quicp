@@ -542,7 +542,7 @@ fn synchronous_engine_connects_and_exchanges_flow_bytes() {
         assert_eq!(quicp_flow_flush(server, client_flow), FfiStatus::Closed);
         assert_eq!(quicp_flow_flush(client, server_flow), FfiStatus::Closed);
 
-        let payload = b"QUICP/2 through the C engine";
+        let payload = b"QUICP through the C engine";
         let mut written = 0;
         assert_eq!(
             quicp_flow_write(

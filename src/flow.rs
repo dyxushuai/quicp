@@ -1396,31 +1396,31 @@ impl Drop for FlowTask {
 
 #[derive(Debug, Error)]
 enum FlowTaskError {
-    #[error("invalid QUICP/2 control frame: {0}")]
+    #[error("invalid QUICP control frame: {0}")]
     Codec(CodecError),
-    #[error("QUICP/2 control stream finished before FIN")]
+    #[error("QUICP control stream finished before FIN")]
     FinishedEarly,
-    #[error("QUICP/2 control frame exceeds the negotiated limit")]
+    #[error("QUICP control frame exceeds the negotiated limit")]
     ControlLimit,
-    #[error("unexpected post-admission QUICP/2 control frame")]
+    #[error("unexpected post-admission QUICP control frame")]
     UnexpectedControl,
     #[error(
-        "peer reset QUICP/2 flow with {error:?} ({code})",
+        "peer reset QUICP flow with {error:?} ({code})",
         error = .0,
         code = .0.code()
     )]
     PeerReset(ApplicationError),
-    #[error("reading QUICP/2 control stream: {0}")]
+    #[error("reading QUICP control stream: {0}")]
     Read(noq::ReadError),
-    #[error("writing QUICP/2 control stream: {0}")]
+    #[error("writing QUICP control stream: {0}")]
     Write(noq::WriteError),
-    #[error("finishing QUICP/2 control stream: {0}")]
+    #[error("finishing QUICP control stream: {0}")]
     Finish(noq::ClosedStream),
-    #[error("QUICP/2 control stream accepted zero bytes")]
+    #[error("QUICP control stream accepted zero bytes")]
     WriteZero,
-    #[error("QUICP/2 DATAGRAM failed: {0}")]
+    #[error("QUICP DATAGRAM failed: {0}")]
     Datagram(noq::SendDatagramError),
-    #[error("QUICP/2 connection failed: {0}")]
+    #[error("QUICP connection failed: {0}")]
     Connection(noq::ConnectionError),
     #[error(transparent)]
     Recovery(#[from] RecoveryError),

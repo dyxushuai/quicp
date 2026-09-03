@@ -198,7 +198,7 @@ impl NoSecuritySession {
     }
 
     fn validate_peer_token(&self, token: &[u8]) -> Result<(), TransportError> {
-        let valid = token == crate::wire::QUICP_V2_PROFILE;
+        let valid = token == crate::wire::QUICP_PROFILE;
         if !valid || (self.side == Side::Client && token != self.profile_token) {
             return Err(Self::protocol_error("unsupported QUICP profile token"));
         }
@@ -488,7 +488,7 @@ mod tests {
         let params = TransportParameters::read(Side::Client, &mut Cursor::new(&[][..])).unwrap();
         let mut client = NoSecuritySession::new(
             Side::Client,
-            crate::wire::QUICP_V2_PROFILE.to_vec(),
+            crate::wire::QUICP_PROFILE.to_vec(),
             &params,
             None,
             None,

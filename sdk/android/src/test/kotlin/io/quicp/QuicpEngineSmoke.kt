@@ -191,7 +191,7 @@ fun main() {
                     check(received == initialBytes.size)
                     check(initialBytes.indices.all { output.get(it) == initialBytes[it] })
 
-                    val payload = "QUICP/2 through Kotlin".encodeToByteArray()
+                    val payload = "QUICP through Kotlin".encodeToByteArray()
                     val input = ByteBuffer.allocateDirect(payload.size).put(payload).rewind()
                     check(
                         flow.write(input, payload.size) ==

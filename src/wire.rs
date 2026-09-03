@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::config::{MAX_DECODER_WINDOW, MAX_REPAIR_SPAN};
 
-pub(crate) const QUICP_V2_PROFILE: &[u8] = b"quicp/2";
+pub(crate) const QUICP_PROFILE: &[u8] = b"quicp";
 pub(crate) const SOURCE_DATAGRAM: u8 = 0x20;
 pub(crate) const REPAIR_DATAGRAM: u8 = 0x21;
 pub(crate) const REPAIR_DATAGRAM_HEADER_BYTES: usize = 17;
@@ -227,7 +227,7 @@ pub enum WireError {
     },
 }
 
-/// QUICP/2 connection capabilities repeated during flow admission.
+/// QUICP connection capabilities repeated during flow admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Capabilities {
     pub(crate) flags: u8,
@@ -267,7 +267,7 @@ impl Capabilities {
     }
 }
 
-/// One decoded QUICP/2 reliable control frame.
+/// One decoded QUICP reliable control frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ControlFrame<'a> {
     Capabilities(Capabilities),
@@ -318,17 +318,17 @@ pub(crate) struct RepairDatagram<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum CodecError {
-    #[error("truncated QUICP/2 frame")]
+    #[error("truncated QUICP frame")]
     Truncated,
-    #[error("QUICP/2 integer is not canonical")]
+    #[error("QUICP integer is not canonical")]
     NonCanonical,
-    #[error("QUICP/2 field is invalid")]
+    #[error("QUICP field is invalid")]
     InvalidField,
-    #[error("QUICP/2 frame type is unknown")]
+    #[error("QUICP frame type is unknown")]
     UnknownType,
-    #[error("QUICP/2 frame has trailing bytes")]
+    #[error("QUICP frame has trailing bytes")]
     TrailingBytes,
-    #[error("QUICP/2 frame exceeds a negotiated limit")]
+    #[error("QUICP frame exceeds a negotiated limit")]
     Limit,
 }
 
@@ -813,7 +813,7 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-mod quicp2_tests {
+mod protocol_tests {
     use super::*;
 
     fn hex(value: &str) -> Vec<u8> {
@@ -830,7 +830,7 @@ mod quicp2_tests {
 
     #[test]
     fn committed_vectors_decode_and_reencode() {
-        for line in include_str!("../tests/vectors/quicp2.txt").lines() {
+        for line in include_str!("../tests/vectors/quicp.txt").lines() {
             if line.starts_with('#') {
                 continue;
             }
@@ -839,7 +839,7 @@ mod quicp2_tests {
             };
             let bytes = hex(value);
             if name == "profile" {
-                assert_eq!(bytes, QUICP_V2_PROFILE, "{name}");
+                assert_eq!(bytes, QUICP_PROFILE, "{name}");
                 continue;
             }
             if name.starts_with("invalid_repair") {
