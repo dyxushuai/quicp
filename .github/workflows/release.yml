@@ -80,7 +80,7 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
           cargo package --locked --no-verify
-          sha256sum "target/package/quicp-${version}.crate" > "target/package/quicp-${version}.crate.sha256"
+          (cd target/package && sha256sum "quicp-${version}.crate" > "quicp-${version}.crate.sha256")
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" \
               "target/package/quicp-${version}.crate" \
