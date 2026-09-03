@@ -31,6 +31,7 @@ use thiserror::Error;
 #[path = "flow/tokio.rs"]
 mod tokio_adapter;
 #[cfg(feature = "runtime-tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime-tokio")))]
 pub use tokio_adapter::relay_bidirectional;
 
 #[cfg(feature = "runtime-tokio")]

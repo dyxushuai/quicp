@@ -7,7 +7,9 @@ publish = true
 description = "A QUIC-based TCP alternative over a FakeTCP carrier"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dyxushuai/quicp"
-documentation = "https://github.com/dyxushuai/quicp#documentation"
+documentation = "https://docs.rs/quicp"
+keywords = ["quic", "tcp", "networking", "multipath", "faketcp"]
+categories = ["network-programming"]
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -28,7 +30,10 @@ runtime-tokio = [
 tls-rustls = ["noq/rustls-ring"]
 
 [package.metadata.docs.rs]
-features = ["runtime-tokio", "tls-rustls", "platform-smoltcp", "ffi-c"]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 crc32c = "0.6"

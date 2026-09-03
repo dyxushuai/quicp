@@ -185,6 +185,7 @@ ordered TCP byte stream.
 
 ## Documentation
 
+- [API reference on docs.rs](https://docs.rs/quicp)
 - [Protocol and wire boundaries](docs/protocol.md)
 - [Run the Rust examples](examples/README.md)
 - [Choose the SDK and ABI contract](sdk/README.md)
@@ -195,9 +196,17 @@ ordered TCP byte stream.
 Generate API documentation locally with:
 
 ```sh
-RUSTDOCFLAGS='-D warnings' cargo doc \
-  --features runtime-tokio,tls-rustls,platform-smoltcp,ffi-c --no-deps --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps --locked
 ```
+
+The docs.rs-equivalent build uses nightly Rust and the same feature surface:
+
+```sh
+RUSTDOCFLAGS='--cfg docsrs -D warnings' cargo +nightly doc --all-features --no-deps --locked
+```
+
+The hosted API docs are built from the latest crates.io release. They may lag `main` until the
+next package version is published.
 
 ## Verify locally
 
