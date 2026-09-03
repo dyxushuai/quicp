@@ -21,11 +21,11 @@ Start with the [QUICP/2 protocol specification](docs/protocol.md). It is the nor
 for DATAGRAM recovery, logical ACK/replay/FEC, replay-safe early data, the FakeTCP envelope, and
 the independent-implementation checklist. This README focuses on using the library and SDKs.
 
-> **Status:** `0.1.0` source release candidate. The crate remains unpublished (`publish = false`)
-> because the vendored `noq` patch must be released as a separately reviewable dependency before
-> crates.io distribution. `cargo package` intentionally omits path dependencies, so it is not a
-> valid QUICP release artifact; publish a repository source archive that retains `vendor/**` and
-> the project licenses instead.
+> **Status:** `0.1.1` is the first published QUICP implementation. The registry already contained
+> an unrelated immutable `quicp 0.1.0`, so this release uses the next available version. The
+> hardened backend is published as [`quicp-noq`](https://crates.io/crates/quicp-noq) and
+> [`quicp-noq-proto`](https://crates.io/crates/quicp-noq-proto); the source tree retains `vendor/**`
+> for auditability.
 > Windows Tier 0 is implemented through the external WinDivert WFP/WDF provider. Native
 > packet admission still requires the Windows driver, Administrator privileges, and the black-box
 > evidence listed in [the Windows carrier guide](docs/windows.md); Wintun/TAP remains Tier 1.

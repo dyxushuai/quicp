@@ -41,8 +41,8 @@ Any failure in this section is a release blocker.
 
 - [ ] `cargo fmt --all -- --check` passes.
 - [ ] The project license is selected, declared in `Cargo.toml`, and included in the source archive;
-  the archive must retain `vendor/**`. `cargo package` omits path dependencies and is not a complete
-  QUICP release artifact while the vendored backend remains repository-local.
+  the source archive retains `vendor/**`, while the crates.io package resolves the separately
+  published `quicp-noq` and `quicp-noq-proto` backend crates.
 - [ ] `cargo clippy --all-targets --locked -- -D warnings` passes.
 - [ ] `cargo clippy --all-features --all-targets --locked -- -D warnings` passes.
 - [ ] `cargo test --locked` passes.

@@ -566,51 +566,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "noq"
-version = "1.1.1"
-dependencies = [
- "bytes",
- "cfg_aliases",
- "derive_more",
- "noq-proto",
- "noq-udp",
- "pin-project-lite",
- "rustc-hash",
- "rustls",
- "socket2",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "noq-proto"
-version = "1.1.1"
-dependencies = [
- "aes-gcm",
- "bytes",
- "derive_more",
- "enum-assoc",
- "getrandom 0.4.3",
- "identity-hash",
- "lru-slab",
- "rand",
- "rand_pcg",
- "ring",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "slab",
- "sorted-index-buffer",
- "thiserror",
- "tinyvec",
- "tracing",
- "web-time",
-]
-
-[[package]]
 name = "noq-udp"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -723,14 +678,14 @@ dependencies = [
 
 [[package]]
 name = "quicp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "crc32c",
  "futures-core",
  "libc",
- "noq",
- "noq-proto",
+ "quicp-noq",
+ "quicp-noq-proto",
  "rcgen",
  "ring",
  "rustix",
@@ -742,6 +697,51 @@ dependencies = [
  "tokio",
  "toml",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "quicp-noq"
+version = "1.1.1"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "derive_more",
+ "noq-udp",
+ "pin-project-lite",
+ "quicp-noq-proto",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quicp-noq-proto"
+version = "1.1.1"
+dependencies = [
+ "aes-gcm",
+ "bytes",
+ "derive_more",
+ "enum-assoc",
+ "getrandom 0.4.3",
+ "identity-hash",
+ "lru-slab",
+ "rand",
+ "rand_pcg",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "sorted-index-buffer",
+ "thiserror",
+ "tinyvec",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]

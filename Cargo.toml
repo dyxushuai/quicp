@@ -1,12 +1,11 @@
 [package]
 name = "quicp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
-publish = false
+publish = true
 description = "A QUIC-based TCP alternative over a FakeTCP carrier"
 license = "MIT OR Apache-2.0"
-readme = "README.md"
 repository = "https://github.com/dyxushuai/quicp"
 documentation = "https://github.com/dyxushuai/quicp#documentation"
 [profile.release]
@@ -35,9 +34,9 @@ features = ["runtime-tokio", "tls-rustls", "platform-smoltcp", "ffi-c"]
 crc32c = "0.6"
 futures-core = "0.3"
 # Pinned QUIC substrate; QUICP framing and recovery remain in this crate.
-noq = { version = "=1.1.1", default-features = false, features = ["ring"] }
+noq = { package = "quicp-noq", version = "=1.1.1", default-features = false, features = ["ring"] }
 # The backend's crypto seam exposes transport parameters through this protocol crate.
-noq-proto = { version = "=1.1.1", default-features = false, features = ["ring"] }
+noq-proto = { package = "quicp-noq-proto", version = "=1.1.1", default-features = false, features = ["ring"] }
 bytes = { version = "1", default-features = false, features = ["std"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
@@ -118,5 +117,5 @@ all = "deny"
 pedantic = "deny"
 
 [patch.crates-io]
-noq = { path = "vendor/noq" }
-noq-proto = { path = "vendor/noq-proto" }
+quicp-noq = { path = "vendor/noq" }
+quicp-noq-proto = { path = "vendor/noq-proto" }

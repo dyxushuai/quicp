@@ -11,7 +11,7 @@
 [package]
 edition = "2024"
 rust-version = "1.88"
-name = "noq-proto"
+name = "quicp-noq-proto"
 version = "1.1.1"
 build = false
 autolib = false
@@ -19,7 +19,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "State machine for the QUIC transport protocol"
+description = "QUIC protocol state machine maintained for QUICP"
 readme = false
 keywords = ["quic"]
 categories = [
@@ -27,7 +27,7 @@ categories = [
     "asynchronous",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/noq"
+repository = "https://github.com/dyxushuai/quicp"
 resolver = "2"
 
 [package.metadata.docs.rs]

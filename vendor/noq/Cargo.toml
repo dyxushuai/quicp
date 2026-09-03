@@ -11,7 +11,7 @@
 [package]
 edition = "2024"
 rust-version = "1.88"
-name = "noq"
+name = "quicp-noq"
 version = "1.1.1"
 build = "build.rs"
 autolib = false
@@ -19,15 +19,14 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "General purpose QUIC transport protocol implementation"
-readme = "README.md"
+description = "QUIC transport substrate maintained for QUICP"
 keywords = ["quic"]
 categories = [
     "network-programming",
     "asynchronous",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/noq"
+repository = "https://github.com/dyxushuai/quicp"
 resolver = "2"
 
 [package.metadata.docs.rs]
@@ -234,7 +233,7 @@ version = "0.2"
 version = "1.1.1"
 path = "../noq-proto"
 default-features = false
-package = "noq-proto"
+package = "quicp-noq-proto"
 
 [dependencies.rustc-hash]
 version = "2"
