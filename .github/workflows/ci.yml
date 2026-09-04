@@ -41,11 +41,14 @@ jobs:
         run: >-
           cargo metadata --format-version 1 --no-deps |
           jq -e '.packages[] | select(.name == "quicp") | .metadata.docs.rs as $d |
-          ($d.features | sort) == (["ffi-c", "platform-smoltcp", "runtime-tokio", "tls-rustls"] | sort)'
+          ($d["all-features"] == true) and
+          ($d["default-target"] == "x86_64-unknown-linux-gnu") and
+          (($d.targets | sort) == (["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] | sort)) and
+          ($d["rustdoc-args"] == ["--cfg", "docsrs"])'
       - name: Build stable API documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --features runtime-tokio,tls-rustls,platform-smoltcp,ffi-c --no-deps --locked
+        run: cargo doc --all-features --no-deps --locked
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           rust-version: 1.88.0
@@ -67,6 +70,10 @@ jobs:
             'int main(void) { return quicp_abi_version() == QUICP_ABI_VERSION ? 0 : 1; }' \
             | cc -std=c11 -Wall -Wextra -Werror -Iinclude -x c -fsyntax-only -
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Build docs.rs-compatible API documentation
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc --all-features --no-deps --locked
       - uses: taiki-e/install-action@cargo-fuzz
         with:
           tool: cargo-fuzz
@@ -86,6 +93,11 @@ jobs:
           cargo run --all-features --locked --example echo
           cargo run --all-features --locked --example multipath
           cargo run --all-features --locked --example zero_rtt
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build Windows docs.rs-compatible API documentation
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc --all-features --no-deps --locked --target x86_64-pc-windows-msvc
 
   apple:
     runs-on: macos-14
@@ -126,6 +138,13 @@ jobs:
             -Xcc -I -Xcc "$CQUICP_HEADERS" \
             -Xcc "-fmodule-map-file=$CQUICP_HEADERS/module.modulemap" \
             sdk/apple/Examples/QuicpNetworkExtensionPacketTunnelProvider.swift
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build Apple docs.rs-compatible API documentation
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc --all-features --no-deps --locked --target aarch64-apple-darwin
 
   android:
     runs-on: ubuntu-latest

@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = r"
 # QUICP
 
@@ -133,6 +134,7 @@ pub mod congestion;
 mod faketcp;
 mod fec;
 #[cfg(feature = "ffi-c")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ffi-c")))]
 pub mod ffi;
 pub mod flow;
 #[cfg(fuzzing)]
@@ -145,10 +147,12 @@ mod multipath;
 pub(crate) mod no_security;
 mod packet_ring;
 #[cfg(feature = "platform-smoltcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "platform-smoltcp")))]
 pub mod platform;
 mod recovery;
 mod session;
 #[cfg(feature = "platform-smoltcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "platform-smoltcp")))]
 pub mod smolstack;
 mod transport;
 mod wire;
@@ -176,6 +180,7 @@ pub use host_carrier::{HostDatagramError, HostDatagramSocket};
 pub use host_runtime::{HostRuntime, HostRuntimeError};
 pub use multipath::PathHealth;
 #[cfg(feature = "platform-smoltcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "platform-smoltcp")))]
 pub use platform::{PlatformError, PlatformPacketBridge, PlatformPacketConfig};
 pub use recovery::RecoverySnapshot;
 pub use session::{ApplicationError, SessionError};
