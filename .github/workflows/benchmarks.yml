@@ -1,0 +1,68 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  measure:
+    name: Measure benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check the report converter
+        run: python3 -B -m unittest discover -s benches -p 'test_*.py'
+      - name: Build benchmarks
+        run: |
+          mkdir -p target/benchmarks
+          cargo bench --locked --features runtime-tokio --no-run \
+            --bench carrier_encode --bench carrier_decode --bench loopback \
+            --message-format=json > target/benchmarks/build.jsonl
+      - name: Measure three complete samples
+        env:
+          QUICP_ONLY: '1'
+          QUICP_NODELAY: 'true'
+          QUICP_TOTAL_BYTES: '33554432'
+        run: |
+          for suite in carrier_encode carrier_decode loopback; do
+            binary=$(jq -r --arg suite "$suite" \
+              'select(.reason == "compiler-artifact" and .target.name == $suite and .executable != null) | .executable' \
+              target/benchmarks/build.jsonl)
+            test -x "$binary"
+            if [ "$suite" = loopback ]; then
+              sudo setcap cap_net_raw=ep "$binary"
+            fi
+            for sample in 1 2 3; do
+              mkdir -p "target/benchmarks/$sample"
+              "$binary" > "target/benchmarks/$sample/$suite.csv"
+            done
+          done
+          for sample in 1 2 3; do
+            python3 -B benches/bencher.py "target/benchmarks/$sample" \
+              > "target/benchmarks/results-$sample.json"
+          done
+      - name: Preserve measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            target/benchmarks/results-*.json
+            target/benchmarks/*/*.csv
+          if-no-files-found: error
+          retention-days: 14
