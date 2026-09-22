@@ -1501,8 +1501,8 @@ mod unix_socket_tests {
             send_datagram(&mut sender, client_tuple, &vec![0x5a; 6_000]).await;
             // Cache readiness before discarding the only queued packet.
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let wakes = std::sync::Arc::new(WakeCount(std::sync::atomic::AtomicUsize::new(0)));
-            let waker = std::task::Waker::from(wakes.clone());
+            let counter = std::sync::Arc::new(WakeCount(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(counter.clone());
             let mut cx = std::task::Context::from_waker(&waker);
             let mut storage = [0; 5_888];
             let mut bufs = [IoSliceMut::new(&mut storage)];
@@ -1515,10 +1515,14 @@ mod unix_socket_tests {
             send_datagram(&mut sender, client_tuple, b"valid").await;
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(
-                wakes.0.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                counter.0.load(std::sync::atomic::Ordering::Relaxed) > 0,
                 "read wakeup was lost; packet_socket={packet_socket}"
             );
-            assert_eq!(receive_datagram(&mut receiver).await, b"valid");
+            let valid =
+                tokio::time::timeout(Duration::from_secs(2), receive_datagram(&mut receiver))
+                    .await
+                    .expect("valid packet was not delivered after wakeup");
+            assert_eq!(valid, b"valid");
             assert_eq!(receiver.rejected_datagrams(), 1);
         }
     }
