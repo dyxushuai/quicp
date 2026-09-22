@@ -95,12 +95,44 @@ def validate(results):
             validate_value(measure, metric["value"])
 
 
+def summarize(report):
+    """Keep every threshold result within GitHub's comment size limit."""
+    rows = []
+    comparisons = 0
+    for iteration in report["results"]:
+        for result in iteration:
+            benchmark = result["benchmark"]["name"].replace("|", "\\|").replace("\n", " ")
+            for metric in result["measures"]:
+                if metric.get("threshold") is None:
+                    continue
+                boundary = metric.get("boundary") or {}
+                comparisons += bool(boundary)
+                baseline = boundary.get("baseline")
+                value = metric["metric"]["value"]
+                change = (f"{value / baseline - 1:+.2%}" if baseline else
+                          "0.00%" if baseline == value == 0 else "n/a")
+                base = f"{baseline:.6g}" if baseline is not None else "n/a"
+                measure = metric["measure"]["slug"].replace("|", "\\|").replace("\n", " ")
+                rows.append(f"| {benchmark} | {measure} | {base} | {value:.6g} | {change} |")
+    alerts = report["counts"]["alerts"]["total"]
+    url = f'https://bencher.dev/perf/quicp/reports/{report["uuid"]}'
+    return "\n".join([
+        "## Bencher summary", "", f"**{comparisons} comparisons; {alerts} alerts.**", "",
+        f"[Full report]({url}) · `latency` is in ns; custom measures include their units.", "",
+        "| Benchmark | Measure | Baseline | Current | Change |",
+        "| --- | --- | ---: | ---: | ---: |", *rows, "",
+    ])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, nargs="?", help="directory of <suite>.csv files")
     parser.add_argument("--validate", type=Path, help="validate a complete BMF report")
+    parser.add_argument("--summary", type=Path, help="summarize a published Bencher report")
     args = parser.parse_args()
-    if args.validate:
+    if args.summary:
+        print(summarize(json.loads(args.summary.read_text())))
+    elif args.validate:
         if args.validate.stat().st_size > 100_000:
             parser.error("report exceeds 100 KB")
         validate(json.loads(args.validate.read_text()))

@@ -69,8 +69,9 @@ measurements, incomplete reports, missing credentials, and Bencher errors fail t
 The upload also requires a complete base-commit report among the latest 255 main reports and
 all 72 expected regression boundaries. This prevents Bencher's missing-hash fallback or
 insufficient history from silently passing a PR. Rebase older PRs onto a measured main commit.
-Bencher also publishes its native `Bencher Report (QUICP)` check and a PR comment with the
-threshold comparisons and public report links.
+Bencher also publishes its native `Bencher Report (QUICP)` check. The workflow compacts its PR
+comment into a Markdown table containing every threshold comparison, preserving the full report
+link and avoiding GitHub's comment length limit. The same table appears in the required check.
 
 The initial percentage threshold is 20% against the last ten baseline reports, with one report
 required to start comparison. Increases in codec latency, delivery p50/p95/p99, allocations,
