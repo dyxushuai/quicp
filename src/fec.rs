@@ -11,10 +11,9 @@ use thiserror::Error;
 
 use crate::config::MAX_REPAIR_SPAN;
 use crate::recovery::{RecoveryCharge, RecoveryMemoryBudget};
-use crate::wire::{SourceRecord, decode_source_padded};
+use crate::wire::{MAX_SOURCE_RECORDS, decode_source_padded};
 
 const REDUCTION: u8 = 0x1d;
-const MAX_DECODED_SOURCE_RECORDS: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Row {
@@ -497,9 +496,6 @@ impl Decoder {
             .checked_add(self.max_symbol_bytes)
             .and_then(|bytes| bytes.checked_add(coefficient_bytes))
             .ok_or(FecError::MemoryCapacity)?;
-        let source_record_bytes = MAX_DECODED_SOURCE_RECORDS
-            .checked_mul(size_of::<SourceRecord<'static>>())
-            .ok_or(FecError::MemoryCapacity)?;
         let recovered_bytes = rows
             .checked_mul(
                 self.max_symbol_bytes
@@ -508,7 +504,6 @@ impl Decoder {
                         bytes
                             .checked_add(size_of::<(u32, Bytes)>())
                             .and_then(|bytes| bytes.checked_add(size_of::<RecoveredSource>()))
-                            .and_then(|bytes| bytes.checked_add(source_record_bytes))
                     })
                     .ok_or(FecError::MemoryCapacity)?,
             )
@@ -706,11 +701,8 @@ fn canonical_recovered(
     let mut canonical = bounded_vec(recovered.len())?;
     for (symbol_id, source) in recovered {
         let (decoded, consumed) =
-            decode_source_padded(&source, MAX_DECODED_SOURCE_RECORDS, max_symbol_bytes)
+            decode_source_padded(&source, MAX_SOURCE_RECORDS, max_symbol_bytes)
                 .map_err(|_| FecError::ContradictoryRepair)?;
-        if decoded.records.capacity() != decoded.records.len() {
-            return Err(FecError::MemoryCapacity);
-        }
         if decoded.symbol_id != symbol_id {
             return Err(FecError::ContradictoryRepair);
         }

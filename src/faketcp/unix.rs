@@ -74,7 +74,7 @@ pub struct FakeTcpSocket {
     tuple: FourTuple,
     inbound: FakeTcpCarrier,
     outbound: Arc<Mutex<FakeTcpCarrier>>,
-    server_side: bool,
+    direction: CarrierDirection,
     receive_buffer: Vec<u8>,
     receive_batch_count: usize,
     receive_batch_index: usize,
@@ -115,7 +115,7 @@ impl FakeTcpSocket {
             tuple,
             inbound,
             outbound: Arc::new(Mutex::new(outbound)),
-            server_side: outbound_direction == CarrierDirection::ServerToClient,
+            direction: outbound_direction,
             receive_buffer: vec![0; RAW_PACKET_BUFFER_BYTES * RawPlatform::RECV_BATCH_SIZE],
             receive_batch_count: 0,
             receive_batch_index: 0,
@@ -215,7 +215,7 @@ impl AsyncUdpSocket for FakeTcpSocket {
             send_mode: self.platform.send_mode(),
             tuple: self.tuple,
             carrier: Arc::clone(&self.outbound),
-            server_side: self.server_side,
+            direction: self.direction,
             pending: vec![0; RAW_PACKET_BUFFER_BYTES],
             pending_segment: 0,
             pending_segments: 0,
@@ -359,7 +359,7 @@ struct FakeTcpSender {
     send_mode: RawSendMode,
     tuple: FourTuple,
     carrier: Arc<Mutex<FakeTcpCarrier>>,
-    server_side: bool,
+    direction: CarrierDirection,
     pending: Vec<u8>,
     pending_segment: usize,
     pending_segments: usize,
@@ -409,7 +409,7 @@ impl UdpSender for FakeTcpSender {
                 let this = self.as_mut().get_mut();
                 let remaining = this.pending_segments - this.pending_segment;
                 let batch_count = remaining.min(RawPlatform::SEND_BATCH_SIZE);
-                let server_side = this.server_side;
+                let direction = this.direction;
                 let Ok(mut carrier) = this.carrier.lock() else {
                     return Poll::Ready(Err(std::io::Error::other("FakeTCP send state poisoned")));
                 };
@@ -446,22 +446,11 @@ impl UdpSender for FakeTcpSender {
                     let end = (start + this.pending_segment_size).min(transmit.contents.len());
                     let output_start = index * packet_capacity;
                     let output_end = output_start + packet_capacity;
-                    let encoded = if carrier.sent_syn {
-                        carrier.encode_datagram_into(
-                            &transmit.contents[start..end],
-                            &mut this.pending[output_start..output_end],
-                        )
-                    } else if server_side {
-                        carrier.encode_syn_ack_into(
-                            &transmit.contents[start..end],
-                            &mut this.pending[output_start..output_end],
-                        )
-                    } else {
-                        carrier.encode_syn_into(
-                            &transmit.contents[start..end],
-                            &mut this.pending[output_start..output_end],
-                        )
-                    };
+                    let encoded = carrier.encode_next_datagram_into(
+                        direction,
+                        &transmit.contents[start..end],
+                        &mut this.pending[output_start..output_end],
+                    );
                     match encoded.map_err(carrier_io_error) {
                         Ok(length) => this.pending_batch_lengths[index] = length,
                         Err(error) => return Poll::Ready(Err(error)),

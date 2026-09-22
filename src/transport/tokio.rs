@@ -15,10 +15,9 @@ use crate::congestion::TransportOptions;
 use crate::faketcp::{CarrierDirection, FakeTcpSocket, FourTuple, SynDataMode};
 
 use super::{
-    Client, MultipathSocket, RecoveryMemoryBudget, Server, TransportError, ValidatedClientConfig,
+    Client, ConfiguredEndpoint, MultipathSocket, Server, TransportError, ValidatedClientConfig,
     ValidatedServerConfig, build_client_config_with_options_and_payload, build_client_endpoint,
-    build_server_config_with_options_and_payload, build_server_endpoint, configured_backup_path,
-    listen_addr_admits,
+    build_server_config_with_options_and_payload, build_server_endpoint, listen_addr_admits,
 };
 
 pub(crate) const SYN_COOKIE_EPOCH_SECONDS: u64 = 60;
@@ -45,33 +44,9 @@ impl Client {
         tuples: &[FourTuple],
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
-        let (endpoint, payload_ceiling) =
-            build_fake_tcp_client_endpoint_with_options(config, tuples, options)?;
-        let Some(primary) = tuples.first() else {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "FakeTCP requires a path").into(),
-            );
-        };
-        let server_addr = primary.destination;
-        let server_name = config
-            .tls
-            .as_ref()
-            .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name.clone());
-        Ok(Self::from_endpoint_with_runtime(
-            endpoint,
-            server_addr,
-            server_name,
-            Some(Arc::new(noq::TokioRuntime)),
-            None,
-            configured_backup_path(config),
-            config.transport().flow_write_buffer_bytes as usize,
-            config.transport().default_nodelay,
-            config.transport().recovery,
-            Arc::new(RecoveryMemoryBudget::new(
-                config.transport().recovery_memory_budget_bytes,
-            )),
-            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
-        ))
+        let config = ValidatedClientConfig::new(config)?;
+        let endpoint = build_fake_tcp_client_endpoint_with_options(config, tuples, options)?;
+        Ok(Self::from_configured_endpoint(endpoint, config, None))
     }
 }
 impl Server {
@@ -97,30 +72,16 @@ impl Server {
         tuples: &[FourTuple],
         options: &TransportOptions,
     ) -> Result<Self, TransportError> {
-        let (endpoint, payload_ceiling) =
-            build_fake_tcp_server_endpoint_with_options(config, tuples, options)?;
-        Ok(Self::from_endpoint_with_limits(
-            endpoint,
-            usize::from(config.transport().max_active_connections),
-            usize::from(config.transport().max_active_connections_per_peer),
-            config.transport().flow_write_buffer_bytes as usize,
-            config.transport().default_nodelay,
-            Arc::new(noq::TokioRuntime),
-            None,
-            config.transport().recovery,
-            Arc::new(RecoveryMemoryBudget::new(
-                config.transport().recovery_memory_budget_bytes,
-            )),
-            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
-        ))
+        let config = ValidatedServerConfig::new(config)?;
+        let endpoint = build_fake_tcp_server_endpoint_with_options(config, tuples, options)?;
+        Ok(Self::from_configured_endpoint(endpoint, config, None))
     }
 }
 fn build_fake_tcp_client_endpoint_with_options(
-    config: &ClientConfig,
+    config: ValidatedClientConfig<'_>,
     tuples: &[FourTuple],
     options: &TransportOptions,
-) -> Result<(noq::Endpoint, u16), TransportError> {
-    let config = ValidatedClientConfig::new(config)?;
+) -> Result<ConfiguredEndpoint, TransportError> {
     let paths = configure_fake_tcp_paths(&config.carrier, config.transport(), tuples)?;
     if paths.len() != usize::from(config.multipath.mode.path_limit())
         || paths.len() != config.multipath.candidates.len()
@@ -159,11 +120,10 @@ fn build_fake_tcp_client_endpoint_with_options(
 }
 
 fn build_fake_tcp_server_endpoint_with_options(
-    config: &ServerConfig,
+    config: ValidatedServerConfig<'_>,
     tuples: &[FourTuple],
     options: &TransportOptions,
-) -> Result<(noq::Endpoint, u16), TransportError> {
-    let config = ValidatedServerConfig::new(config)?;
+) -> Result<ConfiguredEndpoint, TransportError> {
     let paths = configure_fake_tcp_paths(&config.carrier, config.transport(), tuples)?;
     if paths.is_empty()
         || paths.len() > 2

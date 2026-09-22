@@ -558,13 +558,18 @@ impl FakeTcpCarrier {
         outer_mtu: u16,
     ) -> Result<Self, CarrierError> {
         let pseudo_header_prefix = validated_pseudo_header_prefix(tuple)?;
-        let ip_header_bytes = if tuple.source.is_ipv4() {
-            IPV4_HEADER_BYTES
+        #[allow(clippy::cast_possible_truncation)]
+        let header_bytes = if tuple.source.is_ipv4() {
+            const {
+                assert!(IPV4_HEADER_BYTES + TCP_HEADER_BYTES <= u16::MAX as usize);
+                (IPV4_HEADER_BYTES + TCP_HEADER_BYTES) as u16
+            }
         } else {
-            IPV6_HEADER_BYTES
+            const {
+                assert!(IPV6_HEADER_BYTES + TCP_HEADER_BYTES <= u16::MAX as usize);
+                (IPV6_HEADER_BYTES + TCP_HEADER_BYTES) as u16
+            }
         };
-        let header_bytes = u16::try_from(ip_header_bytes + TCP_HEADER_BYTES)
-            .map_err(|_| CarrierError::InvalidOuterMtu(outer_mtu))?;
         let maximum_mss = outer_mtu
             .checked_sub(header_bytes)
             .ok_or(CarrierError::InvalidOuterMtu(outer_mtu))?;
@@ -656,6 +661,29 @@ impl FakeTcpCarrier {
         let mut outbound = Self::new_with_mtu(tuple, direction, syn_data, syn_mss, outer_mtu)?;
         outbound.acknowledgment = Arc::clone(&inbound.acknowledgment);
         Ok((inbound, outbound))
+    }
+
+    #[cfg(any(
+        test,
+        all(
+            feature = "runtime-tokio",
+            any(target_os = "linux", target_os = "macos", windows)
+        )
+    ))]
+    fn encode_next_datagram_into(
+        &mut self,
+        direction: CarrierDirection,
+        datagram: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CarrierError> {
+        if self.sent_syn {
+            self.encode_datagram_into(datagram, output)
+        } else {
+            match direction {
+                CarrierDirection::ClientToServer => self.encode_syn_into(datagram, output),
+                CarrierDirection::ServerToClient => self.encode_syn_ack_into(datagram, output),
+            }
+        }
     }
 
     /// Encodes one ordinary QUICP datagram in one TCP-shaped packet.
@@ -1181,6 +1209,41 @@ mod sequence_tests {
         let second = decode_packet_view(&second, None).expect("second view");
         assert_eq!(first.sequence, u32::MAX - 1);
         assert_eq!(second.sequence, 2);
+    }
+
+    #[test]
+    fn next_datagram_selects_first_packet_flags_and_preserves_state_on_error() {
+        for (direction, first_flags) in [
+            (CarrierDirection::ClientToServer, TcpFlags::SYN),
+            (
+                CarrierDirection::ServerToClient,
+                TcpFlags::SYN | TcpFlags::ACK,
+            ),
+        ] {
+            let mut carrier = FakeTcpCarrier::new_with_initial_sequence(
+                tuple(),
+                SynDataMode::Cookie([7; 16]),
+                42,
+            )
+            .expect("carrier");
+            for (payload, flags, sequence) in [
+                (b"initial".as_slice(), first_flags, 42),
+                (b"next".as_slice(), TcpFlags::ACK | TcpFlags::PSH, 50),
+            ] {
+                assert!(matches!(
+                    carrier.encode_next_datagram_into(direction, payload, &mut [0; 1]),
+                    Err(CarrierError::OutputTooSmall { .. })
+                ));
+                let mut output = [0; 1500];
+                let length = carrier
+                    .encode_next_datagram_into(direction, payload, &mut output)
+                    .expect("packet");
+                let packet = decode_packet_view(&output[..length], None).expect("packet view");
+                assert_eq!(packet.flags, flags);
+                assert_eq!(packet.sequence, sequence);
+                assert_eq!(packet.payload, payload);
+            }
+        }
     }
 
     #[test]
