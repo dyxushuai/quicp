@@ -121,14 +121,17 @@ quicp_status_t quicp_engine_egress(quicp_engine_t *engine,
 quicp_status_t quicp_engine_path_unavailable(quicp_engine_t *engine,
                                              uint32_t path);
 
-/* Repeat the same open call after WOULD_BLOCK until it returns a flow handle. */
+/* Client-only: submit an OPEN once on an established connection, then use
+ * poll_open_flow after WOULD_BLOCK. Accepted input is copied before return.
+ * Repeating the same open call remains supported for existing callers. */
 quicp_status_t quicp_engine_open_flow(quicp_engine_t *engine,
                                       const uint8_t *host,
                                       uint32_t host_length,
                                       uint16_t port,
                                       quicp_flow_t *flow);
-/* Replay-safe opens run on an established connection; all input buffers are
- * copied before return. Initial data is limited to 32768 bytes. */
+/* Replay-safe opens use the same submit/poll contract on an established
+ * connection. Accepted input buffers are copied before return; initial data
+ * is limited to 32768 bytes. */
 quicp_status_t quicp_engine_open_replay_safe_flow(
     quicp_engine_t *engine,
     const uint8_t *token,
@@ -140,6 +143,12 @@ quicp_status_t quicp_engine_open_replay_safe_flow(
     const uint8_t *initial,
     uint32_t initial_length,
     quicp_flow_t *flow);
+/* Client-only: poll either kind of submitted OPEN without resending inputs.
+ * WOULD_BLOCK means pending; OK returns its flow handle exactly once; FAILED
+ * consumes a failed attempt. With no pending result, returns NOT_READY.
+ * Only one OPEN may be pending per engine. */
+quicp_status_t quicp_engine_poll_open_flow(quicp_engine_t *engine,
+                                          quicp_flow_t *flow);
 /* Polling an incoming OPEN never accepts it. On OK, inspect host, port, and
  * initial bytes, then pass request to accept_pending_flow or
  * reject_pending_flow. Zero-capacity buffers query the required lengths. */

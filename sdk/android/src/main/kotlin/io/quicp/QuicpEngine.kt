@@ -146,6 +146,7 @@ class QuicpEngine private constructor(private var handle: Long) : AutoCloseable 
         @JvmStatic private external fun nativeOpenFlow(
             handle: Long, host: ByteArray, port: Int, flow: LongArray,
         ): Int
+        @JvmStatic private external fun nativePollOpenFlow(handle: Long, flow: LongArray): Int
         @JvmStatic private external fun nativeOpenReplaySafeFlow(
             handle: Long,
             token: ByteBuffer,
@@ -248,6 +249,8 @@ class QuicpEngine private constructor(private var handle: Long) : AutoCloseable 
     fun markPathUnavailable(path: Int): QuicpStatus =
         if (handle == 0L) QuicpStatus.CLOSED else status(nativePathUnavailable(handle, path))
 
+    /** Submits one OPEN on an established client connection. After WOULD_BLOCK,
+     * call pollOpenFlow(); the accepted host is copied before return. */
     fun openFlow(host: String, port: Int): Result<QuicpFlow> {
         require(port in 1..65535)
         if (handle == 0L) return Result.failure(QuicpException(QuicpStatus.CLOSED))
@@ -255,6 +258,8 @@ class QuicpEngine private constructor(private var handle: Long) : AutoCloseable 
         return flow(nativeOpenFlow(handle, host.encodeToByteArray(), port, output), output, this)
     }
 
+    /** Submits one replay-safe OPEN. Accepted inputs are copied before return;
+     * after WOULD_BLOCK, call pollOpenFlow() without retaining those buffers. */
     fun openReplaySafeFlow(
         token: ByteBuffer,
         tokenLength: Int,
@@ -276,6 +281,15 @@ class QuicpEngine private constructor(private var handle: Long) : AutoCloseable 
             initialLength, output,
         )
         return flow(status, output, this)
+    }
+
+    /** Polls the client's submitted OPEN: WOULD_BLOCK while pending, a flow or
+     * FAILED once, then NOT_READY when idle. Only one OPEN may be pending per engine.
+     * Repeating identical open calls remains supported for existing callers. */
+    fun pollOpenFlow(): Result<QuicpFlow> {
+        if (handle == 0L) return Result.failure(QuicpException(QuicpStatus.CLOSED))
+        val output = LongArray(1)
+        return flow(nativePollOpenFlow(handle, output), output, this)
     }
 
     fun pollFlowRequest(replaySafe: Boolean = false): Result<QuicpPendingFlow> {

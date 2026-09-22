@@ -103,13 +103,22 @@ final class QuicpTests: XCTestCase {
     }
     XCTAssertEqual(client.connectionStatus, .ok)
     XCTAssertEqual(server.connectionStatus, .ok)
+    XCTAssertThrowsError(try client.pollOpenFlow().get()) {
+      XCTAssertEqual($0 as? QuicpStatus, .notReady)
+    }
+    XCTAssertThrowsError(try server.pollOpenFlow().get()) {
+      XCTAssertEqual($0 as? QuicpStatus, .invalidArgument)
+    }
 
     var primeClient: QuicpFlow?
     var primePending: QuicpPendingFlow?
     var primeServer: QuicpFlow?
+    XCTAssertThrowsError(try client.openFlow(host: "prime.example", port: 443).get()) {
+      XCTAssertEqual($0 as? QuicpStatus, .wouldBlock)
+    }
     for _ in 0..<1_000 where primeClient == nil || primeServer == nil {
       if primeClient == nil,
-         case .success(let flow) = client.openFlow(host: "prime.example", port: 443) {
+         case .success(let flow) = client.pollOpenFlow() {
         primeClient = flow
       }
       if primePending == nil,
@@ -126,6 +135,9 @@ final class QuicpTests: XCTestCase {
     }
     let closedClient = try XCTUnwrap(primeClient)
     let closedServer = try XCTUnwrap(primeServer)
+    XCTAssertThrowsError(try client.pollOpenFlow().get()) {
+      XCTAssertEqual($0 as? QuicpStatus, .notReady)
+    }
     XCTAssertEqual(closedClient.close(), .ok)
     XCTAssertEqual(closedServer.close(), .ok)
 
@@ -150,16 +162,19 @@ final class QuicpTests: XCTestCase {
     var clientFlow: QuicpFlow?
     var pendingFlow: QuicpPendingFlow?
     var serverFlow: QuicpFlow?
+    let opened = token.withUnsafeBytes { token in
+      initial.withUnsafeBytes { initial in
+        client.openReplaySafeFlow(
+          token: token, nonce: 42, host: "swift.example", port: 443, initial: initial
+        )
+      }
+    }
+    XCTAssertThrowsError(try opened.get()) {
+      XCTAssertEqual($0 as? QuicpStatus, .wouldBlock)
+    }
     for _ in 0..<1_000 where clientFlow == nil || serverFlow == nil {
-      if clientFlow == nil {
-        let opened = token.withUnsafeBytes { token in
-          initial.withUnsafeBytes { initial in
-            client.openReplaySafeFlow(
-              token: token, nonce: 42, host: "swift.example", port: 443, initial: initial
-            )
-          }
-        }
-        if case .success(let flow) = opened { clientFlow = flow }
+      if clientFlow == nil, case .success(let flow) = client.pollOpenFlow() {
+        clientFlow = flow
       }
       if pendingFlow == nil,
          case .success(let pending) = server.pollFlowRequest(replaySafe: true) {
@@ -176,6 +191,9 @@ final class QuicpTests: XCTestCase {
     }
     let sender = try XCTUnwrap(clientFlow)
     let receiver = try XCTUnwrap(serverFlow)
+    XCTAssertThrowsError(try client.pollOpenFlow().get()) {
+      XCTAssertEqual($0 as? QuicpStatus, .notReady)
+    }
     XCTAssertEqual(closedClient.flush(), .closed)
     XCTAssertEqual(closedServer.flush(), .closed)
     var output = [UInt8](repeating: 0, count: 64)

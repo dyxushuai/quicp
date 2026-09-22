@@ -5,7 +5,7 @@
 
 #![allow(unsafe_code)]
 
-use std::mem::size_of;
+use std::mem::{align_of, offset_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -53,7 +53,7 @@ pub enum FfiStatus {
     BufferTooSmall = 2,
     /// A pointer, length, address, handle, or operation is invalid.
     InvalidArgument = 3,
-    /// Connection establishment has not completed.
+    /// Connection establishment has not completed, or no client OPEN is pending.
     NotReady = 4,
     /// The engine or flow is closed.
     Closed = 5,
@@ -126,7 +126,7 @@ pub struct FfiPathConfig {
     pub peer: FfiSocketAddress,
 }
 
-/// Bounded no-TLS engine construction values.
+/// Bounded engine construction values shared by the no-TLS and mutual-TLS entry points.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiEngineConfig {
@@ -212,6 +212,62 @@ pub struct FfiRecoverySnapshot {
     pub retained_source_bytes: u64,
 }
 
+// Keep the Rust side of ABI 3 checked in every ffi-c build, including cross-compilation.
+// tests/ffi_header.c checks the corresponding declarations in include/quicp.h.
+const _: () = {
+    assert!(size_of::<FfiStatus>() == 4);
+    assert!(size_of::<FfiRole>() == 4);
+    assert!(size_of::<FfiRecoveryMode>() == 4);
+    assert!(size_of::<FfiSocketAddress>() == 24);
+    assert!(align_of::<FfiSocketAddress>() == 4);
+    assert!(offset_of!(FfiSocketAddress, family) == 0);
+    assert!(offset_of!(FfiSocketAddress, port) == 4);
+    assert!(offset_of!(FfiSocketAddress, reserved) == 6);
+    assert!(offset_of!(FfiSocketAddress, address) == 8);
+    assert!(size_of::<FfiPathConfig>() == 48);
+    assert!(align_of::<FfiPathConfig>() == 4);
+    assert!(offset_of!(FfiPathConfig, local) == 0);
+    assert!(offset_of!(FfiPathConfig, peer) == 24);
+    assert!(size_of::<FfiEngineConfig>() == 120);
+    assert!(align_of::<FfiEngineConfig>() == 4);
+    assert!(offset_of!(FfiEngineConfig, abi_version) == 0);
+    assert!(offset_of!(FfiEngineConfig, role) == 4);
+    assert!(offset_of!(FfiEngineConfig, path_count) == 8);
+    assert!(offset_of!(FfiEngineConfig, paths) == 12);
+    assert!(offset_of!(FfiEngineConfig, packet_capacity) == 108);
+    assert!(offset_of!(FfiEngineConfig, mtu) == 112);
+    assert!(offset_of!(FfiEngineConfig, recovery_mode) == 116);
+    assert!(offset_of!(FfiBytes, data) == 0);
+    assert!(offset_of!(FfiBytes, length) == size_of::<*const u8>());
+    assert!(align_of::<FfiBytes>() == align_of::<*const u8>());
+    assert!(size_of::<FfiTlsConfig>() == 4 * size_of::<FfiBytes>());
+    assert!(align_of::<FfiTlsConfig>() == align_of::<FfiBytes>());
+    assert!(offset_of!(FfiTlsConfig, server_name) == 0);
+    assert!(offset_of!(FfiTlsConfig, ca_certificate) == size_of::<FfiBytes>());
+    assert!(offset_of!(FfiTlsConfig, certificate) == 2 * size_of::<FfiBytes>());
+    assert!(offset_of!(FfiTlsConfig, private_key) == 3 * size_of::<FfiBytes>());
+    assert!(size_of::<FfiRecoverySnapshot>() == 104);
+    assert!(align_of::<FfiRecoverySnapshot>() == align_of::<u64>());
+    assert!(offset_of!(FfiRecoverySnapshot, source_sent) == 0);
+    assert!(offset_of!(FfiRecoverySnapshot, source_received) == 8);
+    assert!(offset_of!(FfiRecoverySnapshot, repair_sent) == 16);
+    assert!(offset_of!(FfiRecoverySnapshot, recovered) == 24);
+    assert!(offset_of!(FfiRecoverySnapshot, replayed) == 32);
+    assert!(offset_of!(FfiRecoverySnapshot, fallback) == 40);
+    assert!(offset_of!(FfiRecoverySnapshot, dropped) == 48);
+    assert!(offset_of!(FfiRecoverySnapshot, early_accepted) == 56);
+    assert!(offset_of!(FfiRecoverySnapshot, early_rejected) == 64);
+    assert!(offset_of!(FfiRecoverySnapshot, path_lost_packets) == 72);
+    assert!(offset_of!(FfiRecoverySnapshot, max_path_rtt_micros) == 80);
+    assert!(offset_of!(FfiRecoverySnapshot, queued_datagrams) == 88);
+    assert!(offset_of!(FfiRecoverySnapshot, retained_source_bytes) == 96);
+};
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<FfiBytes>() == 16);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(size_of::<FfiBytes>() == 8);
+
 #[derive(Debug)]
 enum ConnectionState {
     Connecting,
@@ -238,6 +294,24 @@ enum OpenState {
     Pending(OpenOperation),
     Ready(OpenOperation, u64),
     Failed(OpenOperation),
+}
+
+impl OpenState {
+    fn poll(&mut self) -> Result<u64, FfiStatus> {
+        match self {
+            Self::Idle => Err(FfiStatus::NotReady),
+            Self::Pending(_) => Err(FfiStatus::WouldBlock),
+            Self::Ready(_, handle) => {
+                let handle = *handle;
+                *self = Self::Idle;
+                Ok(handle)
+            }
+            Self::Failed(_) => {
+                *self = Self::Idle;
+                Err(FfiStatus::Failed)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -915,7 +989,8 @@ pub unsafe extern "C" fn quicp_engine_path_unavailable(
     })
 }
 
-/// Starts or polls one client flow open. Repeat with the same host and port after `WOULD_BLOCK`.
+/// Starts one client flow open. After `WOULD_BLOCK`, use [`quicp_engine_poll_open_flow`].
+/// Repeating this call with identical inputs remains supported.
 ///
 /// # Safety
 ///
@@ -943,7 +1018,9 @@ pub unsafe extern "C" fn quicp_engine_open_flow(
     })
 }
 
-/// Starts or polls one replay-safe client flow open on an established connection.
+/// Starts one replay-safe client flow open on an established connection.
+/// After `WOULD_BLOCK`, use [`quicp_engine_poll_open_flow`]. Repeating this call with identical
+/// inputs remains supported.
 ///
 /// # Safety
 ///
@@ -995,6 +1072,40 @@ pub unsafe extern "C" fn quicp_engine_open_replay_safe_flow(
     })
 }
 
+/// Polls the current client OPEN without resubmitting its copied inputs.
+///
+/// Returns `WOULD_BLOCK` while pending and `NOT_READY` if no OPEN is pending. A terminal result
+/// is consumed once. `flow` is written only on success.
+///
+/// # Safety
+///
+/// `engine_pointer` must be live and calls on it serialized. `flow` must be writable and disjoint
+/// from the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn quicp_engine_poll_open_flow(
+    engine_pointer: *mut FfiEngine,
+    flow: *mut u64,
+) -> FfiStatus {
+    boundary(|| {
+        if !valid_engine_output(engine_pointer, flow) {
+            return FfiStatus::InvalidArgument;
+        }
+        let Ok(engine) = engine(engine_pointer) else {
+            return FfiStatus::InvalidArgument;
+        };
+        if engine.role != FfiRole::Client {
+            return FfiStatus::InvalidArgument;
+        }
+        match lock(&engine.state).open.poll() {
+            Ok(handle) => {
+                unsafe { flow.write(handle) };
+                FfiStatus::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
 unsafe fn poll_open(
     engine_pointer: *mut FfiEngine,
     host: &[u8],
@@ -1016,17 +1127,16 @@ unsafe fn poll_open(
     }
     let mut state = lock(&engine.state);
     match &state.open {
-        OpenState::Pending(active) if open_matches(active, host, port, replay) => {
-            return FfiStatus::WouldBlock;
-        }
-        OpenState::Ready(active, handle) if open_matches(active, host, port, replay) => {
-            unsafe { flow.write(*handle) };
-            state.open = OpenState::Idle;
-            return FfiStatus::Ok;
-        }
-        OpenState::Failed(active) if open_matches(active, host, port, replay) => {
-            state.open = OpenState::Idle;
-            return FfiStatus::Failed;
+        OpenState::Pending(active) | OpenState::Ready(active, _) | OpenState::Failed(active)
+            if open_matches(active, host, port, replay) =>
+        {
+            return match state.open.poll() {
+                Ok(handle) => {
+                    unsafe { flow.write(handle) };
+                    FfiStatus::Ok
+                }
+                Err(status) => status,
+            };
         }
         OpenState::Idle => {}
         _ => return FfiStatus::InvalidArgument,
