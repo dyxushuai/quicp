@@ -57,7 +57,18 @@ jobs:
             python3 -B benches/bencher.py "target/benchmarks/$sample" \
               > "target/benchmarks/results-$sample.json"
           done
+      - name: Diagnose loopback failure
+        if: failure()
+        run: |
+          binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "loopback" and .executable != null) | .executable' target/benchmarks/build.jsonl)
+          test -x "$binary"
+          for backend in packet ip; do
+            echo "Diagnostic: $backend, 64 KiB per sample"
+            if [ "$backend" = ip ]; then export QUICP_IP_RAW=1; fi
+            QUICP_ONLY=1 QUICP_TOTAL_BYTES=65536 timeout 60 "$binary" || true
+          done
       - name: Preserve measurements
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results

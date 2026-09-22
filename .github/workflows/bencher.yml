@@ -18,7 +18,7 @@ permissions:
   contents: read
   actions: read
   checks: write
-  pull-requests: read
+  pull-requests: write
 
 concurrency:
   group: bencher-publish
@@ -47,6 +47,7 @@ jobs:
             }
             let branch = 'main';
             let base = '';
+            let number = '';
             if (run.event === 'pull_request') {
               const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
                 ...context.repo, commit_sha: run.head_sha,
@@ -55,6 +56,7 @@ jobs:
                 pr.base.repo.full_name === run.repository.full_name && pr.base.ref === 'main');
               if (!pr) throw new Error('No matching pull request for this commit');
               branch = `pr-${pr.number}`;
+              number = String(pr.number);
               base = run.pull_requests.find(item => item.number === pr.number)?.base.sha || pr.base.sha;
             } else if (!['push', 'workflow_dispatch'].includes(run.event) || run.head_branch !== 'main') {
               throw new Error('Only main runs may update the baseline');
@@ -68,6 +70,7 @@ jobs:
             core.setOutput('sha', run.head_sha);
             core.setOutput('branch', branch);
             core.setOutput('base', base);
+            core.setOutput('pr_number', number);
             if (run.conclusion !== 'success') throw new Error('Benchmark measurement failed');
       # Only trusted default-branch code executes in this workflow. PR artifacts are data.
       - uses: actions/checkout@v4
@@ -96,6 +99,8 @@ jobs:
           BENCHER_TESTBED: github-ubuntu-24-04-x86-64-rust-1-88
           HEAD_SHA: ${{ steps.source.outputs.sha }}
           BASE_SHA: ${{ steps.source.outputs.base }}
+          PR_NUMBER: ${{ steps.source.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
           REGRESSION_LIMIT: ${{ vars.BENCHER_REGRESSION_LIMIT || '0.20' }}
         run: |
           test -n "$BENCHER_API_KEY" || { echo 'Set the BENCHER_API_KEY repository secret'; exit 1; }
@@ -110,7 +115,9 @@ jobs:
                 echo 'Missing complete baseline for the PR base commit; run Benchmarks on main or rebase the PR'
                 exit 1
               }
-            args+=(--start-point main --start-point-hash "$BASE_SHA" --start-point-reset)
+            args+=(--start-point main --start-point-hash "$BASE_SHA" --start-point-reset
+              --github-actions "$GH_TOKEN" --ci-number "$PR_NUMBER" --ci-id QUICP
+              --ci-public-links --ci-only-thresholds)
           fi
           for measure in latency delivery-p50-ns delivery-p95-ns delivery-p99-ns allocations-per-run rust-heap-bytes; do
             args+=(--threshold-measure "$measure" --threshold-test percentage

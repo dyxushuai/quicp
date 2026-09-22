@@ -143,6 +143,7 @@ mod linux {
             let mut tcp = Samples::preallocated();
             for sample in 0..SAMPLES {
                 let run = |mode, tuple| {
+                    eprintln!("loopback payload={payload_size} sample={sample} mode={mode:?}");
                     quicp_sample(payload_size, iterations, tuple, nodelay, mode).map_err(|error| {
                         if error.kind() == io::ErrorKind::PermissionDenied {
                             io::Error::new(
@@ -541,6 +542,7 @@ mod linux {
         let client_connection = async { client.connect().await.map_err(debug_io_error) };
         let (server_connection, client_connection) =
             tokio::try_join!(server_connection, client_connection)?;
+        eprintln!("loopback handshake complete");
 
         let server_flow = async {
             let pending = server_connection
@@ -560,6 +562,7 @@ mod linux {
                 .map_err(debug_io_error)
         };
         let (mut server_flow, mut client_flow) = tokio::try_join!(server_flow, client_flow)?;
+        eprintln!("loopback flow open");
         client_flow.set_nodelay(nodelay);
 
         let payload = vec![0x5a; payload_size];
