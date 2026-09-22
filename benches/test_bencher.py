@@ -3,10 +3,26 @@
 import io
 import unittest
 
-from bencher import PAYLOADS, SUITES, convert, validate
+from bencher import PAYLOADS, SUITES, convert, summarize, validate
 
 
 class BencherTest(unittest.TestCase):
+    def test_summary_preserves_comparisons_and_zero_baselines(self):
+        metric = {"threshold": {}, "boundary": {"baseline": 0},
+                  "metric": {"value": 0}, "measure": {"slug": "latency"}}
+        report = {"uuid": "report-id", "counts": {"alerts": {"total": 1}},
+                  "results": [[{"benchmark": {"name": "case|name"}, "measures": [metric]}]]}
+        self.assertIn("1 comparisons; 1 alerts", summarize(report))
+        self.assertIn("case\\|name | latency | 0 | 0 | 0.00%", summarize(report))
+        metric["metric"]["value"] = 120
+        self.assertIn("| 0 | 120 | n/a |", summarize(report))
+        metric["boundary"]["baseline"] = 100
+        self.assertIn("| 100 | 120 | +20.00% |", summarize(report))
+        metric["boundary"] = None
+        self.assertIn("0 comparisons", summarize(report))
+        del metric["threshold"]
+        self.assertNotIn("| case", summarize(report))
+
     def test_csv_and_report_boundaries(self):
         results = {}
         for suite, (modes, columns) in SUITES.items():

@@ -130,10 +130,10 @@ jobs:
           bencher run "${args[@]}" --format json --quiet \
             --file target/benchmarks/results-1.json \
             --file target/benchmarks/results-2.json \
-            --file target/benchmarks/results-3.json > target/benchmarks/report.json
+            --file target/benchmarks/results-3.json > "$RUNNER_TEMP/bencher-report.json"
           if [ "$BENCHER_BRANCH" != main ]; then
             jq -e '[.results[][] | .measures[] | select(.threshold != null)] |
-              length == 72 and all(.boundary != null)' target/benchmarks/report.json > /dev/null || {
+              length == 72 and all(.boundary != null)' "$RUNNER_TEMP/bencher-report.json" > /dev/null || {
                 echo 'Expected 72 regression comparisons with established boundaries'
                 exit 1
               }
@@ -172,6 +172,32 @@ jobs:
               raise SystemExit('Bencher failed to reject the synthetic regression')
           print(f'Bencher rejected the synthetic regression with {alerts} alerts')
           PY
+      - name: Publish a compact PR summary
+        if: always() && steps.source.outputs.pr_number
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.source.outputs.pr_number }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = `${process.env.RUNNER_TEMP}/bencher-report.json`;
+            if (!fs.existsSync(path) || fs.statSync(path).size === 0) return;
+            const { execFileSync } = require('node:child_process');
+            const summary = execFileSync('python3', ['-B', 'benches/bencher.py', '--summary', path], { encoding: 'utf8' });
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/bencher-summary.md`, summary);
+            await core.summary.addRaw(summary).write();
+            const marker = '<div id="bencher.dev/projects/quicp/id/QUICP"></div>';
+            const issue_number = Number(process.env.PR_NUMBER);
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number,
+            });
+            const previous = comments.find(comment => comment.user.login === 'github-actions[bot]' && comment.body.includes(marker));
+            const body = `${summary}\n${marker}`;
+            if (previous) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number, body });
+            }
       - name: Finish the required check
         if: always() && steps.source.outputs.check_id
         uses: actions/github-script@v7
@@ -180,6 +206,8 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         with:
           script: |
+            const fs = require('node:fs');
+            const summaryPath = `${process.env.RUNNER_TEMP}/bencher-summary.md`;
             const success = process.env.JOB_STATUS === 'success';
             await github.rest.checks.update({
               ...context.repo, check_run_id: Number(process.env.CHECK_ID),
@@ -187,6 +215,7 @@ jobs:
               details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               output: {
                 title: success ? 'No benchmark regression detected' : 'Benchmark regression check failed',
-                summary: 'Results: https://bencher.dev/perf/quicp. See the workflow log for alerts or setup errors.',
+                summary: fs.existsSync(summaryPath) ? fs.readFileSync(summaryPath, 'utf8') :
+                  'Results: https://bencher.dev/perf/quicp. See the workflow log for alerts or setup errors.',
               },
             });
