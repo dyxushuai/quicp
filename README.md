@@ -191,6 +191,7 @@ ordered TCP byte stream.
 - [Run the Rust examples](examples/README.md)
 - [Choose the SDK and ABI contract](sdk/README.md)
 - [Run the benchmark commands](benches/README.md)
+- [View benchmark history on Bencher](https://bencher.dev/perf/quicp)
 - [Follow the production acceptance checklist](docs/production-acceptance-checklist.md)
 - [Read the change log](CHANGELOG.md)
 
