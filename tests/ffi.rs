@@ -7,9 +7,10 @@ use quicp::ffi::{
     quicp_engine_connection_state, quicp_engine_create, quicp_engine_create_tls,
     quicp_engine_drive, quicp_engine_egress, quicp_engine_ingress, quicp_engine_issue_replay_token,
     quicp_engine_open_flow, quicp_engine_open_replay_safe_flow, quicp_engine_path_unavailable,
-    quicp_engine_poll_flow_request, quicp_engine_poll_replay_safe_flow_request,
-    quicp_engine_recovery_snapshot, quicp_engine_reject_pending_flow, quicp_flow_close,
-    quicp_flow_flush, quicp_flow_read, quicp_flow_shutdown, quicp_flow_write,
+    quicp_engine_poll_flow_request, quicp_engine_poll_open_flow,
+    quicp_engine_poll_replay_safe_flow_request, quicp_engine_recovery_snapshot,
+    quicp_engine_reject_pending_flow, quicp_flow_close, quicp_flow_flush, quicp_flow_read,
+    quicp_flow_shutdown, quicp_flow_write,
 };
 
 #[repr(C, align(8))]
@@ -520,25 +521,68 @@ fn synchronous_engine_connects_and_exchanges_flow_bytes() {
         let mut client_flow = 0;
         let mut server_flow = 0;
         let mut server_request = 0;
-        for _ in 0..1_000 {
-            let _ = quicp_engine_open_flow(
+        assert_eq!(
+            quicp_engine_poll_open_flow(client, &raw mut client_flow),
+            FfiStatus::NotReady
+        );
+        assert_eq!(
+            quicp_engine_poll_open_flow(server, &raw mut server_flow),
+            FfiStatus::InvalidArgument
+        );
+        assert_eq!(
+            quicp_engine_open_flow(
                 client,
                 host.as_ptr(),
                 u32::try_from(host.len()).unwrap(),
                 443,
                 &raw mut client_flow,
-            );
+            ),
+            FfiStatus::WouldBlock
+        );
+        // Legacy polling must reject a different request without consuming the active OPEN.
+        assert_eq!(
+            quicp_engine_open_flow(
+                client,
+                host.as_ptr(),
+                u32::try_from(host.len()).unwrap(),
+                80,
+                &raw mut client_flow,
+            ),
+            FfiStatus::InvalidArgument
+        );
+        for _ in 0..1_000 {
             if server_flow == 0 {
                 let _ = accept_request(server, false, &mut server_request, &mut server_flow);
             }
             progress(client, server, elapsed);
             elapsed += 1_000_000;
+            // Invalid outputs must never consume a completed OPEN or its flow handle.
+            for output in [
+                std::ptr::null_mut(),
+                std::ptr::without_provenance_mut(1),
+                client.cast(),
+            ] {
+                assert_eq!(
+                    quicp_engine_poll_open_flow(client, output),
+                    FfiStatus::InvalidArgument
+                );
+            }
+            if client_flow == 0 {
+                let status = quicp_engine_poll_open_flow(client, &raw mut client_flow);
+                assert!(matches!(status, FfiStatus::Ok | FfiStatus::WouldBlock));
+            }
             if client_flow != 0 && server_flow != 0 {
                 break;
             }
         }
         assert_ne!(client_flow, 0);
         assert_ne!(server_flow, 0);
+        let mut repeated = u64::MAX;
+        assert_eq!(
+            quicp_engine_poll_open_flow(client, &raw mut repeated),
+            FfiStatus::NotReady
+        );
+        assert_eq!(repeated, u64::MAX);
         assert_eq!(quicp_flow_flush(server, client_flow), FfiStatus::Closed);
         assert_eq!(quicp_flow_flush(client, server_flow), FfiStatus::Closed);
 
@@ -627,16 +671,19 @@ fn synchronous_engine_connects_and_exchanges_flow_bytes() {
         let mut request_port = 0;
         let mut request_initial = [0; 1];
         let mut request_initial_length = 0;
-        let mut open_status = FfiStatus::WouldBlock;
+        let mut open_status = quicp_engine_open_flow(
+            client,
+            denied_host.as_ptr(),
+            u32::try_from(denied_host.len()).unwrap(),
+            443,
+            &raw mut denied_flow,
+        );
+        assert_eq!(open_status, FfiStatus::WouldBlock);
         let mut reject_status = FfiStatus::WouldBlock;
         for _ in 0..1_000 {
-            open_status = quicp_engine_open_flow(
-                client,
-                denied_host.as_ptr(),
-                u32::try_from(denied_host.len()).unwrap(),
-                443,
-                &raw mut denied_flow,
-            );
+            if open_status == FfiStatus::WouldBlock {
+                open_status = quicp_engine_poll_open_flow(client, &raw mut denied_flow);
+            }
             if denied_request == 0 {
                 let status = quicp_engine_poll_flow_request(
                     server,
@@ -667,6 +714,10 @@ fn synchronous_engine_connects_and_exchanges_flow_bytes() {
         assert_eq!(reject_status, FfiStatus::Ok);
         assert_eq!(open_status, FfiStatus::Failed);
         assert_eq!(denied_flow, 0);
+        assert_eq!(
+            quicp_engine_poll_open_flow(client, &raw mut denied_flow),
+            FfiStatus::NotReady
+        );
 
         assert_eq!(quicp_engine_path_unavailable(client, 0), FfiStatus::Ok);
         for _ in 0..1_000 {
@@ -781,24 +832,33 @@ fn synchronous_engine_exposes_replay_safe_profile() {
 
         let host = b"early.example";
         let initial = b"replay-safe initial bytes";
+        let mut submitted_host = host.to_vec();
+        let mut submitted_initial = initial.to_vec();
         let mut client_flow = 0;
         let mut server_flow = 0;
         let mut server_request = 0;
-        let mut client_status = FfiStatus::WouldBlock;
+        let mut client_status = quicp_engine_open_replay_safe_flow(
+            client,
+            token.as_ptr(),
+            token_length,
+            42,
+            submitted_host.as_ptr(),
+            u32::try_from(submitted_host.len()).unwrap(),
+            443,
+            submitted_initial.as_ptr(),
+            u32::try_from(submitted_initial.len()).unwrap(),
+            &raw mut client_flow,
+        );
+        assert_eq!(client_status, FfiStatus::WouldBlock);
+        token.fill(0);
+        submitted_host.fill(0);
+        submitted_initial.fill(0);
+        drop((token, submitted_host, submitted_initial));
         let mut server_status = FfiStatus::WouldBlock;
         for _ in 0..2_000 {
-            client_status = quicp_engine_open_replay_safe_flow(
-                client,
-                token.as_ptr(),
-                token_length,
-                42,
-                host.as_ptr(),
-                u32::try_from(host.len()).unwrap(),
-                443,
-                initial.as_ptr(),
-                u32::try_from(initial.len()).unwrap(),
-                &raw mut client_flow,
-            );
+            if client_flow == 0 {
+                client_status = quicp_engine_poll_open_flow(client, &raw mut client_flow);
+            }
             if server_flow == 0 {
                 server_status = accept_request(server, true, &mut server_request, &mut server_flow);
             }

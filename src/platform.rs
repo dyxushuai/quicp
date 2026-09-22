@@ -4,8 +4,8 @@
 //! driven by the task that owns [`RingDevice`]; no executor or operating-system handle crosses
 //! this boundary.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use thiserror::Error;
 
@@ -35,15 +35,13 @@ impl Default for PlatformPacketConfig {
 
 /// A safe, allocation-owning packet seam for TUN, `VpnService`, and `packetFlow` adapters.
 ///
-/// Concurrent platform calls are serialized per direction, so the internal rings still observe
-/// one logical producer and one logical consumer. smoltcp itself remains single-owner.
+/// Concurrent platform calls briefly lock the corresponding packet pool. Packet copying and
+/// smoltcp callbacks run outside that lock; smoltcp itself remains single-owner.
 #[derive(Clone, Debug)]
 pub struct PlatformPacketBridge {
     ingress: Arc<PacketRing>,
     egress: Arc<PacketRing>,
     mtu: usize,
-    ingress_producer: Arc<Mutex<()>>,
-    egress_consumer: Arc<Mutex<()>>,
     smoltcp_owner: Arc<AtomicBool>,
 }
 
@@ -67,8 +65,6 @@ impl PlatformPacketBridge {
             ingress,
             egress,
             mtu: config.smoltcp.mtu,
-            ingress_producer: Arc::new(Mutex::new(())),
-            egress_consumer: Arc::new(Mutex::new(())),
             smoltcp_owner: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -82,7 +78,6 @@ impl PlatformPacketBridge {
     /// Returns an error when the packet is empty, exceeds the MTU, or the ingress queue is full.
     pub fn ingress_ip_borrowed(&self, packet: &[u8]) -> Result<(), PlatformError> {
         self.validate_packet_length(packet.len())?;
-        let _guard = lock_recover(&self.ingress_producer);
         self.ingress
             .push_copy(packet)
             .map_err(PlatformError::from_ring)?;
@@ -95,7 +90,6 @@ impl PlatformPacketBridge {
     ///
     /// Returns an error without dequeuing when the output buffer is too small.
     pub fn poll_egress_ip_into(&self, output: &mut [u8]) -> Result<Option<usize>, PlatformError> {
-        let _guard = lock_recover(&self.egress_consumer);
         self.egress
             .pop_into(output)
             .map_err(PlatformError::from_ring)
@@ -136,10 +130,6 @@ impl PlatformPacketBridge {
         }
         Ok(())
     }
-}
-
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Packet-bridge configuration, ownership, MTU, and bounded-queue errors.

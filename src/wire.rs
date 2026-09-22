@@ -1,3 +1,8 @@
+//! QUICP wire syntax and bounded decoding.
+//!
+//! This module validates canonical fields and frame lengths before exposing borrowed payloads.
+//! Flow admission, recovery memory accounting, and state mutation belong to its callers.
+
 use core::{fmt, net::IpAddr, num::NonZeroU16, str};
 use std::{sync::Arc, vec, vec::Vec};
 
@@ -8,8 +13,12 @@ use crate::config::{MAX_DECODER_WINDOW, MAX_REPAIR_SPAN};
 pub(crate) const QUICP_PROFILE: &[u8] = b"quicp";
 pub(crate) const SOURCE_DATAGRAM: u8 = 0x20;
 pub(crate) const REPAIR_DATAGRAM: u8 = 0x21;
-pub(crate) const REPAIR_DATAGRAM_HEADER_BYTES: usize = 17;
-pub(crate) const SOURCE_RECORD_MAX_OVERHEAD: usize = 31;
+// Type, repair ID, first symbol ID, span, symbol size, and coding seed.
+pub(crate) const REPAIR_DATAGRAM_HEADER_BYTES: usize = 1 + 4 + 4 + 2 + 2 + 4;
+// SOURCE header (type, symbol ID, count), then the largest single-record header
+// (flow ID, offset, flags, length). Varints occupy at most eight bytes.
+pub(crate) const SINGLE_SOURCE_MAX_OVERHEAD: usize = (1 + 4 + 1) + (8 + 8 + 1 + 8);
+pub(crate) const MAX_SOURCE_RECORDS: usize = 32;
 
 const FRAME_CAPABILITIES: u8 = 0x01;
 const FRAME_OPEN: u8 = 0x02;
@@ -22,11 +31,12 @@ const FRAME_EARLY_OPEN: u8 = 0x09;
 const CAPABILITY_DATAGRAM: u8 = 0x01;
 const CAPABILITY_RLC: u8 = 0x02;
 const CAPABILITY_REPLAY_SAFE: u8 = 0x08;
-const CAPABILITY_MASK: u64 = 0x0b;
+const CAPABILITY_MASK: u8 = CAPABILITY_DATAGRAM | CAPABILITY_RLC | CAPABILITY_REPLAY_SAFE;
 pub(crate) const MAX_WIRE_OFFSET: u64 = (1 << 62) - 1;
 
 pub(crate) const MAX_CANONICAL_HOST_BYTES: usize = 253;
 pub(crate) const MAX_OPEN_FRAME_BYTES: usize = MAX_CANONICAL_HOST_BYTES + 3;
+const _: () = assert!(MAX_CANONICAL_HOST_BYTES <= u8::MAX as usize);
 
 /// Validated lowercase ASCII DNS name used by the QUICP OPEN message.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -62,6 +72,12 @@ impl CanonicalHost {
     /// Returns the canonical host text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn wire_len(&self) -> u8 {
+        // Only parse() constructs this type; its limit is checked at compile time above.
+        self.0.len() as u8
     }
 }
 
@@ -107,7 +123,7 @@ impl OpenRequest {
                 available: output.len(),
             });
         }
-        output[0] = u8::try_from(host.len()).map_err(|_| WireError::InvalidHost)?;
+        output[0] = self.host.wire_len();
         output[1..=host.len()].copy_from_slice(host);
         output[1 + host.len()..required].copy_from_slice(&self.port.get().to_be_bytes());
         Ok(required)
@@ -303,7 +319,28 @@ pub(crate) struct SourceRecord<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceDatagram<'a> {
     pub(crate) symbol_id: u32,
-    pub(crate) records: Vec<SourceRecord<'a>>,
+    first_record: SourceRecord<'a>,
+    remaining_records: &'a [u8],
+    record_count: usize,
+}
+
+impl<'a> SourceDatagram<'a> {
+    pub(crate) fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    pub(crate) fn single_record(&self) -> Option<SourceRecord<'a>> {
+        (self.record_count == 1).then_some(self.first_record)
+    }
+
+    /// Traverses the validated bytes without allocating record storage.
+    pub(crate) fn records(
+        &self,
+    ) -> impl Iterator<Item = Result<SourceRecord<'a>, CodecError>> + '_ {
+        let mut cursor = Cursor::new(self.remaining_records);
+        std::iter::once(Ok(self.first_record))
+            .chain((1..self.record_count).map(move |_| decode_source_record(&mut cursor)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,24 +369,53 @@ pub(crate) enum CodecError {
     Limit,
 }
 
+fn control_payload_range(
+    input: &[u8],
+    max_frame_bytes: usize,
+) -> Result<core::ops::Range<usize>, CodecError> {
+    let rest = input.get(1..).ok_or(CodecError::Truncated)?;
+    let (length, length_bytes) = decode_varint(rest)?;
+    let length = usize::try_from(length).map_err(|_| CodecError::Limit)?;
+    let header = 1 + length_bytes;
+    let end = header
+        .checked_add(length)
+        .filter(|end| *end <= max_frame_bytes)
+        .ok_or(CodecError::Limit)?;
+    Ok(header..end)
+}
+
+/// Returns the bounded byte count needed for the next prefix or complete frame.
+pub(crate) fn control_frame_read_target(
+    input: &[u8],
+    max_frame_bytes: usize,
+) -> Result<usize, CodecError> {
+    match control_payload_range(input, max_frame_bytes) {
+        Ok(payload) => Ok(payload.end),
+        Err(CodecError::Truncated) => {
+            let needed = input.get(1).map_or(2, |first| 1 + (1usize << (first >> 6)));
+            if needed > max_frame_bytes {
+                return Err(CodecError::Limit);
+            }
+            Ok(needed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn decode_control(
     input: &[u8],
     max_ack_ranges: usize,
+    max_frame_bytes: usize,
 ) -> Result<(ControlFrame<'_>, usize), CodecError> {
-    let Some((&kind, rest)) = input.split_first() else {
-        return Err(CodecError::Truncated);
-    };
-    let (length, length_bytes) = decode_varint(rest)?;
-    let length = usize::try_from(length).map_err(|_| CodecError::Limit)?;
-    let header = 1usize.checked_add(length_bytes).ok_or(CodecError::Limit)?;
-    let end = header.checked_add(length).ok_or(CodecError::Limit)?;
-    let payload = input.get(header..end).ok_or(CodecError::Truncated)?;
+    let range = control_payload_range(input, max_frame_bytes)?;
+    let end = range.end;
+    let payload = input.get(range).ok_or(CodecError::Truncated)?;
     let mut cursor = Cursor::new(payload);
-    let frame = match kind {
+    let frame = match input[0] {
         FRAME_CAPABILITIES => {
             let flags = cursor.varint()?;
-            if flags > CAPABILITY_MASK {
+            if flags & !u64::from(CAPABILITY_MASK) != 0 {
                 return Err(CodecError::InvalidField);
             }
             let capabilities = Capabilities {
@@ -554,46 +620,6 @@ pub(crate) fn decode_source(
     Ok(source)
 }
 
-pub(crate) fn decode_source_single(
-    input: &[u8],
-    max_symbol_bytes: usize,
-) -> Result<(u32, u64, u64, bool, core::ops::Range<usize>), CodecError> {
-    if input.len() > max_symbol_bytes {
-        return Err(CodecError::Limit);
-    }
-    let mut cursor = Cursor::new(input);
-    if cursor.u8()? != SOURCE_DATAGRAM {
-        return Err(CodecError::UnknownType);
-    }
-    let symbol_id = cursor.u32()?;
-    if cursor.u8()? != 1 {
-        return Err(CodecError::Limit);
-    }
-    let flow_id = cursor.varint()?;
-    let offset = cursor.varint()?;
-    let flags = cursor.u8()?;
-    if flags & !1 != 0 {
-        return Err(CodecError::InvalidField);
-    }
-    let length = usize::try_from(cursor.varint()?).map_err(|_| CodecError::Limit)?;
-    if length == 0 {
-        return Err(CodecError::InvalidField);
-    }
-    validate_wire_range(offset, length)?;
-    let start = cursor.offset;
-    cursor.take(length)?;
-    if !cursor.is_empty() {
-        return Err(CodecError::TrailingBytes);
-    }
-    Ok((
-        symbol_id,
-        flow_id,
-        offset,
-        flags == 1,
-        start..start + length,
-    ))
-}
-
 pub(crate) fn decode_source_padded(
     input: &[u8],
     max_records: usize,
@@ -623,29 +649,41 @@ fn decode_source_inner(
     if count == 0 || count > max_records {
         return Err(CodecError::Limit);
     }
-    let mut records = Vec::with_capacity(count);
-    for _ in 0..count {
-        let flow_id = cursor.varint()?;
-        let offset = cursor.varint()?;
-        let flags = cursor.u8()?;
-        if flags & !1 != 0 {
-            return Err(CodecError::InvalidField);
-        }
-        let length = usize::try_from(cursor.varint()?).map_err(|_| CodecError::Limit)?;
-        if length == 0 {
-            return Err(CodecError::InvalidField);
-        }
-        validate_wire_range(offset, length)?;
-        let data = cursor.take(length)?;
-        records.push(SourceRecord {
-            flow_id,
-            offset,
-            fin: flags == 1,
-            data,
-        });
+    let first_record = decode_source_record(&mut cursor)?;
+    let remaining_start = cursor.offset;
+    for _ in 1..count {
+        decode_source_record(&mut cursor)?;
     }
     let consumed = cursor.offset;
-    Ok((SourceDatagram { symbol_id, records }, consumed))
+    Ok((
+        SourceDatagram {
+            symbol_id,
+            first_record,
+            remaining_records: &input[remaining_start..consumed],
+            record_count: count,
+        },
+        consumed,
+    ))
+}
+
+fn decode_source_record<'a>(cursor: &mut Cursor<'a>) -> Result<SourceRecord<'a>, CodecError> {
+    let flow_id = cursor.varint()?;
+    let offset = cursor.varint()?;
+    let flags = cursor.u8()?;
+    if flags & !1 != 0 {
+        return Err(CodecError::InvalidField);
+    }
+    let length = usize::try_from(cursor.varint()?).map_err(|_| CodecError::Limit)?;
+    if length == 0 {
+        return Err(CodecError::InvalidField);
+    }
+    validate_wire_range(offset, length)?;
+    Ok(SourceRecord {
+        flow_id,
+        offset,
+        fin: flags == 1,
+        data: cursor.take(length)?,
+    })
 }
 
 fn validate_wire_range(offset: u64, length: usize) -> Result<(), CodecError> {
@@ -853,7 +891,8 @@ mod protocol_tests {
             if name == "source" {
                 let decoded = decode_source(&bytes, 8, 1200).unwrap();
                 let mut encoded = Vec::new();
-                encode_source(decoded.symbol_id, &decoded.records, &mut encoded).unwrap();
+                let records = decoded.records().collect::<Result<Vec<_>, _>>().unwrap();
+                encode_source(decoded.symbol_id, &records, &mut encoded).unwrap();
                 assert_eq!(encoded, bytes, "{name}");
                 continue;
             }
@@ -865,11 +904,11 @@ mod protocol_tests {
                 continue;
             }
             if name.starts_with("invalid_") {
-                assert!(decode_control(&bytes, 32).is_err(), "{name}");
+                assert!(decode_control(&bytes, 32, 1200).is_err(), "{name}");
                 continue;
             }
             let (frame, consumed) =
-                decode_control(&bytes, 32).unwrap_or_else(|error| panic!("{name}: {error}"));
+                decode_control(&bytes, 32, 1200).unwrap_or_else(|error| panic!("{name}: {error}"));
             assert_eq!(consumed, bytes.len(), "{name}");
             let mut encoded = Vec::new();
             encode_control(&frame, &mut encoded);
@@ -880,21 +919,47 @@ mod protocol_tests {
     #[test]
     fn rejects_noncanonical_and_excessive_ack_ranges() {
         assert_eq!(
-            decode_control(&hex("054001"), 32),
+            decode_control(&hex("054001"), 32, 1200),
             Err(CodecError::NonCanonical)
         );
         assert_eq!(
-            decode_control(&hex("0406000140404080"), 0),
+            decode_control(&hex("0406000140404080"), 0, 1200),
             Err(CodecError::Limit)
         );
     }
 
     #[test]
+    fn capabilities_reject_every_reserved_flag() {
+        for flags in 0..=u8::MAX {
+            let frame = ControlFrame::Capabilities(Capabilities {
+                flags,
+                max_symbol: 1200,
+                max_span: 16,
+                decoder_window: 512,
+                max_ack_ranges: 32,
+            });
+            let mut encoded = Vec::new();
+            encode_control(&frame, &mut encoded);
+            let decoded = decode_control(&encoded, 32, 1200);
+            if flags & !CAPABILITY_MASK == 0 {
+                assert_eq!(decoded, Ok((frame, encoded.len())));
+            } else {
+                assert_eq!(decoded, Err(CodecError::InvalidField));
+            }
+        }
+    }
+
+    #[test]
     fn recovered_source_accepts_only_zero_padding() {
         let source = hex("2000000001010000000468656c70");
-        let (symbol_id, flow_id, offset, fin, data) = decode_source_single(&source, 1200).unwrap();
-        assert_eq!((symbol_id, flow_id, offset, fin), (1, 0, 0, false));
-        assert_eq!(&source[data], b"help");
+        let decoded = decode_source(&source, 1, 1200).unwrap();
+        let record = decoded.single_record().unwrap();
+        assert_eq!(
+            (decoded.symbol_id, record.flow_id, record.offset, record.fin),
+            (1, 0, 0, false)
+        );
+        assert_eq!(record.data, b"help");
+        assert_eq!(record.data.as_ptr(), source[source.len() - 4..].as_ptr());
         let mut padded = source.clone();
         padded.extend_from_slice(&[0, 0]);
         assert_eq!(
@@ -905,7 +970,8 @@ mod protocol_tests {
             decode_source_padded(&padded, 8, 1200)
                 .expect("zero-padded recovered source")
                 .0
-                .records[0]
+                .single_record()
+                .unwrap()
                 .data,
             b"help"
         );
@@ -928,10 +994,6 @@ mod protocol_tests {
         source.push(b'x');
 
         assert_eq!(
-            decode_source_single(&source, 1200),
-            Err(CodecError::InvalidField)
-        );
-        assert_eq!(
             decode_source(&source, 1, 1200),
             Err(CodecError::InvalidField)
         );
@@ -948,5 +1010,106 @@ mod protocol_tests {
             ),
             Err(CodecError::InvalidField)
         );
+    }
+
+    #[test]
+    fn source_view_validates_every_record_before_exposing_data() {
+        let records = [
+            SourceRecord {
+                flow_id: 1,
+                offset: 0,
+                fin: false,
+                data: b"first",
+            },
+            SourceRecord {
+                flow_id: 2,
+                offset: 64,
+                fin: true,
+                data: b"second",
+            },
+        ];
+        let mut encoded = Vec::new();
+        encode_source(7, &records, &mut encoded).unwrap();
+        let decoded = decode_source(&encoded, 2, 1200).unwrap();
+        assert_eq!(decoded.record_count(), 2);
+        assert_eq!(decoded.single_record(), None);
+        assert_eq!(
+            decoded.records().collect::<Result<Vec<_>, _>>().unwrap(),
+            records
+        );
+        for end in 0..encoded.len() {
+            assert!(decode_source(&encoded[..end], 2, 1200).is_err());
+            assert!(decode_source_padded(&encoded[..end], 2, 1200).is_err());
+        }
+        assert_eq!(decode_source(&encoded, 1, 1200), Err(CodecError::Limit));
+
+        let canonical_len = encoded.len();
+        encoded.extend_from_slice(&[0, 0]);
+        let (padded, consumed) = decode_source_padded(&encoded, 2, 1200).unwrap();
+        assert_eq!(consumed, canonical_len);
+        assert_eq!(
+            padded.records().collect::<Result<Vec<_>, _>>().unwrap(),
+            records
+        );
+
+        // The second record's reserved flag must invalidate the entire symbol.
+        encoded[canonical_len - records[1].data.len() - 2] = 2;
+        assert_eq!(
+            decode_source_padded(&encoded, 2, 1200),
+            Err(CodecError::InvalidField)
+        );
+    }
+
+    #[test]
+    fn bounded_control_framing_handles_splits_and_concatenation() {
+        for length in [1, 64, 16_384] {
+            let data = vec![b'x'; length];
+            let frame = ControlFrame::StreamData {
+                offset: 7,
+                fin: false,
+                data: &data,
+            };
+            let mut encoded = Vec::new();
+            encode_control(&frame, &mut encoded);
+            let total = encoded.len();
+            for end in 0..total {
+                let target = control_frame_read_target(&encoded[..end], total).unwrap();
+                assert!(target > end && target <= total);
+                assert_eq!(
+                    decode_control(&encoded[..end], 32, total),
+                    Err(CodecError::Truncated)
+                );
+            }
+            assert_eq!(control_frame_read_target(&encoded, total), Ok(total));
+            assert_eq!(
+                decode_control(&encoded, 32, total),
+                Ok((frame.clone(), total))
+            );
+            encoded.extend_from_within(..);
+            assert_eq!(control_frame_read_target(&encoded, total), Ok(total));
+            assert_eq!(decode_control(&encoded, 32, total), Ok((frame, total)));
+            assert_eq!(
+                control_frame_read_target(&encoded, total - 1),
+                Err(CodecError::Limit)
+            );
+        }
+
+        for prefix in [hex("034001"), hex("0380000001"), hex("03c000000000000001")] {
+            assert_eq!(
+                control_frame_read_target(&prefix, 1200),
+                Err(CodecError::NonCanonical)
+            );
+            assert_eq!(
+                decode_control(&prefix, 32, 1200),
+                Err(CodecError::NonCanonical)
+            );
+        }
+        let mut oversized = vec![FRAME_STREAM_DATA];
+        encode_varint(1 << 30, &mut oversized);
+        assert_eq!(
+            control_frame_read_target(&oversized, 1200),
+            Err(CodecError::Limit)
+        );
+        assert_eq!(decode_control(&oversized, 32, 1200), Err(CodecError::Limit));
     }
 }

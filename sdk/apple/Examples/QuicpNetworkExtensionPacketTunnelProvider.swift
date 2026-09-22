@@ -10,6 +10,7 @@ final class QuicpNetworkExtensionPacketTunnelProvider: NEPacketTunnelProvider {
   private let queue = DispatchQueue(label: "io.quicp.network-extension")
   private var engine: QuicpEngine?
   private var flow: QuicpFlow?
+  private var openingFlow = false
   private var underlay: NWConnection?
   private var startedAt: DispatchTime?
   private var startupCompletion: ((Error?) -> Void)?
@@ -129,12 +130,17 @@ final class QuicpNetworkExtensionPacketTunnelProvider: NEPacketTunnelProvider {
 
   private func advanceStartup(_ engine: QuicpEngine) {
     guard startupCompletion != nil, flow == nil, engine.connectionStatus == .ok else { return }
-    switch engine.openFlow(host: "packet-tunnel.internal", port: 1) {
+    let result = openingFlow
+      ? engine.pollOpenFlow()
+      : engine.openFlow(host: "packet-tunnel.internal", port: 1)
+    switch result {
     case .failure(.wouldBlock):
+      openingFlow = true
       return
     case .failure(let error):
       fail(error)
     case .success(let flow):
+      openingFlow = false
       self.flow = flow
       let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "203.0.113.10")
       let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.252"])
@@ -256,6 +262,7 @@ final class QuicpNetworkExtensionPacketTunnelProvider: NEPacketTunnelProvider {
     underlay = nil
     _ = flow?.close()
     flow = nil
+    openingFlow = false
     _ = engine?.close()
     engine = nil
     startedAt = nil

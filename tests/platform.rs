@@ -117,6 +117,81 @@ fn smoltcp_tx_token_bounds_a_malformed_length() {
 }
 
 #[test]
+fn smoltcp_tokens_release_slots_after_drop_and_unwind() {
+    let config = PlatformPacketConfig {
+        packet_capacity: 1,
+        smoltcp: SmoltcpConfig::default(),
+    };
+    let bridge = PlatformPacketBridge::new(config).expect("bridge");
+    let mut device = bridge.smoltcp_device(config.smoltcp).expect("device");
+    drop(device.transmit(Instant::ZERO).expect("unused transmit"));
+    bridge.ingress_ip_borrowed(&[1]).expect("first ingress");
+    drop(device.receive(Instant::ZERO).expect("unused token pair"));
+
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device
+                .transmit(Instant::ZERO)
+                .expect("transmit after drop")
+                .consume(1, |_| panic!("cancel transmit"));
+        }))
+        .is_err()
+    );
+    bridge.ingress_ip_borrowed(&[2]).expect("second ingress");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (rx, _tx) = device.receive(Instant::ZERO).expect("receive after drop");
+            rx.consume(|_| panic!("cancel receive"));
+        }))
+        .is_err()
+    );
+    let mut output = [0; 1];
+    assert_eq!(bridge.poll_egress_ip_into(&mut output), Ok(None));
+
+    drop(device);
+    let mut device = bridge.smoltcp_device(config.smoltcp).expect("new owner");
+    bridge.ingress_ip_borrowed(&[3]).expect("reused ingress");
+    let (rx, tx) = device.receive(Instant::ZERO).expect("reused token pair");
+    thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                rx.consume(|packet| assert_eq!(packet, [3]));
+                tx.consume(1, |packet| packet[0] = 4);
+            })
+            .join()
+            .expect("tokens remain sendable");
+    });
+    assert_eq!(bridge.poll_egress_ip_into(&mut output), Ok(Some(1)));
+    assert_eq!(output, [4]);
+}
+
+#[test]
+fn host_can_drain_egress_during_a_transmit_callback() {
+    let config = PlatformPacketConfig {
+        packet_capacity: 2,
+        smoltcp: SmoltcpConfig::default(),
+    };
+    let bridge = PlatformPacketBridge::new(config).expect("bridge");
+    let mut device = bridge.smoltcp_device(config.smoltcp).expect("device");
+    device
+        .transmit(Instant::ZERO)
+        .expect("first slot")
+        .consume(1, |packet| packet[0] = 1);
+    device
+        .transmit(Instant::ZERO)
+        .expect("second slot")
+        .consume(1, |packet| {
+            let mut output = [0; 1];
+            assert_eq!(bridge.poll_egress_ip_into(&mut output), Ok(Some(1)));
+            assert_eq!(output, [1]);
+            packet[0] = 2;
+        });
+    let mut output = [0; 1];
+    assert_eq!(bridge.poll_egress_ip_into(&mut output), Ok(Some(1)));
+    assert_eq!(output, [2]);
+}
+
+#[test]
 fn platform_bridge_serializes_parallel_ingress_calls() {
     let bridge =
         Arc::new(PlatformPacketBridge::new(PlatformPacketConfig::default()).expect("bridge"));

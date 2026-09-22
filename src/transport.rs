@@ -56,6 +56,15 @@ pub(crate) use tokio_adapter::{SYN_COOKIE_EPOCH_SECONDS, configure_fake_tcp_path
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 const BACKUP_PATH_RETRY_LIMIT: u8 = 16;
 const BACKUP_PATH_RETRY_DELAY: Duration = Duration::from_millis(20);
+const _: () =
+    assert!(crate::wire::REPAIR_DATAGRAM_HEADER_BYTES < crate::config::MIN_QUIC_PAYLOAD as usize);
+
+/// Retains the endpoint's runtime and recovery ceiling as one construction result.
+struct ConfiguredEndpoint {
+    backend: noq::Endpoint,
+    runtime: Arc<dyn noq::Runtime>,
+    max_symbol_bytes: usize,
+}
 
 #[derive(Debug)]
 pub(crate) struct MultipathSocket {
@@ -249,7 +258,7 @@ pub struct Client {
     endpoint: noq::Endpoint,
     server_addr: SocketAddr,
     server_name: String,
-    runtime: Option<Arc<dyn noq::Runtime>>,
+    runtime: Arc<dyn noq::Runtime>,
     runtime_shutdown: Option<Arc<AtomicBool>>,
     backup_path: Option<BackupPath>,
     flow_buffer_bytes: usize,
@@ -270,58 +279,59 @@ impl Client {
         server_addr: SocketAddr,
         server_name: String,
     ) -> Self {
-        Self::from_endpoint_with_runtime(
-            endpoint,
-            server_addr,
-            server_name,
-            Some(Arc::new(noq::TokioRuntime)),
-            None,
-            None,
-            crate::flow::RELAY_BUFFER_BYTES,
-            true,
-            crate::config::RecoveryConfig::default(),
-            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
-            1200,
+        let config = ClientConfig::insecure(
+            crate::config::Multipath::single(
+                crate::config::PathCandidate::new(endpoint.local_addr().unwrap().ip(), server_addr)
+                    .unwrap(),
+            )
+            .unwrap(),
+            crate::config::CarrierConfig::default(),
         )
+        .unwrap();
+        let mut client = Self::from_configured_endpoint(
+            ConfiguredEndpoint {
+                backend: endpoint,
+                runtime: Arc::new(noq::TokioRuntime),
+                max_symbol_bytes: 1200,
+            },
+            ValidatedClientConfig::new(&config).unwrap(),
+            None,
+        );
+        client.server_name = server_name;
+        client
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_endpoint_with_runtime(
-        endpoint: noq::Endpoint,
-        server_addr: SocketAddr,
-        server_name: String,
-        runtime: Option<Arc<dyn noq::Runtime>>,
+    fn from_configured_endpoint(
+        endpoint: ConfiguredEndpoint,
+        config: ValidatedClientConfig<'_>,
         runtime_shutdown: Option<Arc<AtomicBool>>,
-        backup_path: Option<BackupPath>,
-        flow_buffer_bytes: usize,
-        default_nodelay: bool,
-        recovery: crate::config::RecoveryConfig,
-        recovery_memory: Arc<RecoveryMemoryBudget>,
-        max_symbol_bytes: usize,
     ) -> Self {
+        let transport = config.transport();
         Self {
-            endpoint,
-            server_addr,
-            server_name,
-            runtime,
+            endpoint: endpoint.backend,
+            server_addr: config.multipath.candidates[0].server_addr,
+            server_name: config
+                .tls()
+                .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name().to_owned()),
+            runtime: endpoint.runtime,
             runtime_shutdown,
-            backup_path,
-            flow_buffer_bytes,
-            default_nodelay,
-            recovery,
-            recovery_memory,
-            max_symbol_bytes,
+            backup_path: configured_backup_path(&config),
+            flow_buffer_bytes: transport.flow_write_buffer_bytes as usize,
+            default_nodelay: transport.default_nodelay,
+            recovery: transport.recovery,
+            recovery_memory: Arc::new(RecoveryMemoryBudget::new(
+                transport.recovery_memory_budget_bytes,
+            )),
+            max_symbol_bytes: endpoint.max_symbol_bytes,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_socket_with_options_internal(
         config: ValidatedClientConfig<'_>,
         socket: Box<dyn noq::AsyncUdpSocket>,
         runtime: Arc<dyn noq::Runtime>,
         runtime_shutdown: Option<Arc<AtomicBool>>,
         server_addr: SocketAddr,
-        server_name: impl Into<String>,
         options: &TransportOptions,
         adapter_mtu: Option<u16>,
     ) -> Result<Self, TransportError> {
@@ -332,28 +342,17 @@ impl Client {
             )
             .into());
         }
-        let runtime_for_client = Arc::clone(&runtime);
-        let (endpoint, payload_ceiling) = build_client_endpoint_with_validated_config(
+        let endpoint = build_client_endpoint_with_validated_config(
             config,
             socket,
             runtime,
             options,
             adapter_mtu,
         )?;
-        Ok(Self::from_endpoint_with_runtime(
+        Ok(Self::from_configured_endpoint(
             endpoint,
-            server_addr,
-            server_name.into(),
-            Some(runtime_for_client),
+            config,
             runtime_shutdown,
-            configured_backup_path(&config),
-            config.transport().flow_write_buffer_bytes as usize,
-            config.transport().default_nodelay,
-            config.transport().recovery,
-            Arc::new(RecoveryMemoryBudget::new(
-                config.transport().recovery_memory_budget_bytes,
-            )),
-            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
         ))
     }
 
@@ -408,9 +407,6 @@ impl Client {
         let adapter_mtu = u16::try_from(socket.mtu()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "host datagram MTU exceeds u16")
         })?;
-        let server_name = config
-            .tls()
-            .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name().to_owned());
         let runtime_shutdown = Some(runtime.shutdown_signal());
         Self::from_socket_with_options_internal(
             config,
@@ -418,7 +414,6 @@ impl Client {
             runtime,
             runtime_shutdown,
             server_addr,
-            server_name,
             options,
             Some(adapter_mtu),
         )
@@ -461,9 +456,6 @@ impl Client {
             .and_then(|mtu| u16::try_from(mtu).ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid host MTU"))?;
         let server_addr = sockets[0].peer_addr();
-        let server_name = config
-            .tls()
-            .map_or_else(|| "quicp".to_owned(), |tls| tls.server_name().to_owned());
         let socket = MultipathSocket::new(
             (Box::new(sockets[0].clone()), sockets[0].peer_addr()),
             (Box::new(sockets[1].clone()), sockets[1].peer_addr()),
@@ -475,7 +467,6 @@ impl Client {
             runtime,
             runtime_shutdown,
             server_addr,
-            server_name,
             &TransportOptions::default(),
             Some(adapter_mtu),
         )
@@ -578,11 +569,6 @@ impl Client {
     }
 
     fn prepare_connection(&self, backend: noq::Connection) -> Result<Connection, ConnectionError> {
-        let runtime = self.runtime.as_ref().ok_or_else(|| {
-            ConnectionError::Multipath(Box::new(io::Error::other(
-                "connection runtime is unavailable",
-            )))
-        })?;
         let mode = self
             .backup_path
             .map_or(MultipathMode::Off, |_| MultipathMode::Failover);
@@ -599,7 +585,7 @@ impl Client {
             path_manager,
             self.flow_buffer_bytes,
             self.default_nodelay,
-            runtime,
+            &self.runtime,
             self.runtime_shutdown.clone(),
             self.recovery,
             Arc::clone(&self.recovery_memory),
@@ -615,19 +601,10 @@ impl Client {
         // reported back-to-back and the bounded stream must not lose either event.
         let path_events = connection.backend.path_events();
         let backup_path = if let Some(backup) = self.backup_path {
-            let Some(runtime) = self.runtime.as_ref() else {
-                connection.backend.close(
-                    backend_error_code(ApplicationError::MultipathRequired),
-                    b"missing multipath runtime",
-                );
-                return Err(ConnectionError::Multipath(Box::new(io::Error::other(
-                    "multipath runtime is unavailable",
-                ))));
-            };
             let path = match open_backup_path(
                 &connection.backend,
                 noq::FourTuple::new(backup.remote, Some(backup.local_ip)),
-                runtime.as_ref(),
+                self.runtime.as_ref(),
             )
             .await
             {
@@ -660,19 +637,17 @@ impl Client {
                     ConnectionError::Multipath(Box::new(error))
                 })?;
         }
-        if let Some(runtime) = self.runtime.as_ref() {
-            spawn_path_event_monitor(
-                runtime,
-                connection.backend.weak_handle(),
-                Arc::clone(
-                    connection
-                        .path_manager
-                        .as_ref()
-                        .expect("client connection retains a path manager"),
-                ),
-                path_events,
-            );
-        }
+        spawn_path_event_monitor(
+            &self.runtime,
+            connection.backend.weak_handle(),
+            Arc::clone(
+                connection
+                    .path_manager
+                    .as_ref()
+                    .expect("client connection retains a path manager"),
+            ),
+            path_events,
+        );
         connection.backup_path = backup_path;
         Ok(connection)
     }
@@ -762,46 +737,43 @@ impl Server {
         any(target_os = "linux", target_os = "macos", windows)
     ))]
     fn from_endpoint(endpoint: noq::Endpoint) -> Self {
-        Self::from_endpoint_with_limits(
-            endpoint,
-            128,
-            16,
-            crate::flow::RELAY_BUFFER_BYTES,
-            true,
-            Arc::new(noq::TokioRuntime),
+        let config = ServerConfig::insecure(
+            vec![endpoint.local_addr().unwrap()],
+            crate::config::CarrierConfig::default(),
+        )
+        .unwrap();
+        Self::from_configured_endpoint(
+            ConfiguredEndpoint {
+                backend: endpoint,
+                runtime: Arc::new(noq::TokioRuntime),
+                max_symbol_bytes: 1200,
+            },
+            ValidatedServerConfig::new(&config).unwrap(),
             None,
-            crate::config::RecoveryConfig::default(),
-            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
-            1200,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_endpoint_with_limits(
-        endpoint: noq::Endpoint,
-        max_active_connections: usize,
-        max_active_connections_per_peer: usize,
-        flow_buffer_bytes: usize,
-        default_nodelay: bool,
-        runtime: Arc<dyn noq::Runtime>,
+    fn from_configured_endpoint(
+        endpoint: ConfiguredEndpoint,
+        config: ValidatedServerConfig<'_>,
         runtime_shutdown: Option<Arc<AtomicBool>>,
-        recovery: crate::config::RecoveryConfig,
-        recovery_memory: Arc<RecoveryMemoryBudget>,
-        max_symbol_bytes: usize,
     ) -> Self {
+        let transport = config.transport();
         Self {
-            endpoint,
+            endpoint: endpoint.backend,
             active_connections: Arc::new(ConnectionBudget::new(
-                max_active_connections,
-                max_active_connections_per_peer,
+                usize::from(transport.max_active_connections),
+                usize::from(transport.max_active_connections_per_peer),
             )),
-            flow_buffer_bytes,
-            default_nodelay,
-            runtime,
+            flow_buffer_bytes: transport.flow_write_buffer_bytes as usize,
+            default_nodelay: transport.default_nodelay,
+            runtime: endpoint.runtime,
             runtime_shutdown,
-            recovery,
-            recovery_memory,
-            max_symbol_bytes,
+            recovery: transport.recovery,
+            recovery_memory: Arc::new(RecoveryMemoryBudget::new(
+                transport.recovery_memory_budget_bytes,
+            )),
+            max_symbol_bytes: endpoint.max_symbol_bytes,
         }
     }
 
@@ -813,27 +785,17 @@ impl Server {
         options: &TransportOptions,
         adapter_mtu: Option<u16>,
     ) -> Result<Self, TransportError> {
-        let runtime_for_server = Arc::clone(&runtime);
-        let (endpoint, payload_ceiling) = build_server_endpoint_with_validated_config(
+        let endpoint = build_server_endpoint_with_validated_config(
             config,
             socket,
             runtime,
             options,
             adapter_mtu,
         )?;
-        Ok(Self::from_endpoint_with_limits(
+        Ok(Self::from_configured_endpoint(
             endpoint,
-            usize::from(config.transport().max_active_connections),
-            usize::from(config.transport().max_active_connections_per_peer),
-            config.transport().flow_write_buffer_bytes as usize,
-            config.transport().default_nodelay,
-            runtime_for_server,
+            config,
             runtime_shutdown,
-            config.transport().recovery,
-            Arc::new(RecoveryMemoryBudget::new(
-                config.transport().recovery_memory_budget_bytes,
-            )),
-            usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
         ))
     }
 
@@ -1546,7 +1508,7 @@ fn build_client_endpoint_with_validated_config(
     runtime: Arc<dyn noq::Runtime>,
     options: &TransportOptions,
     adapter_mtu: Option<u16>,
-) -> Result<(noq::Endpoint, u16), TransportError> {
+) -> Result<ConfiguredEndpoint, TransportError> {
     let payload_ceiling =
         effective_payload_ceiling_inner(&config.transport().mtu, socket.as_ref(), adapter_mtu)?;
     let transport =
@@ -1560,15 +1522,24 @@ fn build_client_endpoint(
     socket: Box<dyn noq::AsyncUdpSocket>,
     runtime: Arc<dyn noq::Runtime>,
     payload_ceiling: u16,
-) -> Result<(noq::Endpoint, u16), TransportError> {
+) -> Result<ConfiguredEndpoint, TransportError> {
     let mut endpoint_config = noq::EndpointConfig::default();
     endpoint_config.grease_quic_bit(config.tls.is_some());
     endpoint_config
         .max_udp_payload_size(payload_ceiling)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let endpoint = noq::Endpoint::new_with_abstract_socket(endpoint_config, None, socket, runtime)?;
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        endpoint_config,
+        None,
+        socket,
+        Arc::clone(&runtime),
+    )?;
     endpoint.set_default_client_config(transport);
-    Ok((endpoint, payload_ceiling))
+    Ok(ConfiguredEndpoint {
+        backend: endpoint,
+        runtime,
+        max_symbol_bytes: usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
+    })
 }
 
 fn build_server_endpoint_with_validated_config(
@@ -1577,7 +1548,7 @@ fn build_server_endpoint_with_validated_config(
     runtime: Arc<dyn noq::Runtime>,
     options: &TransportOptions,
     adapter_mtu: Option<u16>,
-) -> Result<(noq::Endpoint, u16), TransportError> {
+) -> Result<ConfiguredEndpoint, TransportError> {
     let payload_ceiling =
         effective_payload_ceiling_inner(&config.transport().mtu, socket.as_ref(), adapter_mtu)?;
     let transport =
@@ -1591,15 +1562,23 @@ fn build_server_endpoint(
     socket: Box<dyn noq::AsyncUdpSocket>,
     runtime: Arc<dyn noq::Runtime>,
     payload_ceiling: u16,
-) -> Result<(noq::Endpoint, u16), TransportError> {
+) -> Result<ConfiguredEndpoint, TransportError> {
     let mut endpoint_config = noq::EndpointConfig::default();
     endpoint_config.grease_quic_bit(config.tls.is_some());
     endpoint_config
         .max_udp_payload_size(payload_ceiling)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let endpoint =
-        noq::Endpoint::new_with_abstract_socket(endpoint_config, Some(transport), socket, runtime)?;
-    Ok((endpoint, payload_ceiling))
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        endpoint_config,
+        Some(transport),
+        socket,
+        Arc::clone(&runtime),
+    )?;
+    Ok(ConfiguredEndpoint {
+        backend: endpoint,
+        runtime,
+        max_symbol_bytes: usize::from(payload_ceiling) - crate::wire::REPAIR_DATAGRAM_HEADER_BYTES,
+    })
 }
 
 fn effective_payload_ceiling_inner(
@@ -1731,7 +1710,7 @@ mod tests {
     #[cfg(unix)]
     use super::SYN_COOKIE_EPOCH_SECONDS;
     use super::{
-        BackupPath, Client, ConnectionBudget, MultipathSocket, Server, TransportError,
+        Client, ConfiguredEndpoint, ConnectionBudget, MultipathSocket, Server, TransportError,
         ValidatedClientConfig, ValidatedServerConfig, lock_budget,
     };
     use crate::config::{
@@ -1797,7 +1776,7 @@ mod tests {
             &crate::TransportOptions::default(),
             None,
         )
-        .map(|(endpoint, _)| endpoint)
+        .map(|endpoint| endpoint.backend)
     }
 
     fn build_server_endpoint_with_socket(
@@ -1812,7 +1791,7 @@ mod tests {
             &crate::TransportOptions::default(),
             None,
         )
-        .map(|(endpoint, _)| endpoint)
+        .map(|endpoint| endpoint.backend)
     }
 
     #[cfg(unix)]
@@ -2035,19 +2014,15 @@ mod tests {
         let client_endpoint =
             noq::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
         client_endpoint.set_default_client_config(build_client_config(&client_config).unwrap());
-        let server = Server::from_endpoint_with_limits(
-            server_endpoint,
-            128,
-            16,
-            crate::flow::RELAY_BUFFER_BYTES,
-            true,
-            Arc::new(noq::TokioRuntime),
+        server_config.transport.recovery_memory_budget_bytes = recovery_memory_budget_bytes;
+        let server = Server::from_configured_endpoint(
+            ConfiguredEndpoint {
+                backend: server_endpoint,
+                runtime: Arc::new(noq::TokioRuntime),
+                max_symbol_bytes: 1200,
+            },
+            ValidatedServerConfig::new(&server_config).unwrap(),
             None,
-            recovery,
-            Arc::new(crate::recovery::RecoveryMemoryBudget::new(
-                recovery_memory_budget_bytes,
-            )),
-            1200,
         );
         let client = Client::from_endpoint(client_endpoint, server_addr, "quicp".to_owned());
         let server_connection = async { server.accept().await.unwrap().handshake().await.unwrap() };
@@ -3125,21 +3100,14 @@ mod tests {
             Arc::clone(&runtime),
         )
         .unwrap();
-        let client = Client::from_endpoint_with_runtime(
-            client_endpoint,
-            server_primary_addr,
-            "quicp".to_owned(),
-            Some(Arc::clone(&runtime)),
+        let client = Client::from_configured_endpoint(
+            ConfiguredEndpoint {
+                backend: client_endpoint,
+                runtime: Arc::clone(&runtime),
+                max_symbol_bytes: 1200,
+            },
+            ValidatedClientConfig::new(&client).unwrap(),
             None,
-            Some(BackupPath {
-                remote: server_backup_addr,
-                local_ip: client_backup_addr.ip(),
-            }),
-            crate::flow::RELAY_BUFFER_BYTES,
-            true,
-            crate::config::RecoveryConfig::default(),
-            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
-            1200,
         );
 
         let server_connection = async {
@@ -3372,34 +3340,23 @@ mod tests {
             Arc::clone(&runtime),
         )
         .unwrap();
-        let recovery = server_config.transport.recovery;
-        let server = Server::from_endpoint_with_limits(
-            server_endpoint,
-            128,
-            16,
-            crate::flow::RELAY_BUFFER_BYTES,
-            true,
-            Arc::clone(&runtime),
+        let server = Server::from_configured_endpoint(
+            ConfiguredEndpoint {
+                backend: server_endpoint,
+                runtime: Arc::clone(&runtime),
+                max_symbol_bytes: 1200,
+            },
+            ValidatedServerConfig::new(&server_config).unwrap(),
             None,
-            recovery,
-            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
-            1200,
         );
-        let client = Client::from_endpoint_with_runtime(
-            client_endpoint,
-            server_primary_addr,
-            client_config.tls.as_ref().unwrap().server_name.clone(),
-            Some(Arc::clone(&runtime)),
+        let client = Client::from_configured_endpoint(
+            ConfiguredEndpoint {
+                backend: client_endpoint,
+                runtime: Arc::clone(&runtime),
+                max_symbol_bytes: 1200,
+            },
+            ValidatedClientConfig::new(&client_config).unwrap(),
             None,
-            Some(BackupPath {
-                remote: server_backup_addr,
-                local_ip: client_backup_addr.ip(),
-            }),
-            crate::flow::RELAY_BUFFER_BYTES,
-            true,
-            client_config.transport.recovery,
-            Arc::new(crate::recovery::RecoveryMemoryBudget::new(64 * 1024 * 1024)),
-            1200,
         );
         let admission = crate::ReplayAdmission::new(&[0xa5; 32], 9, 16).unwrap();
 

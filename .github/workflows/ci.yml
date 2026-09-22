@@ -52,23 +52,10 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           rust-version: 1.88.0
-      - name: C ABI header smoke
+      - name: C and C++ ABI layout checks
         run: |
-          printf '%s\n' \
-            '#include <stdint.h>' \
-            '#include <stddef.h>' \
-            '#include "quicp.h"' \
-            '_Static_assert(sizeof(quicp_socket_address_t) == 24, "address layout");' \
-            '_Static_assert(sizeof(quicp_path_config_t) == 48, "path layout");' \
-            '_Static_assert(sizeof(quicp_engine_config_t) == 120, "engine layout");' \
-            '_Static_assert(offsetof(quicp_engine_config_t, abi_version) == 0, "ABI version offset");' \
-            '_Static_assert(offsetof(quicp_engine_config_t, role) == 4, "role offset");' \
-            '_Static_assert(sizeof(quicp_bytes_t) == 16, "bytes layout");' \
-            '_Static_assert(sizeof(quicp_tls_config_t) == 64, "TLS layout");' \
-            '_Static_assert(sizeof(quicp_recovery_snapshot_t) == 104, "snapshot layout");' \
-            '_Static_assert(sizeof(quicp_flow_t) == 8, "flow layout");' \
-            'int main(void) { return quicp_abi_version() == QUICP_ABI_VERSION ? 0 : 1; }' \
-            | cc -std=c11 -Wall -Wextra -Werror -Iinclude -x c -fsyntax-only -
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude -fsyntax-only tests/ffi_header.c
+          c++ -std=c++11 -Wall -Wextra -Werror -Iinclude -x c++ -fsyntax-only tests/ffi_header.c
       - uses: dtolnay/rust-toolchain@nightly
       - name: Build docs.rs-compatible API documentation
         env:

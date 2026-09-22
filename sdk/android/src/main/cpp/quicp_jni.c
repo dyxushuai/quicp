@@ -321,6 +321,24 @@ JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeOpenFlow(
   return (jint)status;
 }
 
+JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativePollOpenFlow(
+    JNIEnv *env, jclass type, jlong handle, jlongArray flow_output) {
+  (void)type;
+  if (handle == 0 || flow_output == NULL ||
+      (*env)->GetArrayLength(env, flow_output) != 1) {
+    return QUICP_STATUS_INVALID_ARGUMENT;
+  }
+  quicp_flow_t flow = 0;
+  quicp_status_t status = quicp_engine_poll_open_flow(
+      (quicp_engine_t *)(uintptr_t)handle, &flow);
+  if (status == QUICP_STATUS_OK) {
+    jlong output = (jlong)flow;
+    (*env)->SetLongArrayRegion(env, flow_output, 0, 1, &output);
+    if ((*env)->ExceptionCheck(env)) return QUICP_STATUS_FAILED;
+  }
+  return (jint)status;
+}
+
 JNIEXPORT jint JNICALL Java_io_quicp_QuicpEngine_nativeOpenReplaySafeFlow(
     JNIEnv *env, jclass type, jlong handle, jobject token_buffer,
     jint token_length, jlong nonce, jbyteArray host, jint port,

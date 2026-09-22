@@ -33,6 +33,11 @@ and nonblocking; it does not start a Rust thread or executor.
 independent of Rust, Swift, Kotlin, and package versions; change it when a layout or ownership
 contract changes.
 
+Rust builds check the ABI layouts with const assertions; CI compiles the same layout contract
+against the C header in both C11 and C++11. These checks catch source-level layout drift. The
+runtime ABI-version check still protects separately built archives and callers. Build wrappers
+and archives from matching sources when using newly added symbols.
+
 - The host allocates underlay and flow input/output storage.
 - Rust never retains a foreign pointer after an ABI call returns.
 - One engine has one logical owner. That owner serializes ingress, egress, drive, flow, and close.
@@ -47,6 +52,19 @@ TUN API or writing to a socket; that is an adapter choice, not an ABI requiremen
 The engine creates connections, opens or accepts flows, exposes ordered reads and writes, drives
 timers, and moves DATAGRAMs over one or two host-owned paths. It does not grant raw-underlay
 privileges or bypass Network Extension or `VpnService` admission.
+
+## Opening flows
+
+After the client connection is ready, call `openFlow` or `openReplaySafeFlow` once. An accepted
+start copies its inputs and returns `wouldBlock` / `WOULD_BLOCK`. Advance the host event loop and
+call `pollOpenFlow()` until it delivers the flow or a failure. The C equivalent is
+`quicp_engine_poll_open_flow(engine, &flow)`; no host, token, nonce, or initial bytes are needed again.
+
+Only one OPEN may be pending per engine. Polling returns `WOULD_BLOCK` while it is pending, `OK`
+with the handle exactly once when ready, or `FAILED` exactly once for a failed attempt. The next
+poll returns `NOT_READY` until another OPEN is submitted. Polling on a server returns
+`INVALID_ARGUMENT`. Existing callers may still repeat an identical open call to collect its
+result; this additive operation does not change ABI version 3 or any structure layout.
 
 ## Security and early data
 

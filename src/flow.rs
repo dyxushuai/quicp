@@ -23,7 +23,7 @@ use crate::session::{
 use crate::transport::ConnectionPermit;
 use crate::wire::{
     CodecError, ControlFrame, MAX_OPEN_FRAME_BYTES, MAX_WIRE_OFFSET, OpenRequest, OpenStatus,
-    decode_control, encode_control,
+    control_frame_read_target, decode_control, encode_control,
 };
 use thiserror::Error;
 
@@ -874,7 +874,7 @@ impl FlowTask {
         let mut input = std::mem::take(&mut self.input).freeze();
         let mut hit_limit = true;
         for _ in 0..CONTROL_DECODE_BATCH {
-            match decode_control(&input, self.recovery.max_ack_ranges()) {
+            match decode_control(&input, self.recovery.max_ack_ranges(), self.max_input) {
                 Ok((frame, consumed)) => {
                     self.apply_control(frame)?;
                     input.advance(consumed);
@@ -1720,7 +1720,7 @@ async fn read_admission_control(
     max_ack_ranges: usize,
 ) -> Result<ControlFrame<'static>, FlowError> {
     let encoded = read_control_bytes(recv, MAX_OPEN_FRAME_BYTES + 16).await?;
-    let (frame, consumed) = decode_control(&encoded, max_ack_ranges)
+    let (frame, consumed) = decode_control(&encoded, max_ack_ranges, MAX_OPEN_FRAME_BYTES + 16)
         .map_err(|_| FlowError::Session(SessionError::InvalidState))?;
     debug_assert_eq!(consumed, encoded.len());
     match frame {
@@ -1751,7 +1751,7 @@ async fn read_open_control(
     let max_frame_bytes = early_open_frame_limit(flow_buffer_bytes)
         .ok_or(FlowError::Session(SessionError::InvalidState))?;
     let encoded = read_control_bytes(recv, max_frame_bytes).await?;
-    let (frame, consumed) = decode_control(&encoded, max_ack_ranges)
+    let (frame, consumed) = decode_control(&encoded, max_ack_ranges, max_frame_bytes)
         .map_err(|_| FlowError::Session(SessionError::InvalidState))?;
     if consumed != encoded.len() {
         return Err(FlowError::Session(SessionError::InvalidState));
@@ -1781,33 +1781,19 @@ async fn read_control_bytes(
     recv: &mut noq::RecvStream,
     max_frame_bytes: usize,
 ) -> Result<Vec<u8>, FlowError> {
-    let mut prefix = [0u8; 9];
-    recv.read_exact(&mut prefix[..2])
-        .await
-        .map_err(|error| FlowError::Read(Box::new(error)))?;
-    let length_bytes = 1usize << usize::from(prefix[1] >> 6);
-    let header = 1 + length_bytes;
-    if length_bytes > 1 {
-        recv.read_exact(&mut prefix[2..header])
+    let mut encoded = Vec::new();
+    loop {
+        let target = control_frame_read_target(&encoded, max_frame_bytes)
+            .map_err(|_| FlowError::Session(SessionError::InvalidState))?;
+        let start = encoded.len();
+        if target == start {
+            return Ok(encoded);
+        }
+        encoded.resize(target, 0);
+        recv.read_exact(&mut encoded[start..])
             .await
             .map_err(|error| FlowError::Read(Box::new(error)))?;
     }
-    let mut length = u64::from(prefix[1] & 0x3f);
-    for byte in &prefix[2..header] {
-        length = (length << 8) | u64::from(*byte);
-    }
-    let length =
-        usize::try_from(length).map_err(|_| FlowError::Session(SessionError::InvalidState))?;
-    let total = header
-        .checked_add(length)
-        .filter(|total| *total <= max_frame_bytes)
-        .ok_or(FlowError::Session(SessionError::InvalidState))?;
-    let mut encoded = vec![0; total];
-    encoded[..header].copy_from_slice(&prefix[..header]);
-    recv.read_exact(&mut encoded[header..])
-        .await
-        .map_err(|error| FlowError::Read(Box::new(error)))?;
-    Ok(encoded)
 }
 
 pub(crate) fn backend_error_code(error: ApplicationError) -> noq::VarInt {

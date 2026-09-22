@@ -238,6 +238,8 @@ public final class QuicpEngine {
     return QuicpStatus.fromNative(quicp_engine_path_unavailable(raw, path))
   }
 
+  /// Submits one OPEN on an established client connection. After `wouldBlock`,
+  /// call `pollOpenFlow()`; the accepted host is copied before this call returns.
   public func openFlow(host: String, port: UInt16) -> Result<QuicpFlow, QuicpStatus> {
     guard let raw else { return .failure(.closed) }
     var handle: UInt64 = 0
@@ -248,6 +250,8 @@ public final class QuicpEngine {
     return value == .ok ? .success(QuicpFlow(engine: self, handle: handle)) : .failure(value)
   }
 
+  /// Submits one replay-safe OPEN. Accepted inputs are copied before return;
+  /// after `wouldBlock`, call `pollOpenFlow()` without retaining those buffers.
   public func openReplaySafeFlow(
     token: UnsafeRawBufferPointer,
     nonce: UInt64,
@@ -271,6 +275,16 @@ public final class QuicpEngine {
     }
     let value = QuicpStatus.fromNative(status)
     return value == .ok ? .success(QuicpFlow(engine: self, handle: handle)) : .failure(value)
+  }
+
+  /// Polls the client's submitted OPEN. Returns `wouldBlock` while pending,
+  /// delivers a flow or `failed` once, and returns `notReady` when idle.
+  /// Only one OPEN may be pending per engine; repeated identical open calls remain supported.
+  public func pollOpenFlow() -> Result<QuicpFlow, QuicpStatus> {
+    guard let raw else { return .failure(.closed) }
+    var handle: UInt64 = 0
+    let status = QuicpStatus.fromNative(quicp_engine_poll_open_flow(raw, &handle))
+    return status == .ok ? .success(QuicpFlow(engine: self, handle: handle)) : .failure(status)
   }
 
   public func pollFlowRequest(replaySafe: Bool = false) -> Result<QuicpPendingFlow, QuicpStatus> {

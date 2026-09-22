@@ -1,11 +1,10 @@
 //! Executor-facing smoltcp device plumbing.
 //!
 //! The stack itself remains single-owner, as smoltcp requires.  Only complete IP packets cross
-//! the executor boundary through bounded lock-free queues; TCP socket state is never shared
+//! the executor boundary through bounded packet queues; TCP socket state is never shared
 //! between executor tasks.
 
 use std::io;
-use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +15,7 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use thiserror::Error;
 
-use crate::packet_ring::PacketRing;
+use crate::packet_ring::{PacketRing, ReadPacket, WritePacket};
 
 /// Default IP packet MTU.
 pub const DEFAULT_MTU: usize = 1500;
@@ -132,8 +131,9 @@ impl Default for SmoltcpConfig {
     fn default() -> Self {
         Self {
             mtu: DEFAULT_MTU,
-            max_packets_per_poll: NonZeroUsize::new(DEFAULT_POLL_BUDGET)
-                .unwrap_or(NonZeroUsize::MIN),
+            max_packets_per_poll: const {
+                NonZeroUsize::new(DEFAULT_POLL_BUDGET).expect("default poll budget is nonzero")
+            },
         }
     }
 }
@@ -152,10 +152,10 @@ impl SmoltcpConfig {
     }
 }
 
-/// A packet device backed by two bounded lock-free queues.
+/// A packet device backed by two bounded packet queues.
 ///
-/// An outstanding token keeps the device borrowed, preserving each queue's single-producer and
-/// single-consumer contract.
+/// An outstanding token keeps the device borrowed and owns a reserved packet buffer. The pool
+/// handles concurrent host calls without holding a lock during token callbacks.
 ///
 /// ```compile_fail
 /// use quicp::platform::{PlatformPacketBridge, PlatformPacketConfig};
@@ -174,7 +174,6 @@ pub struct RingDevice {
     ingress: Arc<PacketRing>,
     egress: Arc<PacketRing>,
     capabilities: DeviceCapabilities,
-    mtu: usize,
     owner: Option<Arc<AtomicBool>>,
 }
 
@@ -198,7 +197,6 @@ impl RingDevice {
             ingress,
             egress,
             capabilities,
-            mtu: config.mtu,
             owner: None,
         })
     }
@@ -231,30 +229,16 @@ impl Device for RingDevice {
         // smoltcp returns a transmit token together with every receive token.  Do not consume an
         // ingress packet when the bounded egress pool cannot provide that token: doing so would
         // make a stack-generated response an unobservable drop under backpressure.
-        if !self.egress.can_push(self.mtu) {
-            return None;
-        }
-        let packet = self.ingress.pop()?;
+        let transmit = self.egress.write()?;
+        let receive = self.ingress.read()?;
         Some((
-            RingRxToken {
-                packet: Some(packet),
-                recycle: Arc::clone(&self.ingress),
-                _device: PhantomData,
-            },
-            RingTxToken {
-                queue: Arc::clone(&self.egress),
-                mtu: self.mtu,
-                _device: PhantomData,
-            },
+            RingRxToken { packet: receive },
+            RingTxToken { packet: transmit },
         ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        self.egress.can_push(self.mtu).then(|| RingTxToken {
-            queue: Arc::clone(&self.egress),
-            mtu: self.mtu,
-            _device: PhantomData,
-        })
+        self.egress.write().map(|packet| RingTxToken { packet })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -265,9 +249,7 @@ impl Device for RingDevice {
 /// smoltcp receive token borrowing one packet and its device owner.
 #[derive(Debug)]
 pub struct RingRxToken<'a> {
-    packet: Option<Vec<u8>>,
-    recycle: Arc<PacketRing>,
-    _device: PhantomData<&'a mut RingDevice>,
+    packet: ReadPacket<'a>,
 }
 
 impl RxToken for RingRxToken<'_> {
@@ -275,24 +257,14 @@ impl RxToken for RingRxToken<'_> {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.packet.as_deref().unwrap_or_default())
-    }
-}
-
-impl Drop for RingRxToken<'_> {
-    fn drop(&mut self) {
-        if let Some(packet) = self.packet.take() {
-            self.recycle.recycle_buffer(packet);
-        }
+        self.packet.consume(f)
     }
 }
 
 /// smoltcp transmit token borrowing the bounded egress queue and device owner.
 #[derive(Debug)]
 pub struct RingTxToken<'a> {
-    queue: Arc<PacketRing>,
-    mtu: usize,
-    _device: PhantomData<&'a mut RingDevice>,
+    packet: WritePacket<'a>,
 }
 
 impl TxToken for RingTxToken<'_> {
@@ -300,26 +272,7 @@ impl TxToken for RingTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // The smoltcp contract normally supplies a length no larger than the interface MTU.
-        // Bound a violating caller before any allocation so a bad token cannot request an
-        // arbitrary buffer. The callback receives the bounded slice and the packet is discarded
-        // after the callback when the requested length was invalid.
-        let bounded_len = len.min(self.mtu);
-        let mut packet = self
-            .queue
-            .acquire_buffer(bounded_len)
-            .unwrap_or_else(|| vec![0; bounded_len]);
-        let result = f(&mut packet);
-        if len <= self.mtu {
-            // `transmit` checked capacity before handing out this token. Under the SPSC
-            // contract the consumer can only make room, so a full result means the caller
-            // violated the single-producer ownership rule; drop the packet instead of writing
-            // to the consumer-owned free queue.
-            let _ = self.queue.push(packet);
-        } else {
-            self.queue.recycle_buffer(packet);
-        }
-        result
+        self.packet.consume(len, f)
     }
 }
 

@@ -109,14 +109,20 @@ fun main() {
             }
             check(client.connectionStatus == QuicpStatus.OK)
             check(server.connectionStatus == QuicpStatus.OK)
+            check((client.pollOpenFlow().exceptionOrNull() as? QuicpException)?.status ==
+                QuicpStatus.NOT_READY)
+            check((server.pollOpenFlow().exceptionOrNull() as? QuicpException)?.status ==
+                QuicpStatus.INVALID_ARGUMENT)
 
             var primeSender: QuicpFlow? = null
             var primePending: QuicpPendingFlow? = null
             var primeReceiver: QuicpFlow? = null
             attempts = 0
+            check((client.openFlow("prime.example", 443).exceptionOrNull() as? QuicpException)?.status ==
+                QuicpStatus.WOULD_BLOCK)
             while ((primeSender == null || primeReceiver == null) && attempts < 1_000) {
                 if (primeSender == null) {
-                    primeSender = client.openFlow("prime.example", 443).getOrNull()
+                    primeSender = client.pollOpenFlow().getOrNull()
                 }
                 if (primePending == null) {
                     primePending = server.pollFlowRequest().getOrNull()
@@ -129,6 +135,8 @@ fun main() {
                 attempts += 1
             }
             check(primeSender != null && primeReceiver != null)
+            check((client.pollOpenFlow().exceptionOrNull() as? QuicpException)?.status ==
+                QuicpStatus.NOT_READY)
             primeSender.close()
             primeReceiver.close()
 
@@ -159,11 +167,13 @@ fun main() {
             var pending: QuicpPendingFlow? = null
             var receiver: QuicpFlow? = null
             attempts = 0
+            val opened = client.openReplaySafeFlow(
+                token, 73, 42, "kotlin.example", 443, initial, initialBytes.size
+            )
+            check((opened.exceptionOrNull() as? QuicpException)?.status == QuicpStatus.WOULD_BLOCK)
             while ((sender == null || receiver == null) && attempts < 1_000) {
                 if (sender == null) {
-                    sender = client.openReplaySafeFlow(
-                        token, 73, 42, "kotlin.example", 443, initial, initialBytes.size
-                    ).getOrNull()
+                    sender = client.pollOpenFlow().getOrNull()
                 }
                 if (pending == null) {
                     pending = server.pollFlowRequest(replaySafe = true).getOrNull()
@@ -175,6 +185,8 @@ fun main() {
                 elapsed += 1_000_000
                 attempts += 1
             }
+            check((client.pollOpenFlow().exceptionOrNull() as? QuicpException)?.status ==
+                QuicpStatus.NOT_READY)
 
             sender!!.use { flow ->
                 receiver!!.use { peer ->

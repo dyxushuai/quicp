@@ -92,6 +92,12 @@ mod ffi {
     type Shutdown = unsafe extern "system" fn(isize, u32) -> i32;
     type Close = unsafe extern "system" fn(isize) -> i32;
 
+    #[allow(clippy::cast_possible_truncation)]
+    const fn windows_struct_size<T>() -> u32 {
+        assert!(size_of::<T>() <= u32::MAX as usize);
+        size_of::<T>() as u32
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn FreeLibrary(module: *mut c_void) -> i32;
@@ -206,13 +212,13 @@ mod ffi {
             .chain(once(0))
             .collect::<Vec<_>>();
         let mut file_info = WINTRUST_FILE_INFO {
-            cbStruct: u32::try_from(size_of::<WINTRUST_FILE_INFO>()).expect("structure fits u32"),
+            cbStruct: const { windows_struct_size::<WINTRUST_FILE_INFO>() },
             pcwszFilePath: wide.as_ptr(),
             hFile: file.as_raw_handle().cast(),
             pgKnownSubject: null_mut(),
         };
         let mut trust = WINTRUST_DATA {
-            cbStruct: u32::try_from(size_of::<WINTRUST_DATA>()).expect("structure fits u32"),
+            cbStruct: const { windows_struct_size::<WINTRUST_DATA>() },
             dwUIChoice: WTD_UI_NONE,
             fdwRevocationChecks: WTD_REVOKE_NONE,
             dwUnionChoice: WTD_CHOICE_FILE,
@@ -247,7 +253,7 @@ mod ffi {
                 file.as_raw_handle().cast(),
                 FileIdInfo,
                 addr_of_mut!(information).cast(),
-                u32::try_from(size_of::<FILE_ID_INFO>()).expect("file identity structure fits u32"),
+                const { windows_struct_size::<FILE_ID_INFO>() },
             )
         } == 0
         {
@@ -562,7 +568,7 @@ pub struct FakeTcpSocket {
     tuple: FourTuple,
     inbound: FakeTcpCarrier,
     outbound: Arc<Mutex<FakeTcpCarrier>>,
-    server_side: bool,
+    direction: CarrierDirection,
     receiver: Mutex<Receiver<io::Result<Vec<u8>>>>,
     waker: Arc<Mutex<Option<Waker>>>,
     decode_rejects: u64,
@@ -615,7 +621,7 @@ impl FakeTcpSocket {
             tuple,
             inbound,
             outbound: Arc::new(Mutex::new(outbound)),
-            server_side: outbound_direction == CarrierDirection::ServerToClient,
+            direction: outbound_direction,
             receiver: Mutex::new(receiver),
             waker,
             decode_rejects: 0,
@@ -663,7 +669,7 @@ impl AsyncUdpSocket for FakeTcpSocket {
             state: Arc::clone(&self.state),
             tuple: self.tuple,
             carrier: Arc::clone(&self.outbound),
-            server_side: self.server_side,
+            direction: self.direction,
             pending: vec![0; MAX_PACKET_BYTES],
         })
     }
@@ -740,7 +746,7 @@ struct FakeTcpSender {
     state: Arc<WinDivertState>,
     tuple: FourTuple,
     carrier: Arc<Mutex<FakeTcpCarrier>>,
-    server_side: bool,
+    direction: CarrierDirection,
     pending: Vec<u8>,
 }
 
@@ -800,22 +806,11 @@ impl UdpSender for FakeTcpSender {
         for segment in 0..segment_count {
             let start = segment * segment_size;
             let end = (start + segment_size).min(transmit.contents.len());
-            let length = if carrier.sent_syn {
-                carrier.encode_datagram_into(
-                    &transmit.contents[start..end],
-                    &mut this.pending[..packet_capacity],
-                )
-            } else if this.server_side {
-                carrier.encode_syn_ack_into(
-                    &transmit.contents[start..end],
-                    &mut this.pending[..packet_capacity],
-                )
-            } else {
-                carrier.encode_syn_into(
-                    &transmit.contents[start..end],
-                    &mut this.pending[..packet_capacity],
-                )
-            };
+            let length = carrier.encode_next_datagram_into(
+                this.direction,
+                &transmit.contents[start..end],
+                &mut this.pending[..packet_capacity],
+            );
             let length = match length.map_err(carrier_io_error) {
                 Ok(length) => length,
                 Err(error) => return Poll::Ready(Err(error)),

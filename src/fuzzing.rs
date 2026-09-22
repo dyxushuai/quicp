@@ -18,11 +18,10 @@ pub fn protocol(input: &[u8]) {
     };
     match tag % 9 {
         0 => {
-            let _ = crate::wire::decode_control(data, 32);
+            let _ = crate::wire::control_frame_read_target(data, MAX_FUZZ_BYTES);
+            let _ = crate::wire::decode_control(data, 32, MAX_FUZZ_BYTES);
         }
-        1 => {
-            let _ = crate::wire::decode_source(data, 32, MAX_FUZZ_BYTES);
-        }
+        1 => fuzz_source(data),
         2 => {
             let _ = crate::wire::decode_repair(data, MAX_FUZZ_BYTES);
         }
@@ -32,6 +31,29 @@ pub fn protocol(input: &[u8]) {
         6 => fuzz_reassembly(data),
         7 => fuzz_decoder(data),
         _ => fuzz_faketcp(data),
+    }
+}
+
+fn fuzz_source(data: &[u8]) {
+    use crate::wire::{MAX_SOURCE_RECORDS, decode_source, decode_source_padded, encode_source};
+
+    if let Ok(source) = decode_source(data, MAX_SOURCE_RECORDS, MAX_FUZZ_BYTES) {
+        let records = source.records().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), source.record_count());
+        assert_eq!(
+            source.single_record(),
+            (records.len() == 1).then_some(records[0])
+        );
+        let mut encoded = Vec::new();
+        encode_source(source.symbol_id, &records, &mut encoded).unwrap();
+        assert_eq!(encoded, data);
+    }
+    if let Ok((source, consumed)) = decode_source_padded(data, MAX_SOURCE_RECORDS, MAX_FUZZ_BYTES) {
+        let records = source.records().collect::<Result<Vec<_>, _>>().unwrap();
+        let mut encoded = Vec::new();
+        encode_source(source.symbol_id, &records, &mut encoded).unwrap();
+        assert_eq!(encoded, data[..consumed]);
+        assert!(data[consumed..].iter().all(|byte| *byte == 0));
     }
 }
 

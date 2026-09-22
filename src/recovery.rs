@@ -17,14 +17,13 @@ use crate::config::{RecoveryConfig, RecoveryMode};
 use crate::fec::{Decoder, FecError, RecoveredBatch, SourceStatus, repair_symbol};
 use crate::flow::FlowState;
 use crate::wire::{
-    Capabilities, MAX_WIRE_OFFSET, REPAIR_DATAGRAM, REPAIR_DATAGRAM_HEADER_BYTES, RepairDatagram,
-    SOURCE_DATAGRAM, SOURCE_RECORD_MAX_OVERHEAD, SourceRecord, decode_repair, decode_source,
-    decode_source_single, encode_repair, encode_source,
+    Capabilities, MAX_SOURCE_RECORDS, MAX_WIRE_OFFSET, REPAIR_DATAGRAM,
+    REPAIR_DATAGRAM_HEADER_BYTES, RepairDatagram, SINGLE_SOURCE_MAX_OVERHEAD, SOURCE_DATAGRAM,
+    SourceRecord, decode_repair, decode_source, encode_repair, encode_source,
 };
 
 const PRE_OPEN_TTL: Duration = Duration::from_secs(1);
 const DRIVER_SEND_BATCH: u8 = 32;
-const MAX_SOURCE_RECORDS: usize = 32;
 
 const fn repair_seed(first_symbol_id: u32) -> u32 {
     first_symbol_id
@@ -545,14 +544,14 @@ impl ConnectionRecovery {
                     .min(negotiated)
                     .min(maximum.saturating_sub(REPAIR_DATAGRAM_HEADER_BYTES))
             })
-            .saturating_sub(SOURCE_RECORD_MAX_OVERHEAD)
+            .saturating_sub(SINGLE_SOURCE_MAX_OVERHEAD)
     }
 
     pub(crate) fn max_stream_payload(&self) -> usize {
         self.max_symbol_bytes
             .min(usize::from(self.active_capabilities().max_symbol))
             .saturating_sub(REPAIR_DATAGRAM_HEADER_BYTES)
-            .saturating_sub(SOURCE_RECORD_MAX_OVERHEAD)
+            .saturating_sub(SINGLE_SOURCE_MAX_OVERHEAD)
             .max(1)
     }
 
@@ -882,37 +881,27 @@ impl ConnectionRecovery {
     }
 
     fn receive_source(&self, datagram: &Bytes) {
-        let retained_bytes = self.max_symbol_bytes + REPAIR_DATAGRAM_HEADER_BYTES;
-        if datagram.get(5) == Some(&1) {
-            let Ok((symbol_id, flow_id, offset, fin, data)) =
-                decode_source_single(datagram, self.max_symbol_bytes)
-            else {
-                self.drop_datagram();
-                return;
-            };
-            let mut record = [PendingSourceRecord {
-                flow: None,
-                flow_id,
-                offset,
-                fin,
-                retained_bytes,
-                data: datagram.slice(data),
-                charge: None,
-            }];
-            self.accept_source(symbol_id, datagram.clone(), &mut record);
-            return;
-        }
-        let Some(record_count) = datagram
-            .get(5)
-            .copied()
-            .map(usize::from)
-            .filter(|count| (2..=MAX_SOURCE_RECORDS).contains(count))
-        else {
+        let Ok(source) = decode_source(datagram, MAX_SOURCE_RECORDS, self.max_symbol_bytes) else {
             self.drop_datagram();
             return;
         };
+        let retained_bytes = self.max_symbol_bytes + REPAIR_DATAGRAM_HEADER_BYTES;
+        if let Some(record) = source.single_record() {
+            let mut record = [PendingSourceRecord {
+                flow: None,
+                flow_id: record.flow_id,
+                offset: record.offset,
+                fin: record.fin,
+                retained_bytes,
+                data: datagram.slice_ref(record.data),
+                charge: None,
+            }];
+            self.accept_source(source.symbol_id, datagram.clone(), &mut record);
+            return;
+        }
+        let record_count = source.record_count();
         let Some(dispatch_bytes) = record_count
-            .checked_mul(size_of::<SourceRecord<'static>>() + size_of::<PendingSourceRecord>())
+            .checked_mul(size_of::<PendingSourceRecord>())
             .and_then(|bytes| bytes.checked_add(datagram.len()))
         else {
             self.drop_datagram();
@@ -924,21 +913,17 @@ impl ConnectionRecovery {
             self.drop_datagram();
             return;
         };
-        let Ok(source) = decode_source(datagram, MAX_SOURCE_RECORDS, self.max_symbol_bytes) else {
-            self.drop_datagram();
-            return;
-        };
-        if source.records.capacity() != record_count {
-            self.drop_datagram();
-            return;
-        }
         let symbol_id = source.symbol_id;
         let mut records = Vec::with_capacity(record_count);
         if records.capacity() != record_count {
             self.drop_datagram();
             return;
         }
-        for record in source.records {
+        for record in source.records() {
+            let Ok(record) = record else {
+                self.drop_datagram();
+                return;
+            };
             let mut storage = Vec::with_capacity(record.data.len());
             if storage.capacity() != record.data.len() {
                 self.drop_datagram();
@@ -1129,9 +1114,9 @@ impl ConnectionRecovery {
                 bytes.checked_add(source.bytes.len())
             })
             .and_then(|bytes| {
-                bytes.checked_add(MAX_SOURCE_RECORDS.saturating_mul(
-                    size_of::<SourceRecord<'static>>() + size_of::<PendingSourceRecord>(),
-                ))
+                bytes.checked_add(
+                    MAX_SOURCE_RECORDS.saturating_mul(size_of::<PendingSourceRecord>()),
+                )
             });
         if dispatch_bytes.is_none_or(|bytes| recovered.reserve_dispatch(bytes).is_err()) {
             self.drop_datagram();
@@ -1144,17 +1129,17 @@ impl ConnectionRecovery {
                 self.drop_datagram();
                 continue;
             };
-            if decoded.records.capacity() != decoded.records.len() {
-                self.drop_datagram();
-                continue;
-            }
-            let mut records = Vec::with_capacity(decoded.records.len());
-            if records.capacity() != decoded.records.len() {
+            let mut records = Vec::with_capacity(decoded.record_count());
+            if records.capacity() != decoded.record_count() {
                 self.drop_datagram();
                 continue;
             }
             let mut allocation_failed = false;
-            for record in decoded.records {
+            for record in decoded.records() {
+                let Ok(record) = record else {
+                    allocation_failed = true;
+                    break;
+                };
                 let mut storage = Vec::with_capacity(record.data.len());
                 if storage.capacity() != record.data.len() {
                     allocation_failed = true;

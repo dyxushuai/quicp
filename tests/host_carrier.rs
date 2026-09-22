@@ -572,7 +572,8 @@ allow_insecure = true
                 .with_recovery(RecoveryConfig {
                     mode: server_recovery_mode,
                     ..RecoveryConfig::default()
-                }),
+                })
+                .with_nodelay(false),
         )
         .unwrap();
     let client =
@@ -601,6 +602,7 @@ allow_insecure = true
                 let pending = connection.accept_flow(true).await?;
                 assert_eq!(pending.request(), &expected);
                 let mut flow = pending.accept().await?;
+                assert!(!flow.nodelay());
                 let mut buffer = [0u8; 512];
                 let mut received = [0u8; 5];
                 let mut offset = 0;
