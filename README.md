@@ -187,6 +187,7 @@ ordered TCP byte stream.
 
 - [API reference on docs.rs](https://docs.rs/quicp)
 - [Protocol and wire boundaries](docs/protocol.md)
+- [Understand module ownership and type guarantees](docs/architecture.md)
 - [Run the Rust examples](examples/README.md)
 - [Choose the SDK and ABI contract](sdk/README.md)
 - [Run the benchmark commands](benches/README.md)

@@ -15,6 +15,7 @@ The [feature map](../README.md#feature-flags) lists each optional capability and
 
 ## Architecture decisions
 
+- [Module ownership, data flow, and type guarantees](architecture.md)
 - [Carrier platform matrix](adr/0001-carrier-platform-matrix.md)
 - [Datagram-first adaptive recovery](adr/0003-datagram-first-recovery.md)
 
