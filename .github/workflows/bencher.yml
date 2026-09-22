@@ -1,0 +1,192 @@
+name: Bencher
+
+on:
+  workflow_run:
+    workflows: [Benchmarks]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Completed Benchmarks run to publish
+        required: true
+      verify_alert:
+        description: Verify alert rejection using synthetic data on a separate branch
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: bencher-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Publish benchmark regression check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Identify the measured commit
+        id: source
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+        with:
+          script: |
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              ...context.repo, run_id: Number(process.env.RUN_ID),
+            });
+            if (run.path !== '.github/workflows/benchmarks.yml' ||
+                run.repository.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                run.status !== 'completed') {
+              throw new Error('Expected a completed Benchmarks run from this repository');
+            }
+            let branch = 'main';
+            let base = '';
+            let number = '';
+            if (run.event === 'pull_request') {
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                ...context.repo, commit_sha: run.head_sha,
+              });
+              const pr = prs.find(pr => pr.head.sha === run.head_sha &&
+                pr.base.repo.full_name === run.repository.full_name && pr.base.ref === 'main');
+              if (!pr) throw new Error('No matching pull request for this commit');
+              branch = `pr-${pr.number}`;
+              number = String(pr.number);
+              base = run.pull_requests.find(item => item.number === pr.number)?.base.sha || pr.base.sha;
+            } else if (!['push', 'workflow_dispatch'].includes(run.event) || run.head_branch !== 'main') {
+              throw new Error('Only main runs may update the baseline');
+            }
+            const { data: check } = await github.rest.checks.create({
+              ...context.repo, name: 'Benchmark regression', head_sha: run.head_sha,
+              status: 'in_progress', details_url: run.html_url,
+            });
+            core.setOutput('check_id', check.id);
+            core.setOutput('run_id', run.id);
+            core.setOutput('sha', run.head_sha);
+            core.setOutput('branch', branch);
+            core.setOutput('base', base);
+            core.setOutput('pr_number', number);
+            if (run.conclusion !== 'success') throw new Error('Benchmark measurement failed');
+      # Only trusted default-branch code executes in this workflow. PR artifacts are data.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+          path: target/benchmarks
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Validate complete reports
+        run: |
+          for sample in 1 2 3; do
+            python3 -B benches/bencher.py --validate "target/benchmarks/results-$sample.json"
+          done
+      - uses: bencherdev/bencher@8d75325c3bc59403a2186a056b472c4f49d42838 # v0.6.12
+        with:
+          version: '0.6.12'
+      - name: Compare with the main baseline
+        env:
+          BENCHER_PROJECT: quicp
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+          BENCHER_BRANCH: ${{ steps.source.outputs.branch }}
+          BENCHER_TESTBED: github-ubuntu-24-04-x86-64-rust-1-88
+          HEAD_SHA: ${{ steps.source.outputs.sha }}
+          BASE_SHA: ${{ steps.source.outputs.base }}
+          PR_NUMBER: ${{ steps.source.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+          REGRESSION_LIMIT: ${{ vars.BENCHER_REGRESSION_LIMIT || '0.20' }}
+        run: |
+          test -n "$BENCHER_API_KEY" || { echo 'Set the BENCHER_API_KEY repository secret'; exit 1; }
+          args=(--hash "$HEAD_SHA" --adapter json --iter 1 --fold median --error-on-alert)
+          if [ "$BENCHER_BRANCH" != main ]; then
+            # Bencher otherwise falls back to latest when the requested hash is absent.
+            bencher report list "$BENCHER_PROJECT" --branch main --testbed "$BENCHER_TESTBED" \
+              --per-page 255 --direction desc > target/benchmarks/baselines.json
+            jq -e --arg hash "$BASE_SHA" \
+              'any(.[]; .branch.head.version.hash == $hash and any(.counts.results[]; .benchmarks == 18))' \
+              target/benchmarks/baselines.json > /dev/null || {
+                echo 'Missing complete baseline for the PR base commit; run Benchmarks on main or rebase the PR'
+                exit 1
+              }
+            args+=(--start-point main --start-point-hash "$BASE_SHA" --start-point-reset
+              --github-actions "$GH_TOKEN" --ci-number "$PR_NUMBER" --ci-id QUICP
+              --ci-public-links --ci-only-thresholds)
+          fi
+          for measure in latency delivery-p50-ns delivery-p95-ns delivery-p99-ns allocations-per-run rust-heap-bytes; do
+            args+=(--threshold-measure "$measure" --threshold-test percentage
+              --threshold-min-sample-size 1 --threshold-max-sample-size 10
+              --threshold-upper-boundary "$REGRESSION_LIMIT" --threshold-lower-boundary _)
+          done
+          args+=(--threshold-measure payload-gbps --threshold-test percentage
+            --threshold-min-sample-size 1 --threshold-max-sample-size 10
+            --threshold-upper-boundary _ --threshold-lower-boundary "$REGRESSION_LIMIT")
+          bencher run "${args[@]}" --format json --quiet \
+            --file target/benchmarks/results-1.json \
+            --file target/benchmarks/results-2.json \
+            --file target/benchmarks/results-3.json > target/benchmarks/report.json
+          if [ "$BENCHER_BRANCH" != main ]; then
+            jq -e '[.results[][] | .measures[] | select(.threshold != null)] |
+              length == 72 and all(.boundary != null)' target/benchmarks/report.json > /dev/null || {
+                echo 'Expected 72 regression comparisons with established boundaries'
+                exit 1
+              }
+          fi
+          echo 'Report: https://bencher.dev/perf/quicp'
+      - name: Verify that a synthetic regression is rejected
+        if: inputs.verify_alert && steps.source.outputs.branch == 'main'
+        env:
+          BENCHER_PROJECT: quicp
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+          BENCHER_TESTBED: github-ubuntu-24-04-x86-64-rust-1-88
+          HEAD_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          python3 -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          result = json.loads(Path('target/benchmarks/results-1.json').read_text())
+          for metrics in result.values():
+              metrics['payload-gbps']['value'] *= 0.01
+          path = Path('target/benchmarks/synthetic-regression.json')
+          path.write_text(json.dumps(result))
+          probe = subprocess.run([
+              'bencher', 'run', '--branch', f'validation-{os.environ["GITHUB_RUN_ID"]}',
+              '--hash', os.environ['HEAD_SHA'], '--start-point', 'main',
+              '--start-point-hash', os.environ['HEAD_SHA'],
+              '--start-point-clone-thresholds', '--start-point-reset',
+              '--adapter', 'json', '--error-on-alert', '--format', 'json', '--quiet',
+              '--file', str(path),
+          ], capture_output=True, text=True)
+          report = json.loads(probe.stdout)
+          alerts = report['counts']['alerts']['total']
+          if probe.returncode == 0 or alerts == 0:
+              raise SystemExit('Bencher failed to reject the synthetic regression')
+          print(f'Bencher rejected the synthetic regression with {alerts} alerts')
+          PY
+      - name: Finish the required check
+        if: always() && steps.source.outputs.check_id
+        uses: actions/github-script@v7
+        env:
+          CHECK_ID: ${{ steps.source.outputs.check_id }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const success = process.env.JOB_STATUS === 'success';
+            await github.rest.checks.update({
+              ...context.repo, check_run_id: Number(process.env.CHECK_ID),
+              status: 'completed', conclusion: success ? 'success' : 'failure',
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              output: {
+                title: success ? 'No benchmark regression detected' : 'Benchmark regression check failed',
+                summary: 'Results: https://bencher.dev/perf/quicp. See the workflow log for alerts or setup errors.',
+              },
+            });
