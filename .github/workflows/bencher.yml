@@ -21,7 +21,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: bencher-publish
+  group: bencher-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch || inputs.run_id }}
   cancel-in-progress: false
 
 jobs:
