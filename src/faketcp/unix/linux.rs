@@ -564,6 +564,9 @@ impl RawPlatform {
                 received_count += 1;
             }
 
+            if received_count == slots {
+                return Poll::Ready(Ok(received_count));
+            }
             if reject_budget == 0 {
                 cx.waker().wake_by_ref();
                 return if received_count > 0 {
@@ -598,7 +601,8 @@ impl RawPlatform {
                 Err(_would_block) if received_count > 0 => {
                     return Poll::Ready(Ok(received_count));
                 }
-                Err(_would_block) => return Poll::Pending,
+                // Re-poll after clearing readiness to register the next wakeup.
+                Err(_would_block) => {}
             }
         }
     }

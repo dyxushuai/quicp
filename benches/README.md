@@ -55,8 +55,9 @@ characterization only; they are not evidence of ISP acceptance or Internet-path 
 
 The `Benchmarks` workflow runs all three binaries on `ubuntu-24.04` with Rust 1.88.0.
 Each binary runs three times; loopback keeps its six internally alternating samples,
-32 MiB transfers, all three payload sizes, and `QUICP_NODELAY=true`. Only the loopback
-executable receives `CAP_NET_RAW`. The workflow uploads CSV and BMF JSON artifacts without
+32 MiB transfers, all three payload sizes, and `QUICP_NODELAY=true`. Only the loopback and
+raw-socket regression-test executables receive `CAP_NET_RAW`. The workflow verifies receive
+wakeups before measuring, then uploads CSV and BMF JSON artifacts without
 access to the Bencher key. Kernel TCP is excluded from CI comparisons.
 
 The `Bencher` workflow runs separately from trusted `main` code, validates all 18 benchmark
