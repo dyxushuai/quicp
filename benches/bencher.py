@@ -96,9 +96,17 @@ def validate(results):
 
 
 def summarize(report):
-    """Keep every threshold result within GitHub's comment size limit."""
+    """Show alerted comparisons and keep complete details in the Bencher report."""
     rows = []
+    all_rows = []
     comparisons = 0
+    alert_count = report["counts"]["alerts"]["total"]
+    alerts = report.get("alerts")
+    alerted = {
+        (alert["benchmark"]["slug"], alert["threshold"]["measure"]["slug"])
+        for alert in alerts or []
+    }
+    show_all = alerts is None or len(alerts) != alert_count
     for iteration in report["results"]:
         for result in iteration:
             benchmark = result["benchmark"]["name"].replace("|", "\\|").replace("\n", " ")
@@ -113,15 +121,25 @@ def summarize(report):
                           "0.00%" if baseline == value == 0 else "n/a")
                 base = f"{baseline:.6g}" if baseline is not None else "n/a"
                 measure = metric["measure"]["slug"].replace("|", "\\|").replace("\n", " ")
-                rows.append(f"| {benchmark} | {measure} | {base} | {value:.6g} | {change} |")
-    alerts = report["counts"]["alerts"]["total"]
+                row = f"| {benchmark} | {measure} | {base} | {value:.6g} | {change} |"
+                all_rows.append(row)
+                if show_all or (result["benchmark"]["slug"], metric["measure"]["slug"]) in alerted:
+                    rows.append(row)
+    if alert_count and not rows:
+        rows = all_rows
     url = f'https://bencher.dev/perf/quicp/reports/{report["uuid"]}'
-    return "\n".join([
-        "## Bencher summary", "", f"**{comparisons} comparisons; {alerts} alerts.**", "",
+    summary = [
+        "## Bencher summary", "", f"**{comparisons} comparisons; {alert_count} alerts.**", "",
         f"[Full report]({url}) · `latency` is in ns; custom measures include their units.", "",
-        "| Benchmark | Measure | Baseline | Current | Change |",
-        "| --- | --- | ---: | ---: | ---: |", *rows, "",
-    ])
+    ]
+    if rows:
+        summary.extend([
+            "| Benchmark | Measure | Baseline | Current | Change |",
+            "| --- | --- | ---: | ---: | ---: |", *rows,
+        ])
+    else:
+        summary.append("No benchmark regressions crossed the configured thresholds.")
+    return "\n".join(summary + [""])
 
 
 def main():
