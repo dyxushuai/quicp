@@ -23,6 +23,36 @@ class BencherTest(unittest.TestCase):
         del metric["threshold"]
         self.assertNotIn("| case", summarize(report))
 
+    def test_summary_only_lists_alerted_metrics(self):
+        measures = [
+            {"threshold": {}, "boundary": {"baseline": 100},
+             "metric": {"value": 125}, "measure": {"slug": "latency"}},
+            {"threshold": {}, "boundary": {"baseline": 100},
+             "metric": {"value": 100}, "measure": {"slug": "payload-gbps"}},
+        ]
+        alert = {"benchmark": {"slug": "case"},
+                 "threshold": {"measure": {"slug": "latency"}}}
+        report = {"uuid": "report-id", "counts": {"alerts": {"total": 1}},
+                  "alerts": [alert], "results": [[
+                      {"benchmark": {"name": "case", "slug": "case"}, "measures": measures}
+                  ]]}
+        summary = summarize(report)
+        self.assertIn("2 comparisons; 1 alerts", summary)
+        self.assertIn("| case | latency | 100 | 125 | +25.00% |", summary)
+        self.assertNotIn("| case | payload-gbps", summary)
+
+        report["alerts"] = []
+        report["counts"]["alerts"]["total"] = 0
+        summary = summarize(report)
+        self.assertIn("2 comparisons; 0 alerts", summary)
+        self.assertIn("No benchmark regressions", summary)
+        self.assertNotIn("| case | latency", summary)
+
+        del report["alerts"]
+        summary = summarize(report)
+        self.assertIn("| case | latency", summary)
+        self.assertIn("| case | payload-gbps", summary)
+
     def test_csv_and_report_boundaries(self):
         results = {}
         for suite, (modes, columns) in SUITES.items():
